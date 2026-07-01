@@ -75,7 +75,6 @@ namespace RoyalGL
 
         double m_lastMouseX = 0.0;
         double m_lastMouseY = 0.0;
-        bool m_orbiting = false;
-        bool m_panning = false;
+        bool m_flying = false; // true while the right mouse button is driving mouse-look
     };
 }

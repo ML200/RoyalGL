@@ -20,23 +20,23 @@ namespace RoyalGL
         return glm::normalize(glm::cross(Right(), Forward()));
     }
 
-    void Camera::Orbit(float dYawDegrees, float dPitchDegrees)
+    void Camera::Look(float dYawDegrees, float dPitchDegrees)
     {
-        glm::vec3 offset = position - target;
-        float radius = std::max(glm::length(offset), 1e-4f);
+        glm::vec3 offset = target - position;
+        float distance = std::max(glm::length(offset), 1e-4f);
 
         float yaw = std::atan2(offset.x, offset.z);
-        float pitch = std::asin(std::clamp(offset.y / radius, -1.0f, 1.0f));
+        float pitch = std::asin(std::clamp(offset.y / distance, -1.0f, 1.0f));
 
         yaw += glm::radians(dYawDegrees);
         pitch += glm::radians(dPitchDegrees);
         pitch = std::clamp(pitch, glm::radians(-89.0f), glm::radians(89.0f));
 
-        offset.x = radius * std::cos(pitch) * std::sin(yaw);
-        offset.y = radius * std::sin(pitch);
-        offset.z = radius * std::cos(pitch) * std::cos(yaw);
+        offset.x = distance * std::cos(pitch) * std::sin(yaw);
+        offset.y = distance * std::sin(pitch);
+        offset.z = distance * std::cos(pitch) * std::cos(yaw);
 
-        position = target + offset;
+        target = position + offset;
     }
 
     void Camera::Dolly(float dScroll)
@@ -49,9 +49,9 @@ namespace RoyalGL
         position = target + direction * newRadius;
     }
 
-    void Camera::Pan(float dx, float dy)
+    void Camera::Move(const glm::vec3& localDelta)
     {
-        glm::vec3 delta = Right() * dx + Up() * dy;
+        glm::vec3 delta = Right() * localDelta.x + worldUp * localDelta.y + Forward() * localDelta.z;
         position += delta;
         target += delta;
     }

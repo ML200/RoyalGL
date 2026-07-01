@@ -71,7 +71,7 @@ namespace RoyalGL
         m_window->OnScroll = [this](double /*xoffset*/, double yoffset)
         {
             if (ImGui::GetIO().WantCaptureMouse) return;
-            m_scene->camera.Dolly(static_cast<float>(-yoffset));
+            m_scene->camera.Dolly(static_cast<float>(yoffset));
         };
     }
 
@@ -103,7 +103,7 @@ namespace RoyalGL
         m_pathTracer->Resize(width, height);
     }
 
-    void Application::HandleCameraInput(float /*dt*/)
+    void Application::HandleCameraInput(float dt)
     {
         GLFWwindow* handle = m_window->Handle();
         ImGuiIO& io = ImGui::GetIO();
@@ -115,36 +115,41 @@ namespace RoyalGL
         m_lastMouseX = mouseX;
         m_lastMouseY = mouseY;
 
-        if (io.WantCaptureMouse)
+        // Hold right mouse button to look around; the cursor is captured
+        // (hidden, unbounded deltas) for the duration so panning past the
+        // window edge keeps working.
+        bool rightDown = !io.WantCaptureMouse && glfwGetMouseButton(handle, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
+        if (rightDown && !m_flying)
         {
-            m_orbiting = false;
-            m_panning = false;
-            return;
+            glfwSetInputMode(handle, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+            dx = dy = 0.0; // suppress the jump on the press frame
+        }
+        else if (!rightDown && m_flying)
+        {
+            glfwSetInputMode(handle, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+        }
+        m_flying = rightDown;
+
+        if (rightDown)
+        {
+            // Vertical axis inverted: moving the mouse up looks down.
+            m_scene->camera.Look(static_cast<float>(-dx) * 0.25f, static_cast<float>(-dy) * 0.25f);
         }
 
-        bool leftDown = glfwGetMouseButton(handle, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
-        bool rightDown = glfwGetMouseButton(handle, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
-        bool middleDown = glfwGetMouseButton(handle, GLFW_MOUSE_BUTTON_MIDDLE) == GLFW_PRESS;
+        if (io.WantCaptureKeyboard) return;
 
-        if (leftDown)
-        {
-            m_scene->camera.Orbit(static_cast<float>(-dx) * 0.25f, static_cast<float>(-dy) * 0.25f);
-            m_orbiting = true;
-        }
-        else
-        {
-            m_orbiting = false;
-        }
+        glm::vec3 move{0.0f};
+        if (glfwGetKey(handle, GLFW_KEY_W) == GLFW_PRESS) move.z += 1.0f;
+        if (glfwGetKey(handle, GLFW_KEY_S) == GLFW_PRESS) move.z -= 1.0f;
+        if (glfwGetKey(handle, GLFW_KEY_D) == GLFW_PRESS) move.x += 1.0f;
+        if (glfwGetKey(handle, GLFW_KEY_A) == GLFW_PRESS) move.x -= 1.0f;
+        if (glfwGetKey(handle, GLFW_KEY_SPACE) == GLFW_PRESS) move.y += 1.0f;
+        if (glfwGetKey(handle, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS) move.y -= 1.0f;
 
-        if (rightDown || middleDown)
+        if (move != glm::vec3{0.0f})
         {
-            float panScale = 0.0025f * glm::length(m_scene->camera.position - m_scene->camera.target);
-            m_scene->camera.Pan(static_cast<float>(-dx) * panScale, static_cast<float>(dy) * panScale);
-            m_panning = true;
-        }
-        else
-        {
-            m_panning = false;
+            constexpr float kFlySpeed = 3.0f; // units/second
+            m_scene->camera.Move(glm::normalize(move) * kFlySpeed * dt);
         }
     }
 

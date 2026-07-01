@@ -4,7 +4,7 @@
 
 namespace RoyalGL
 {
-    // Orbit camera. Stores position/target directly (rather than
+    // Free-fly camera. Stores position/target directly (rather than
     // yaw/pitch/distance) so it composes trivially with glTF camera nodes;
     // Forward/Right/Up are derived on demand.
     class Camera
@@ -19,10 +19,13 @@ namespace RoyalGL
         glm::vec3 Right() const;
         glm::vec3 Up() const;
 
-        // Orbit-style mouse controls.
-        void Orbit(float dYawDegrees, float dPitchDegrees);
+        // Mouse-look: rotates the view direction about the (fixed) position.
+        void Look(float dYawDegrees, float dPitchDegrees);
+        // Scroll-wheel zoom: moves position toward/away from target.
         void Dolly(float dScroll);
-        void Pan(float dx, float dy);
+        // WASD-style fly movement, in the camera's local axes:
+        // x = right, y = world-up, z = forward.
+        void Move(const glm::vec3& localDelta);
 
         bool operator==(const Camera& other) const;
         bool operator!=(const Camera& other) const { return !(*this == other); }

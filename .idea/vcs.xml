@@ -3,12 +3,5 @@
   <component name="VcsDirectoryMappings">
     <mapping directory="" vcs="Git" />
     <mapping directory="$PROJECT_DIR$" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/cmake-build-msvc/_deps/cgltf-src" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/cmake-build-msvc/_deps/glew-src" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/cmake-build-msvc/_deps/glfw-src" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/cmake-build-msvc/_deps/glm-src" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/cmake-build-msvc/_deps/imgui-src" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/cmake-build-msvc/_deps/stb-src" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/cmake-build-msvc/_deps/tinybvh-src" vcs="Git" />
   </component>
 </project>
