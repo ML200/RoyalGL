@@ -1,0 +1,347 @@
+#version 460 core
+#include "common.glsl"
+#include "lens_common.glsl"
+
+// Forward light-tracing pass for lens flares/ghosts and aperture
+// diffraction (Steinert et al. 2011, Sec 4.3/4.4). Each invocation samples
+// a point on an emissive triangle, deterministically aims a ray at the lens
+// system's front element (the paper's "deterministically connecting them
+// to the lens"), walks the lens surfaces front-to-back with a STOCHASTIC
+// per-surface reflect-or-refract choice (the mechanism that produces
+// aperture ghosts from internal reflections), and if the walk reaches the
+// sensor within its physical bounds, emits a splat record consumed by
+// shaders/lens_flare_splat.vert/.frag. See docs/ARCHITECTURE.md for the
+// radiometric-normalization derivation and the barrier sequence this pass
+// requires around it.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+uniform uint uSamplesPerDispatch;
+uniform uint uMaxSplats;
+uniform float uFlareIntensity;
+uniform int uEnableDiffraction; // 0/1
+uniform float uDiffractionEdgeEpsilonMM;
+uniform float uDiffractionBranchProbability;
+uniform float uDiffractionIntensity;
+
+// Dominant aperture ghosts come from exactly 2 internal reflections
+// (Steinert et al. 2011, Fig. 12 discussion); capping here bounds worst-case
+// cost and keeps the per-surface stochastic walk from running away.
+const uint MAX_INTERNAL_REFLECTIONS = 2u;
+
+float Luminance(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+// Binary search over the power-proportional CDF built by LightList::Build().
+uint SampleLightIndex(float u, out float pdf)
+{
+    uint count = uint(lights.length());
+    uint lo = 0u, hi = count - 1u;
+    while (lo < hi)
+    {
+        uint mid = (lo + hi) >> 1u;
+        if (lightCDF[mid] < u) lo = mid + 1u; else hi = mid;
+    }
+    float prevCdf = (lo == 0u) ? 0.0 : lightCDF[lo - 1u];
+    pdf = lightCDF[lo] - prevCdf;
+    return lo;
+}
+
+// Keller/UTD wedge-diffraction coefficient (Steinert et al. 2011, Eq. 1),
+// simplified to alpha=0 (n=2) per the paper's own "infinitely thin
+// aperture" assumption (Sec 4.4). The cos(pi/4) prefactor is transcribed
+// literally from the paper (cross-checked against two independent PDF text
+// extractions - see docs/ARCHITECTURE.md); the overall radiometric scale is
+// not independently verified, hence uDiffractionIntensity as a calibration
+// knob. This factor is wavelength-independent - the paper's L_i*lambda
+// prefactor is applied separately, per RGB channel, by the caller.
+const float DIFFRACTION_C = 0.70710678; // cos(pi/4)
+const float WEDGE_N = 2.0;
+
+float DiffractionCoefficient(float gamma, float delta, float beta)
+{
+    float sinBeta = max(sin(beta), 1e-4);
+    float numerator = DIFFRACTION_C * sin(PI / WEDGE_N);
+    float denom = WEDGE_N * PI * sinBeta * (cos(PI / WEDGE_N) - cos((delta - gamma) / WEDGE_N));
+    // The naive (non-transition-corrected) Keller coefficient has a known
+    // singularity near geometric shadow/reflection boundaries; this epsilon
+    // clamp is a numerical band-aid, not a physically correct fix (see
+    // docs/ARCHITECTURE.md).
+    if (abs(denom) < 1e-5) denom = (denom < 0.0) ? -1e-5 : 1e-5;
+    float amplitude = numerator / denom;
+    return amplitude * amplitude;
+}
+
+// Distance from `p` (aperture-plane local 2D point) to the nearest edge of
+// the regular N-gon blade polygon (same (bladeCount, rotation, radius)
+// triple the primary tracer's PointInsideApertureBlades reads), plus that
+// edge's local 2D tangent/normal. Vertices are derived analytically here -
+// no separate blade-geometry buffer needed. bladeCount < 3 (circular
+// aperture) has no discrete edges to diffract from.
+float NearestBladeEdge(vec2 p, float apertureRadius, float bladeCount, float rotation,
+                        out vec2 edgeTangent, out vec2 edgeNormal)
+{
+    float bestDist = 1e30;
+    edgeTangent = vec2(1.0, 0.0);
+    edgeNormal = vec2(0.0, 1.0);
+    if (bladeCount < 3.0) return bestDist;
+
+    int n = int(bladeCount);
+    for (int i = 0; i < n; i++)
+    {
+        float a0 = rotation + (2.0 * PI * float(i)) / bladeCount;
+        float a1 = rotation + (2.0 * PI * float(i + 1)) / bladeCount;
+        vec2 a = apertureRadius * vec2(cos(a0), sin(a0));
+        vec2 b = apertureRadius * vec2(cos(a1), sin(a1));
+        vec2 ab = b - a;
+        float len = length(ab);
+        vec2 tangent = ab / max(len, 1e-8);
+        vec2 ap = p - a;
+        float t = clamp(dot(ap, tangent), 0.0, len);
+        vec2 closest = a + tangent * t;
+        float d = length(p - closest);
+        if (d < bestDist)
+        {
+            bestDist = d;
+            edgeTangent = tangent;
+            edgeNormal = vec2(-tangent.y, tangent.x);
+        }
+    }
+    return bestDist;
+}
+
+// Samples a direction on the Keller cone: axis = edge tangent, half-angle =
+// beta (the angle of incidence to the edge, per Keller's law of edge
+// diffraction), uniform in azimuth around the cone.
+vec3 SampleKellerCone(vec3 axis, float beta, vec2 u)
+{
+    vec3 up = (abs(axis.z) < 0.999) ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    vec3 tangent = normalize(cross(up, axis));
+    vec3 bitangent = cross(axis, tangent);
+    float phi = 2.0 * PI * u.y;
+    return normalize(cos(beta) * axis + sin(beta) * (cos(phi) * tangent + sin(phi) * bitangent));
+}
+
+void EmitSplat(vec2 pixelF, vec3 radiance, ivec2 imageSize)
+{
+    if (pixelF.x < 0.0 || pixelF.y < 0.0 || pixelF.x >= float(imageSize.x) || pixelF.y >= float(imageSize.y)) return;
+    if (any(isnan(radiance)) || any(isinf(radiance))) return;
+
+    uint idx = atomicAdd(splatCount, 1u);
+    if (idx >= uMaxSplats) return; // fixed capacity, graceful overflow drop (self-corrects next frame)
+    splats[idx].pixelRadianceRG = vec4(pixelF, radiance.r, radiance.g);
+    splats[idx].radianceBValid = vec4(radiance.b, 1.0, 0.0, 0.0);
+}
+
+void main()
+{
+    uint sampleId = gl_GlobalInvocationID.x;
+    if (sampleId >= uSamplesPerDispatch) return;
+    if (lights.length() == 0) return;
+    int surfaceCount = lensSurfaces.length();
+    if (surfaceCount == 0) return;
+
+    g_rngState = WangHash(sampleId * 9781u + uFrame.frameInfo.z * 6271u + 17u);
+    RandomFloat();
+
+    // ---- 1. Sample a point on a light (power-proportional selection) ----
+    float lightPdf;
+    uint lightIdx = SampleLightIndex(RandomFloat(), lightPdf);
+    LightTriangle lt = lights[lightIdx];
+
+    vec2 bary = RandomFloat2();
+    if (bary.x + bary.y > 1.0) bary = vec2(1.0) - bary;
+    vec3 P = lt.p0.xyz * (1.0 - bary.x - bary.y) + lt.p1.xyz * bary.x + lt.p2.xyz * bary.y;
+    vec3 lightNormal = lt.normal_area.xyz;
+    float lightArea = lt.normal_area.w;
+    float pdfAreaP = lightPdf / max(lightArea, 1e-12);
+
+    // ---- 2. Deterministically aim at a point on the front element's clear
+    //         aperture (the paper's "deterministically connecting them to
+    //         the lens" - see docs/ARCHITECTURE.md for the bidirectional
+    //         area-to-area connection this forms). ----
+    float frontSemiDiamMM = lensSurfaces[0].geometry.z;
+    float frontZmm = lensSurfaces[0].iorRGB_z.w;
+    vec2 diskXY = SampleApertureDiskMM(frontSemiDiamMM, RandomFloat2());
+    vec3 Qworld = WorldFromLensMM(vec3(diskXY, frontZmm));
+
+    vec3 toQ = Qworld - P;
+    float dist2 = dot(toQ, toQ);
+    float dist = sqrt(max(dist2, 1e-12));
+    vec3 dirWorld = toQ / dist;
+
+    float cosLight = dot(dirWorld, lightNormal);
+    if (cosLight <= 0.0) return; // sampled the light's back face
+    float cosLens = dot(-dirWorld, uFrame.camForward.xyz);
+    if (cosLens <= 0.0) return; // aiming disk faces away from the light
+
+    float frontSemiDiamM = frontSemiDiamMM * 0.001;
+    float pdfAreaQ = 1.0 / max(PI * frontSemiDiamM * frontSemiDiamM, 1e-12);
+
+    // ---- 3. Visibility: scene occlusion between the light and the lens ----
+    Ray shadowRay = MakeRay(P + dirWorld * 1e-4, dirWorld);
+    Hit shadowHit;
+    if (IntersectScene(shadowRay, shadowHit) && shadowHit.t < dist - 1e-3) return;
+
+    // ---- 4. Connection throughput: standard bidirectional vertex-to-vertex
+    //         area-measure connection, G(P,Q) = cosP*cosQ/dist^2, divided by
+    //         both sides' area pdfs. See docs/ARCHITECTURE.md for the full
+    //         derivation of why dividing by uSamplesPerDispatch here (and
+    //         nothing else) makes the combined image radiometrically
+    //         correct after PathTracer's existing /sampleCount tonemap.
+    //         This is a FLUX estimate (light area x lens area, via the two
+    //         Monte-Carlo 1/pdfArea factors) - step 6 below still needs to
+    //         divide by the sensor pixel's own physical area to turn it into
+    //         an irradiance/radiance-comparable quantity before splatting,
+    //         same as PathTracer's `sampleRadiance`. ----
+    float G = (cosLight * cosLens) / max(dist2, 1e-12);
+    vec3 throughput = lt.emissive.xyz * G / max(pdfAreaP * pdfAreaQ, 1e-12);
+    throughput /= float(uSamplesPerDispatch);
+
+    // ---- 5. Walk the lens front-to-back (index 0 -> N-1) with a stochastic
+    //         reflect-or-refract choice at every refractive surface. ----
+    vec3 O = LensMMFromWorld(P);
+    vec3 D = LensDirFromWorld(dirWorld);
+    vec3 currentIOR = vec3(1.0); // object space is air
+    int surfaceIndex = 0;
+    int direction = 1;
+    uint reflectionCount = 0u;
+
+    for (uint step = 0u; step < 32u; step++)
+    {
+        if (surfaceIndex < 0) return; // exited back out the front - dead path
+        if (surfaceIndex >= surfaceCount) break; // passed the last surface -> travels through air to the sensor
+
+        LensSurface surf = lensSurfaces[surfaceIndex];
+        bool isAperture = surf.geometry.w > 0.5;
+        float radius = isAperture ? 0.0 : surf.geometry.x;
+        float semiDiam = surf.geometry.z;
+        float zVertex = surf.iorRGB_z.w;
+
+        vec3 hitPos, normal;
+        if (!IntersectLensSurface(O, D, zVertex, radius, semiDiam, hitPos, normal)) return;
+
+        if (isAperture)
+        {
+            float bladeCount = surf.apertureData.x;
+            float rotation = surf.apertureData.y;
+            float apRadius = surf.apertureData.z;
+            if (!PointInsideApertureBlades(hitPos.xy, apRadius, bladeCount, rotation)) return;
+
+            bool diffracted = false;
+            if (uEnableDiffraction != 0)
+            {
+                vec2 edgeTangent2D, edgeNormal2D;
+                float distToEdge = NearestBladeEdge(hitPos.xy, apRadius, bladeCount, rotation, edgeTangent2D, edgeNormal2D);
+                if (distToEdge < uDiffractionEdgeEpsilonMM)
+                {
+                    float pDiffract = clamp(uDiffractionBranchProbability, 0.01, 0.99);
+                    if (RandomFloat() < pDiffract)
+                    {
+                        vec3 edgeTangent = vec3(edgeTangent2D, 0.0);
+                        vec3 edgeNormal3D = vec3(edgeNormal2D, 0.0);
+                        float beta = acos(clamp(abs(dot(D, edgeTangent)), 0.0, 1.0));
+                        vec3 diffractedDir = SampleKellerCone(edgeTangent, beta, RandomFloat2());
+
+                        vec3 inProj = D - edgeTangent * dot(D, edgeTangent);
+                        vec3 outProj = diffractedDir - edgeTangent * dot(diffractedDir, edgeTangent);
+                        float gamma = (length(inProj) > 1e-6) ? acos(clamp(dot(normalize(inProj), edgeNormal3D), -1.0, 1.0)) : 0.0;
+                        float delta = (length(outProj) > 1e-6) ? acos(clamp(dot(normalize(outProj), edgeNormal3D), -1.0, 1.0)) : 0.0;
+
+                        float coeff = DiffractionCoefficient(gamma, delta, beta);
+                        vec3 relativeWavelength = kLensWavelengthsNm / kLensWavelengthsNm.y; // normalized so the default intensity multiplier stays near 1x
+                        throughput *= coeff * relativeWavelength * uDiffractionIntensity / pDiffract;
+
+                        O = hitPos;
+                        D = diffractedDir;
+                        diffracted = true;
+                    }
+                    else
+                    {
+                        throughput /= (1.0 - pDiffract);
+                    }
+                }
+            }
+
+            if (!diffracted) O = hitPos; // plain transmission: direction/medium unchanged (air both sides)
+            surfaceIndex += direction;
+            continue;
+        }
+
+        // Refractive surface: unpolarized Fresnel reflectance per RGB channel.
+        vec3 n2 = (direction > 0) ? surf.iorRGB_z.xyz
+                                   : ((surfaceIndex == 0) ? vec3(1.0) : lensSurfaces[surfaceIndex - 1].iorRGB_z.xyz);
+        float cosI = abs(dot(D, normal));
+        vec3 Rf = vec3(
+            FresnelDielectric(cosI, currentIOR.r, n2.r),
+            FresnelDielectric(cosI, currentIOR.g, n2.g),
+            FresnelDielectric(cosI, currentIOR.b, n2.b));
+        Rf = clamp(Rf * surf.coatingRGB.xyz, vec3(0.0), vec3(1.0));
+
+        float pReflect = clamp(Luminance(Rf), 0.02, 0.98);
+        if (RandomFloat() < pReflect)
+        {
+            throughput *= Rf / pReflect;
+            reflectionCount++;
+            if (reflectionCount > MAX_INTERNAL_REFLECTIONS) return;
+            vec3 newDir = reflect(D, normal);
+            O = hitPos + newDir * 1e-4;
+            D = newDir;
+            direction = -direction; // reflection reverses the walk's traversal direction
+        }
+        else
+        {
+            throughput *= (vec3(1.0) - Rf) / (1.0 - pReflect);
+            float eta = currentIOR.g / n2.g; // hero-wavelength (green) refraction direction
+            vec3 refracted;
+            if (!RefractSnell(D, normal, eta, refracted)) return; // TIR
+            O = hitPos + refracted * 1e-4;
+            D = normalize(refracted);
+            currentIOR = n2;
+        }
+        surfaceIndex += direction;
+    }
+
+    // ---- 6. Past the last surface: continue in air to the sensor plane
+    //         (local z=0), then convert to the same pixel-coordinate
+    //         convention pathtrace.comp uses (see docs/ARCHITECTURE.md for
+    //         why no extra Y-flip is needed here, unlike tonemap.frag). ----
+    if (abs(D.z) < 1e-9) return;
+    float tSensor = (0.0 - O.z) / D.z;
+    if (tSensor <= 0.0) return;
+    vec2 sensorHitMM = (O + tSensor * D).xy;
+
+    float sensorWidthMM = uFrame.lensParams.z;
+    float aspect = uFrame.lensParams.y;
+    float sensorHeightMM = sensorWidthMM / aspect;
+    if (abs(sensorHitMM.x) > sensorWidthMM * 0.5 || abs(sensorHitMM.y) > sensorHeightMM * 0.5) return;
+
+    // Inverse of pathtrace.comp's sensorPosMM mapping (see the comment
+    // there): that forward mapping pre-inverts to compensate for the lens's
+    // natural image inversion, so this inverse must negate the same way
+    // (both axes), not match the naive un-inverted pinhole convention.
+    vec2 ndcHit = vec2(-sensorHitMM.x / (sensorWidthMM * 0.5), sensorHitMM.y / (sensorHeightMM * 0.5));
+    ivec2 imageSize = ivec2(uFrame.frameInfo.xy);
+    vec2 pixelF = (ndcHit * 0.5 + 0.5) * vec2(imageSize);
+
+    // The connection throughput above (step 4) is a FLUX estimate (Watts),
+    // not a radiance/irradiance value - converting it to a per-pixel value
+    // comparable to PathTracer's `sampleRadiance` (which is what actually
+    // gets accumulated/tonemapped) requires dividing by the physical area
+    // of one sensor pixel. Missing this made every splat many orders of
+    // magnitude too dim to see against the noise floor (a pixel is a tiny
+    // fraction of a square millimeter) - see docs/ARCHITECTURE.md.
+    float pixelWidthM = (sensorWidthMM * 0.001) / float(imageSize.x);
+    float pixelHeightM = (sensorHeightMM * 0.001) / float(imageSize.y);
+    float pixelAreaM2 = max(pixelWidthM * pixelHeightM, 1e-20);
+    throughput /= pixelAreaM2;
+
+    // Artist-facing calibration multiplier (RenderSettings::flareIntensity) -
+    // the pixel-area conversion above is dimensionally correct but the
+    // resulting absolute scale still depends on scene-specific factors
+    // (how bright/small the lights are, how far from the lens, aperture
+    // size) that make a universally-correct default impossible - see
+    // docs/ARCHITECTURE.md.
+    throughput *= uFlareIntensity;
+
+    EmitSplat(pixelF, throughput, imageSize);
+}

@@ -1,0 +1,18 @@
+# RoyalGL lens prescription
+# Reference copy of the built-in Tessar preset (LensPrescription::BuiltinTessar()).
+# Steinert, Dammertz, Hanika & Lensch 2011, "General Spectral Camera Lens
+# Simulation", Figure 4: Tessar Design by Brendel (USP 2854889).
+name       Tessar (Brendel, USP 2854889) f/2.8 100mm EFL
+efl_mm     100.0
+fstop      2.8
+sensor_mm  36.0 24.0
+
+# radius_mm  thickness_mm  material  semi_diameter_mm
+    42.970        9.8        LAK9        19.2
+  -115.330        2.1        LLF7        19.2
+   306.840        4.16       air         19.2
+     0.0          4.0        air         15.0     aperture
+   -59.060        1.870      SF7         17.3
+    40.930       10.640      air         17.3
+   183.920        7.050      LAK9        16.5
+   -48.910       79.831      air         16.5

@@ -30,3 +30,19 @@
 *.exe
 *.out
 *.app
+
+# Build directories
+/build/
+/cmake-build-*/
+/out/
+
+# CMake FetchContent cache
+_deps/
+
+# Large user-provided scenes dropped into assets (keep repo lean; sample assets are tracked explicitly)
+/assets/scenes/*
+!/assets/scenes/.gitkeep
+!/assets/scenes/*.glb
+
+# Exported renders
+*.render.png
