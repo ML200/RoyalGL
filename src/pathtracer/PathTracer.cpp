@@ -168,7 +168,7 @@ namespace RoyalGL
         uint32_t restirFlags = (restirActive ? 1u : 0u)
                              | (settings.restirTemporal ? 2u : 0u)
                              | (settings.restirSpatial ? 4u : 0u)
-                             | (settings.restirAccumulate ? 8u : 0u);
+                             | (settings.accumulate ? 8u : 0u);
         frame.restirParams = glm::uvec4(static_cast<uint32_t>(settings.restirDebugView),
                                         restirFlags, m_frameCounter, m_restirParity);
 

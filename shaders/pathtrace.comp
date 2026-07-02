@@ -177,6 +177,6 @@ void main()
 
     if (any(isnan(sampleRadiance)) || any(isinf(sampleRadiance))) sampleRadiance = vec3(0.0);
 
-    vec4 prev = (sampleIndex == 0u) ? vec4(0.0) : imageLoad(uAccum, pixel);
+    vec4 prev = (sampleIndex == 0u || !AccumulateFrames()) ? vec4(0.0) : imageLoad(uAccum, pixel);
     imageStore(uAccum, pixel, prev + vec4(sampleRadiance, 1.0));
 }

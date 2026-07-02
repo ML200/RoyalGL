@@ -75,6 +75,9 @@ namespace RoyalGL
         ImGui::ColorEdit3("Background", &settings.backgroundColor.x);
         ImGui::SliderFloat("Background intensity", &settings.backgroundIntensity, 0.0f, 5.0f);
         ImGui::SliderInt("Max samples (0=inf)", &settings.maxSamples, 0, 20000);
+        ImGui::Checkbox("Accumulate frames", &settings.accumulate);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Off: every pipeline shows its latest raw sample instead of\nthe progressive average - for live per-frame comparisons.");
 
         ImGui::Separator();
         ImGui::Text("Camera Model");
@@ -140,9 +143,6 @@ namespace RoyalGL
                 ImGui::TextDisabled("Pinhole only - lens mode falls back to plain BDPT.");
             ImGui::Checkbox("Temporal reuse", &settings.restirTemporal);
             ImGui::Checkbox("Spatial reuse", &settings.restirSpatial);
-            ImGui::Checkbox("Accumulate frames", &settings.restirAccumulate);
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Off: show the raw per-frame estimate (1spp + reuse)\ninstead of the progressive average.");
             if (settings.restirSpatial)
             {
                 ImGui::SliderInt("Spatial neighbors", &settings.restirSpatialNeighbors, 1, 8);

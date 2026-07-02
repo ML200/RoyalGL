@@ -36,7 +36,7 @@ void main()
 
     // Accumulation off: show the raw per-frame estimate (what ReSTIR
     // delivers at 1spp) - useful for comparing reuse configurations live.
-    vec4 prev = (uFrame.frameInfo.z == 0u || !RestirAccumulateEnabled())
+    vec4 prev = (uFrame.frameInfo.z == 0u || !AccumulateFrames())
                     ? vec4(0.0) : imageLoad(uAccum, pixel);
     imageStore(uAccum, pixel, prev + vec4(color, 1.0));
 }

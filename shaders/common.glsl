@@ -51,8 +51,14 @@ layout(std140, binding = 0) uniform FrameUBO
     vec4 prevCamRight;
     vec4 prevCamUp;
     vec4 prevCameraParams; // x=tanHalfFovY, y=aspect
-    uvec4 restirParams;    // x=debug view, y=ReSTIR active (0/1), z=frame counter, w=ping-pong parity
+    uvec4 restirParams;    // x=debug view, y=flags (bit0 restir, bit1 temporal, bit2 spatial,
+                           //   bit3 accumulate frames), z=frame counter, w=ping-pong parity
 } uFrame;
+
+// Global accumulation toggle: off = every pipeline overwrites the image
+// with its latest sample instead of averaging, for live per-frame quality
+// comparisons (naive PT / NEE / BDPT / ReSTIR).
+bool AccumulateFrames() { return (uFrame.restirParams.y & 8u) != 0u; }
 
 layout(std430, binding = 1) readonly buffer BVHNodesSSBO   { BVHNode bvhNodes[]; };
 layout(std430, binding = 2) readonly buffer TriIndicesSSBO { uint triIndices[]; };

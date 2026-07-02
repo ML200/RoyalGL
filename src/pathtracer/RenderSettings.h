@@ -50,10 +50,11 @@ namespace RoyalGL
         bool restirSpatial = true;
         int restirSpatialNeighbors = 3;
         float restirSpatialRadius = 30.0f; // pixels
-        // Off: the resolve pass overwrites the image with the raw per-frame
-        // estimate instead of averaging - what ReSTIR actually delivers at
-        // 1spp, for comparing reuse configurations live.
-        bool restirAccumulate = true;
+
+        // Global: off = every pipeline overwrites the image with its latest
+        // sample instead of averaging, so naive PT / NEE / BDPT / ReSTIR
+        // per-frame quality can be compared live.
+        bool accumulate = true;
 
         // Physical lens camera (Steinert et al. 2011). Lens mode renders
         // through the unidirectional pipeline regardless of enableBidir -
@@ -76,7 +77,7 @@ namespace RoyalGL
                    restirSpatial == other.restirSpatial &&
                    restirSpatialNeighbors == other.restirSpatialNeighbors &&
                    restirSpatialRadius == other.restirSpatialRadius &&
-                   restirAccumulate == other.restirAccumulate &&
+                   accumulate == other.accumulate &&
                    cameraMode == other.cameraMode &&
                    lens == other.lens;
         }

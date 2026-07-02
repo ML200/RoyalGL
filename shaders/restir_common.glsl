@@ -98,10 +98,10 @@ const uint RESTIR_MAX_VERTS = 8u;
 
 // --------------------------------------------------- regions & G-buffer ---
 // restirParams: x=debug view, y=flags (bit0 active, bit1 temporal reuse,
-// bit2 spatial reuse, bit3 accumulate frames), z=frame counter, w=parity.
+// bit2 spatial reuse, bit3 accumulate frames - see AccumulateFrames() in
+// common.glsl), z=frame counter, w=parity.
 bool RestirTemporalEnabled()  { return (uFrame.restirParams.y & 2u) != 0u; }
 bool RestirSpatialEnabled()   { return (uFrame.restirParams.y & 4u) != 0u; }
-bool RestirAccumulateEnabled(){ return (uFrame.restirParams.y & 8u) != 0u; }
 
 uint RestirRegionOffset(uint region) { return region * RestirPixelCount(); }
 uint RestirFinalRegion() { return uFrame.restirParams.w; }        // parity

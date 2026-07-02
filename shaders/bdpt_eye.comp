@@ -260,6 +260,8 @@ void main()
 
     if (any(isnan(radiance)) || any(isinf(radiance))) radiance = vec3(0.0);
 
-    vec4 prev = (sampleIndex == 0u) ? vec4(0.0) : imageLoad(uAccum, pixel);
+    // With accumulation off the eye pass overwrites its sample; the splat
+    // resolve then adds the same sample's t=1 contribution on top.
+    vec4 prev = (sampleIndex == 0u || !AccumulateFrames()) ? vec4(0.0) : imageLoad(uAccum, pixel);
     imageStore(uAccum, pixel, prev + vec4(radiance, 1.0));
 }

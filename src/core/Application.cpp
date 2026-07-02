@@ -95,7 +95,7 @@ namespace RoyalGL
         if (const char* v = std::getenv("ROYALGL_LENS")) m_settings.cameraMode = (v[0] != '0') ? CameraMode::Lens : CameraMode::Pinhole;
         m_statsEnabled = (std::getenv("ROYALGL_STATS") != nullptr);
         if (const char* v = std::getenv("ROYALGL_STATS_INTERVAL")) m_statsInterval = std::max(std::atoi(v), 1);
-        if (const char* v = std::getenv("ROYALGL_RESTIR_ACCUM")) m_settings.restirAccumulate = (v[0] != '0');
+        if (const char* v = std::getenv("ROYALGL_ACCUM")) m_settings.accumulate = (v[0] != '0');
 
         m_lastCamera = m_scene->camera;
         m_lastSettings = m_settings;
