@@ -1,0 +1,42 @@
+#version 460 core
+#include "common.glsl"
+#include "restir_common.glsl"
+
+// ReSTIR pass: shade the final reservoirs into the accumulation image.
+// The GRIS estimate for a pixel is omega_tau(Y) * f(Y) * W_Y (paper Eq. 22);
+// primary-miss pixels show the background directly (deterministic, nothing
+// to resample). Accumulates like the other kernels: sample 0 overwrites,
+// later samples add, per-pixel count in alpha.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(rgba32f, binding = 0) uniform image2D uAccum;
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = ivec2(uFrame.frameInfo.xy);
+    if (pixel.x >= size.x || pixel.y >= size.y) return;
+
+    uint idx = RestirPixelIndex(pixel);
+    GBufferPixel g = gbuf[GBufCurOffset() + idx];
+
+    vec3 color;
+    if (g.posDepth.w < 0.0)
+    {
+        color = uFrame.background.rgb * uFrame.background.a;
+    }
+    else
+    {
+        PathReservoir r = pixelRes[RestirRegionOffset(RestirFinalRegion()) + idx].path;
+        float omega = r.rcInfo.z;
+        color = omega * r.fSeed.xyz * r.core.x;
+    }
+    if (any(isnan(color)) || any(isinf(color))) color = vec3(0.0);
+
+    // Accumulation off: show the raw per-frame estimate (what ReSTIR
+    // delivers at 1spp) - useful for comparing reuse configurations live.
+    vec4 prev = (uFrame.frameInfo.z == 0u || !RestirAccumulateEnabled())
+                    ? vec4(0.0) : imageLoad(uAccum, pixel);
+    imageStore(uAccum, pixel, prev + vec4(color, 1.0));
+}

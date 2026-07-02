@@ -1,0 +1,315 @@
+#version 460 core
+#include "common.glsl"
+#include "light_tree.glsl"
+#include "bdpt_common.glsl"
+#include "restir_common.glsl"
+
+// ReSTIR pass: initial candidate generation + streaming RIS (paper Alg. 2,
+// restricted to Phase 1's camera-side techniques). One camera subpath per
+// pixel, anchored at the G-buffer primary hit (pixel center, no jitter).
+// At every vertex the two available techniques produce candidates:
+//   s=0 - the subpath hits an emitter (or the environment) via BSDF sampling,
+//   s=1 - next event estimation toward the camera-anchored light CDF,
+// each carrying its 2-technique balance-heuristic MIS weight omega_tau.
+// Candidates are streamed into the pixel's reservoir with resampling weight
+//   w = m * pHat * (1/p) = omega * lum(f) / p        (m = 1, Eq. 26 t>=2)
+// and the winner keeps the data every shift needs: the replay seed, the
+// reconnection vertex x_r (first vertex whose predecessor pair is
+// connectable), the suffix radiance L_suf leaving x_r (direction-independent
+// for Lambertian/one-sided-emitter x_r), and the replayed-scatter pdf
+// product for Jacobians.
+//
+// f / pdf convention (see restir_common.glsl): delta scatters contribute
+// choicePdf to pdfs and choicePdf*tint to f; the delta distributions cancel
+// in every ratio. All measures are solid-angle at each vertex.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+vec3 SafeDiv(vec3 num, vec3 den)
+{
+    return vec3(den.x > 0.0 ? num.x / den.x : 0.0,
+                den.y > 0.0 ? num.y / den.y : 0.0,
+                den.z > 0.0 ? num.z / den.z : 0.0);
+}
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = ivec2(uFrame.frameInfo.xy);
+    if (pixel.x >= size.x || pixel.y >= size.y) return;
+
+    uint idx = RestirPixelIndex(pixel);
+    uint outSlot = RestirRegionOffset(RestirCandidateOutRegion()) + idx;
+
+    GBufferPixel g = gbuf[GBufCurOffset() + idx];
+    if (g.posDepth.w < 0.0)
+    {
+        // Primary miss: the resolve pass adds the background directly.
+        pixelRes[outSlot].path = RestirEmptyReservoir();
+        return;
+    }
+
+    // Per-path base seed: pixel + never-resetting frame counter, so every
+    // frame contributes fresh, replayable candidates.
+    uint frameC = uFrame.restirParams.z;
+    g_rngSeed = WangHash(uint(pixel.x) * 1973u + uint(pixel.y) * 9277u + frameC * 26699u + 7u);
+    uint camSeed = g_rngSeed;
+    uint risRng = WangHash(camSeed ^ 0x5f356495u);
+    if (risRng == 0u) risRng = 0x9E3779B9u;
+
+    // Streaming RIS state (selected candidate kept in registers).
+    float wSum = 0.0;
+    PathReservoir sel = RestirEmptyReservoir();
+
+    // ------------------------------------------------------ path state ----
+    Ray primary = RestirPrimaryRay(pixel);
+    vec3 x = g.posDepth.xyz;
+    vec3 n = g.normalMat.xyz;
+    uint matId = GBufMaterial(g);
+    uint triIdx = GBufTriangle(g);
+    vec3 wi = -primary.dir;
+
+    vec3 fCur = vec3(1.0);   // product of rho*cos (f units, pdf-free) up to the current vertex
+    float pProd = 1.0;       // product of all sampled pdfs so far (solid angle)
+    uint deltaMask = 0u;
+    bool haveLights = uFrame.lightInfo.x > 0u;
+    uint maxLen = BdptMaxPathLength();
+
+    // Last sampled edge (arriving at the current vertex): continuous solid-
+    // angle pdf and squared length - feed the s=0 MIS weight. Zero pdf marks
+    // "previous vertex was delta or this is the primary hit".
+    float lastEdgePdfW = 0.0;
+    float lastEdgeDist2 = 0.0;
+
+    // Reconnection bookkeeping: r = first vertex index >= 2 whose
+    // predecessor pair (x_{r-1}, x_r) is both-connectable.
+    bool rcFound = false;
+    uint rcIdx = 0u;
+    vec3 rcPos = vec3(0.0), rcNrm = vec3(0.0);
+    uint rcMat = NO_MATERIAL;
+    float rcBaseCos = 0.0, rcBaseDist2 = 0.0;
+    float replayPdfBase = 1.0;  // pdf product over scatters at vertices 1..r-2
+    vec3 fArriveRc = vec3(1.0); // f at arrival of x_r (prefix incl. scatter at x_{r-1})
+    float pdfPrevArrival = 1.0; // pProd at arrival of the PREVIOUS vertex
+    bool prevConnectable = false;
+
+    // pathLen: index of the current vertex (x_1 = primary hit).
+    for (uint pathLen = 1u; pathLen <= BDPT_MAX_LIGHT_VERTS; ++pathLen)
+    {
+        Material mat = materials[matId];
+        bool isDelta = MatIsDelta(mat);
+        if (isDelta) deltaMask |= 1u << (pathLen - 1u);
+        bool isEmissive = dot(mat.emissive.rgb, mat.emissive.rgb) > 0.0;
+
+        // Reconnection vertex: first connectable pair. Emitters and lights
+        // count as connectable; delta (glass) does not.
+        bool selfConnectable = !isDelta;
+        if (!rcFound && pathLen >= 2u && prevConnectable && selfConnectable)
+        {
+            rcFound = true;
+            rcIdx = pathLen;
+            rcPos = x;
+            rcMat = matId;
+            // Oriented toward the base predecessor's side.
+            rcNrm = (dot(n, wi) >= 0.0) ? n : -n;
+            rcBaseCos = abs(dot(n, wi));
+            rcBaseDist2 = lastEdgeDist2;
+            // replayPdfBase = scatters 1..r-2 = pProd at arrival of x_{r-1}.
+            replayPdfBase = pdfPrevArrival;
+            fArriveRc = fCur;
+        }
+
+        // ------------------------------------------------------ s = 0 ----
+        // Emitters are one-sided and terminate the path (same convention as
+        // both existing pipelines).
+        if (isEmissive)
+        {
+            uint lightIdx = haveLights ? triToLight[triIdx] : LT_SENTINEL;
+            vec3 lightN = (lightIdx != LT_SENTINEL) ? lightTris[lightIdx].normalArea.xyz : n;
+            float cosHit = dot(lightN, wi);
+            if (cosHit > 1e-6)
+            {
+                float omega = 1.0;
+                if (pathLen > 1u && lastEdgePdfW > 0.0 && lightIdx != LT_SENTINEL)
+                {
+                    // Balance heuristic vs the eval NEE pdf of this point,
+                    // converted to solid angle at x_{k-1}.
+                    float directPdfA, emissionPdfW;
+                    BdptLightPdfs(lightIdx, cosHit, directPdfA, emissionPdfW);
+                    float neePdfW = directPdfA * lastEdgeDist2 / cosHit;
+                    omega = lastEdgePdfW / (lastEdgePdfW + neePdfW);
+                }
+
+                vec3 fCand = fCur * mat.emissive.rgb;
+                float w = omega * RestirLum(fCand) / pProd;
+                if (w > 0.0 && !isnan(w) && !isinf(w))
+                {
+                    PathReservoir cand = RestirEmptyReservoir();
+                    // A directly visible emitter (pathLen==1) or a delta
+                    // predecessor chain leaves rc invalid (pure replay);
+                    // otherwise the first connectable pair found so far is
+                    // the reconnection vertex (possibly this emitter itself).
+                    uint flags = (rcFound ? RESTIR_FLAG_RCVALID : 0u) | (deltaMask << 8);
+                    if (rcFound) flags |= (rcIdx & 0xFu) << 4;
+                    cand.core.w = uintBitsToFloat(RestirPackTech(0u, pathLen + 1u, flags));
+                    cand.fSeed = vec4(fCand, uintBitsToFloat(camSeed));
+                    cand.core.y = omega * RestirLum(fCand);
+                    if (rcFound)
+                    {
+                        cand.rcInfo = vec4(rcBaseCos, rcBaseDist2, omega, replayPdfBase);
+                        cand.rcPosMat = vec4(rcPos, uintBitsToFloat(rcMat));
+                        cand.rcNormal = vec4(rcNrm, 0.0);
+                        cand.rcLsuf = vec4(SafeDiv(fCand, fArriveRc), 0.0);
+                    }
+                    else
+                    {
+                        // Pure replay: all sampled scatters are replayed.
+                        cand.rcInfo = vec4(0.0, 0.0, omega, pProd);
+                    }
+
+                    wSum += w;
+                    if (RestirRand(risRng) * wSum <= w) sel = cand;
+                }
+            }
+            break; // paths terminate on emitters
+        }
+
+        if (pathLen >= maxLen) break;
+
+        // ------------------------------------------------------ s = 1 ----
+        if (!isDelta && haveLights)
+        {
+            RngStream(pathLen, RNG_NEE);
+            float pickPdfTrue;
+            uint lightIdx = BdptSampleLightIndex(pickPdfTrue);
+            LightTri lt = lightTris[lightIdx];
+            vec3 lightPos = BdptSampleLightPoint(lightIdx, RandomFloat2());
+
+            vec3 toLight = lightPos - x;
+            float dist2 = dot(toLight, toLight);
+            float dist = sqrt(max(dist2, 1e-12));
+            vec3 L = toLight / dist;
+            float cosAtLight = dot(lt.normalArea.xyz, -L);
+
+            if (cosAtLight > 1e-6 && pickPdfTrue > 0.0)
+            {
+                float invArea = 1.0 / max(lt.normalArea.w, 1e-10);
+                float directPdfWTrue = pickPdfTrue * invArea * dist2 / cosAtLight;
+                float directPdfA, emissionPdfW;
+                BdptLightPdfs(lightIdx, cosAtLight, directPdfA, emissionPdfW);
+                float directPdfW = directPdfA * dist2 / cosAtLight;
+
+                float bsdfDirPdfW, bsdfRevPdfW, cosToLight;
+                vec3 fb = EvalBsdf(mat, n, wi, L, bsdfDirPdfW, bsdfRevPdfW, cosToLight);
+
+                if (fb != vec3(0.0) && directPdfW > 1e-20 && directPdfWTrue > 1e-20)
+                {
+                    float omega = directPdfW / (directPdfW + bsdfDirPdfW);
+                    vec3 fCand = fCur * fb * cosToLight * lt.emissionWeight.rgb;
+                    float pCand = pProd * directPdfWTrue;
+                    float w = omega * RestirLum(fCand) / pCand;
+
+                    if (w > 0.0 && !isnan(w) && !isinf(w))
+                    {
+                        vec3 nf = (dot(n, L) >= 0.0) ? n : -n;
+                        Ray shadowRay = MakeRay(x + nf * 1e-4, L);
+                        if (!IntersectSceneOccluded(shadowRay, dist * 0.999))
+                        {
+                            PathReservoir cand = RestirEmptyReservoir();
+                            // Reconnection: existing rc pair if found, else
+                            // the pair (x_j, y0) - x_j is non-delta here and
+                            // the light point is always connectable.
+                            uint flags = RESTIR_FLAG_RCVALID | (deltaMask << 8);
+                            uint r = rcFound ? rcIdx : pathLen + 1u;
+                            flags |= (r & 0xFu) << 4;
+                            cand.fSeed = vec4(fCand, uintBitsToFloat(camSeed));
+                            cand.core.y = omega * RestirLum(fCand);
+                            cand.core.w = uintBitsToFloat(RestirPackTech(1u, pathLen + 1u, flags));
+                            if (rcFound)
+                            {
+                                cand.rcInfo = vec4(rcBaseCos, rcBaseDist2, omega, replayPdfBase);
+                                cand.rcPosMat = vec4(rcPos, uintBitsToFloat(rcMat));
+                                cand.rcNormal = vec4(rcNrm, 0.0);
+                                cand.rcLsuf = vec4(SafeDiv(fCand, fArriveRc), 0.0);
+                            }
+                            else
+                            {
+                                cand.rcInfo = vec4(cosAtLight, dist2, omega, pProd);
+                                cand.rcPosMat = vec4(lightPos, uintBitsToFloat(NO_MATERIAL));
+                                cand.rcNormal = vec4(lt.normalArea.xyz, 0.0); // emitting side
+                                cand.rcLsuf = vec4(lt.emissionWeight.rgb, 0.0);
+                            }
+                            wSum += w;
+                            if (RestirRand(risRng) * wSum <= w) sel = cand;
+                        }
+                    }
+                }
+            }
+        }
+
+        // -------------------------------------------------- BSDF bounce ---
+        RngStream(pathLen, RNG_BSDF);
+        BsdfSample bs = SampleBsdf(mat, n, wi, false);
+        if (bs.weight == vec3(0.0)) break;
+        if (!bs.specular && bs.pdfDir <= 0.0) break;
+
+        float pdfStep = bs.choicePdf * (bs.specular ? 1.0 : bs.pdfDir);
+        pdfPrevArrival = pProd;
+        fCur *= bs.weight * pdfStep; // = rho*cos (choicePdf*tint for delta)
+        pProd *= pdfStep;
+        prevConnectable = !isDelta;
+
+        vec3 offN = (dot(bs.dir, n) >= 0.0) ? n : -n;
+        Ray ray = MakeRay(x + offN * 1e-4, bs.dir);
+        Hit hit;
+        if (!IntersectScene(ray, hit))
+        {
+            // ------------------------------------------- s = 0, env ------
+            // The environment is only reachable by BSDF sampling: omega = 1.
+            vec3 fCand = fCur * uFrame.background.rgb * uFrame.background.a;
+            float w = RestirLum(fCand) / pProd;
+            if (w > 0.0 && !isnan(w) && !isinf(w))
+            {
+                PathReservoir cand = RestirEmptyReservoir();
+                uint flags = (rcFound ? RESTIR_FLAG_RCVALID : RESTIR_FLAG_ENVEND) | (deltaMask << 8);
+                if (rcFound) flags |= (rcIdx & 0xFu) << 4;
+                // env pseudo-vertex index = pathLen+1 -> t = pathLen+2.
+                cand.core.w = uintBitsToFloat(RestirPackTech(0u, pathLen + 2u, flags));
+                cand.fSeed = vec4(fCand, uintBitsToFloat(camSeed));
+                cand.core.y = RestirLum(fCand);
+                if (rcFound)
+                {
+                    cand.rcInfo = vec4(rcBaseCos, rcBaseDist2, 1.0, replayPdfBase);
+                    cand.rcPosMat = vec4(rcPos, uintBitsToFloat(rcMat));
+                    cand.rcNormal = vec4(rcNrm, 0.0);
+                    cand.rcLsuf = vec4(SafeDiv(fCand, fArriveRc), 0.0);
+                }
+                else
+                {
+                    cand.rcInfo = vec4(0.0, 0.0, 1.0, pProd);
+                }
+                wSum += w;
+                if (RestirRand(risRng) * wSum <= w) sel = cand;
+            }
+            break;
+        }
+
+        // Advance to the next vertex.
+        x = ray.origin + ray.dir * hit.t;
+        n = hit.normal;
+        matId = hit.materialIndex;
+        triIdx = hit.triIndex;
+        wi = -bs.dir;
+        lastEdgePdfW = bs.specular ? 0.0 : bs.pdfDir;
+        lastEdgeDist2 = hit.t * hit.t;
+    }
+
+    // Finalize: rc index for s=0 candidates was folded into flags at
+    // creation time via rcIdx; W = wSum / pHat(selected).
+    float pHatSel = sel.core.y;
+    sel.core.x = (pHatSel > 0.0 && wSum > 0.0) ? wSum / pHatSel : 0.0;
+    sel.core.z = 1.0; // initial-sampling confidence is always 1 (paper 7.1)
+    if (isnan(sel.core.x) || isinf(sel.core.x)) sel.core.x = 0.0;
+
+    pixelRes[outSlot].path = sel;
+}

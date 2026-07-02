@@ -337,6 +337,23 @@ increasing risk.
   index) wired into the tonemap pass or a debug output switch.
 
 ### Phase 1 — GRIS core with camera-side techniques only (≈ ReSTIR PT lite)
+
+> **Phase 1 status: DONE.** restir_camera.comp (initial RIS over s=0/s=1 with
+> extended-path-space target ω_τ·lum(f), reconnection-vertex + L_suf + replay-pdf
+> caching), restir_shift.glsl (hybrid shift: replay + reconnection, solid-angle
+> Jacobians Eq. 53/55, copied ω_τ), restir_temporal.comp (2-way generalized balance
+> heuristic with forward+backward shifts, confidence cap 20, null-history domains
+> still weighted), restir_spatial.comp (sequential 2-way merges over disk
+> neighbors), restir_resolve.comp (ω·f·W). Soak results (fallback Cornell+duck,
+> locked camera): RIS-only 0.116483, +temporal 0.116483, +spatial 0.116484,
+> +both 0.116482 — all bias-free vs. the deterministic-V-buffer baseline; the
+> 0.14% offset vs. the jittered unidirectional reference (0.116647) is primary-
+> visibility aliasing, not transport bias. Confidence saturates at cap (temporal
+> live); spatial cuts accumulated relNoise 0.0526→0.0428 @256spp.
+> Implementation notes: f/pdf convention folds delta Fresnel choice probabilities
+> into both (BsdfSample.choicePdf); reservoir regions rotate scratch/final/history
+> inside one SSBO (3×pixelCount); ROYALGL_LOCK_CAMERA added for deterministic
+> soaks.
 - **1.1 Initial RIS in `restir_camera.comp`:** candidates from s=0 and s=1 only
   (ignore LVC and t=1 for now); reservoir stores path, seeds, reconnection vertex.
   Resolve pass shades `f·W`. *Test:* accumulated output (temporal/spatial OFF, average

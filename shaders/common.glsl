@@ -120,6 +120,8 @@ const uint RNG_BSDF    = 2u; // BSDF direction sampling (incl. the Fresnel choic
 const uint RNG_NEE     = 3u; // s=1 light sampling (tree descent + point)
 const uint RNG_CONNECT = 4u; // s>=2 light-vertex pick
 const uint RNG_CAMCONN = 5u; // t=1 lens-connection sampling (pupil point + lambdas)
+const uint RNG_RIS     = 6u; // ReSTIR reservoir selection draws
+const uint RNG_REUSE   = 7u; // ReSTIR neighbor-pixel selection draws
 
 void RngStream(uint vertex, uint purpose)
 {
@@ -193,11 +195,14 @@ vec3 EvalBsdf(Material mat, vec3 n, vec3 wi, vec3 wo, out float pdfDir, out floa
 
 struct BsdfSample
 {
-    vec3 dir;     // sampled wo
-    vec3 weight;  // f * cosOut / pdf - the throughput multiplier (tint for delta)
-    float pdfDir; // solid-angle pdf of dir (0 marks a delta event)
-    float pdfRev; // pdf of sampling wi from dir (0 for delta)
-    float cosOut; // |cos| between the oriented normal and dir
+    vec3 dir;       // sampled wo
+    vec3 weight;    // f * cosOut / pdf - the throughput multiplier (tint for delta)
+    float pdfDir;   // solid-angle pdf of dir (0 marks a delta event)
+    float pdfRev;   // pdf of sampling wi from dir (0 for delta)
+    float cosOut;   // |cos| between the oriented normal and dir
+    float choicePdf;// discrete lobe-choice probability (Fresnel F or 1-F for
+                    // glass, 1 for diffuse) - enters ReSTIR random-replay
+                    // Jacobians, where F changes with incident angle
     bool specular;
 };
 
@@ -214,6 +219,7 @@ BsdfSample SampleBsdf(Material mat, vec3 n, vec3 wi, bool isLightPath)
     bs.pdfDir = 0.0;
     bs.pdfRev = 0.0;
     bs.cosOut = 0.0;
+    bs.choicePdf = 1.0;
     bs.specular = false;
 
     if (MatIsDelta(mat))
@@ -236,6 +242,7 @@ BsdfSample SampleBsdf(Material mat, vec3 n, vec3 wi, bool isLightPath)
             bs.dir = normalize(2.0 * cosI * nf - wi);
             bs.weight = mat.baseColor.rgb;
             bs.cosOut = cosI;
+            bs.choicePdf = F;
         }
         else
         {
@@ -243,6 +250,7 @@ BsdfSample SampleBsdf(Material mat, vec3 n, vec3 wi, bool isLightPath)
             bs.dir = normalize(refract(-wi, nf, etaRel));
             bs.weight = mat.baseColor.rgb * (isLightPath ? 1.0 : etaRel * etaRel);
             bs.cosOut = abs(dot(nf, bs.dir));
+            bs.choicePdf = 1.0 - F;
         }
         return bs;
     }

@@ -1,0 +1,141 @@
+#version 460 core
+#include "common.glsl"
+#include "restir_common.glsl"
+#include "restir_shift.glsl"
+
+// ReSTIR pass: spatial reuse. Each pixel chains k sequential 2-candidate
+// GRIS merges: the running aggregate (starting from the post-temporal
+// reservoir) absorbs one disk neighbor at a time with the same
+// forward+backward balance heuristic as the temporal pass. Chained 2-way
+// merges are unbiased for any positive MIS proxies as long as each merge's
+// weights sum to 1 on the shared support and vanish where a shift is
+// undefined - both hold here by construction (a failed shift zeroes its
+// side). Neighbor SELECTION uses only sample-independent surface data
+// (G-buffer depth/normal/material), as confidence-weight correctness
+// requires.
+//
+// Reads the scratch region (all pixels post-temporal, barrier'd), writes
+// the final region - no in-flight aliasing.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+const float RESTIR_CONFIDENCE_CAP = 20.0;
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = ivec2(uFrame.frameInfo.xy);
+    if (pixel.x >= size.x || pixel.y >= size.y) return;
+
+    uint idx = RestirPixelIndex(pixel);
+    uint outSlot = RestirRegionOffset(RestirFinalRegion()) + idx;
+
+    PathReservoir R = pixelRes[RestirRegionOffset(RESTIR_SCRATCH_REGION) + idx].path;
+    GBufferPixel gCur = gbuf[GBufCurOffset() + idx];
+
+    if (gCur.posDepth.w < 0.0)
+    {
+        pixelRes[outSlot].path = R;
+        return;
+    }
+
+    float radius = max(uFrame.prevCameraParams.z, 1.0);
+    uint neighborCount = uint(uFrame.prevCameraParams.w + 0.5);
+    vec3 curWi = -RestirPrimaryRay(pixel).dir;
+
+    uint rng = WangHash(idx * 26699u + uFrame.restirParams.z * 30323u + 0x8DA6B343u);
+    if (rng == 0u) rng = 0x9E3779B9u;
+
+    for (uint k = 0u; k < neighborCount; ++k)
+    {
+        // Uniform disk offset.
+        float u1 = RestirRand(rng);
+        float u2 = RestirRand(rng);
+        float rad = radius * sqrt(u1);
+        float phi = 6.28318530718 * u2;
+        ivec2 nbr = pixel + ivec2(round(rad * cos(phi)), round(rad * sin(phi)));
+
+        if (nbr == pixel || nbr.x < 0 || nbr.y < 0 || nbr.x >= size.x || nbr.y >= size.y) continue;
+
+        uint nIdx = RestirPixelIndex(nbr);
+        GBufferPixel gN = gbuf[GBufCurOffset() + nIdx];
+        if (gN.posDepth.w < 0.0) continue;
+        if (GBufMaterial(gN) != GBufMaterial(gCur)) continue;
+        // Surface similarity heuristics (domain choice, sample-independent).
+        if (abs(gN.posDepth.w - gCur.posDepth.w) > 0.1 * gCur.posDepth.w) continue;
+        if (dot(gN.normalMat.xyz, gCur.normalMat.xyz) < 0.9) continue;
+
+        PathReservoir N = pixelRes[RestirRegionOffset(RESTIR_SCRATCH_REGION) + nIdx].path;
+        float cN = min(N.core.z, RESTIR_CONFIDENCE_CAP);
+        float cR = R.core.z;
+
+        // Forward shift: neighbor sample into this pixel's domain.
+        RestirShiftResult SN;
+        SN.ok = false;
+        SN.jacobian = 0.0;
+        if (N.core.x > 0.0 && N.core.y > 0.0)
+            SN = RestirShiftPath(N, gCur, curWi);
+        float omegaN = N.rcInfo.z;
+        float pHatN_cur = SN.ok ? omegaN * RestirLum(SN.f) : 0.0;
+
+        // Backward shift: aggregate into the neighbor's domain (same
+        // frame, same camera - only the primary hit differs).
+        float pHatR_nbr = 0.0;
+        float JR_back = 0.0;
+        if (R.core.x > 0.0 && R.core.y > 0.0)
+        {
+            vec3 nbrWi = -RestirPrimaryRay(nbr).dir;
+            RestirShiftResult SR = RestirShiftPath(R, gN, nbrWi);
+            if (SR.ok)
+            {
+                pHatR_nbr = R.rcInfo.z * RestirLum(SR.f);
+                JR_back = SR.jacobian;
+            }
+        }
+
+        float w_R = 0.0, w_N = 0.0;
+        if (pHatN_cur > 0.0 && SN.jacobian > 0.0)
+        {
+            float pHatFromN = N.core.y / SN.jacobian;
+            float mN = cN * pHatFromN / (cN * pHatFromN + cR * pHatN_cur);
+            w_N = mN * pHatN_cur * N.core.x * SN.jacobian;
+        }
+        if (R.core.y > 0.0)
+        {
+            float pHatFromN_R = pHatR_nbr * JR_back;
+            float mR = cR * R.core.y / (cR * R.core.y + cN * pHatFromN_R);
+            w_R = mR * R.core.y * R.core.x;
+        }
+        if (isnan(w_R) || isinf(w_R)) w_R = 0.0;
+        if (isnan(w_N) || isinf(w_N)) w_N = 0.0;
+
+        float wSum = w_R + w_N;
+        float cOut = min(cR + cN, RESTIR_CONFIDENCE_CAP);
+
+        if (wSum <= 0.0)
+        {
+            R.core.x = 0.0;
+            R.core.z = cOut;
+            continue;
+        }
+
+        if (RestirRand(rng) * wSum <= w_N)
+        {
+            PathReservoir merged = N;
+            merged.fSeed.xyz = SN.f;
+            merged.core.y = pHatN_cur;
+            merged.core.x = wSum / pHatN_cur;
+            merged.core.z = cOut;
+            merged.rcInfo = vec4(SN.rcCos, SN.rcDist2, omegaN, SN.replayPdf);
+            R = merged;
+        }
+        else
+        {
+            R.core.x = wSum / R.core.y;
+            R.core.z = cOut;
+        }
+        if (isnan(R.core.x) || isinf(R.core.x)) R.core.x = 0.0;
+    }
+
+    pixelRes[outSlot].path = R;
+}

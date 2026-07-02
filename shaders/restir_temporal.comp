@@ -1,0 +1,152 @@
+#version 460 core
+#include "common.glsl"
+#include "restir_common.glsl"
+#include "restir_shift.glsl"
+
+// ReSTIR pass: temporal reuse. Each pixel merges its initial candidate
+// reservoir (region 2) with the motion-vector-mapped previous-frame
+// reservoir (history region), using the 2-candidate generalized balance
+// heuristic (paper Eq. 17): both the forward shift (history path into the
+// current pixel) and the backward shift (current path into the previous
+// pixel's domain) are evaluated so the MIS weights form a partition of
+// unity. omega_tau is copied through shifts (paper Sec. 6.4 biased
+// variant; the recursive recomputation lands in Phase 5).
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+const float RESTIR_CONFIDENCE_CAP = 20.0;
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = ivec2(uFrame.frameInfo.xy);
+    if (pixel.x >= size.x || pixel.y >= size.y) return;
+
+    uint idx = RestirPixelIndex(pixel);
+    uint inSlot = RestirRegionOffset(RESTIR_SCRATCH_REGION) + idx;
+    uint outSlot = RestirRegionOffset(RestirTemporalOutRegion()) + idx;
+
+    PathReservoir A = pixelRes[inSlot].path; // this frame's initial candidate
+    GBufferPixel gCur = gbuf[GBufCurOffset() + idx];
+
+    if (gCur.posDepth.w < 0.0)
+    {
+        pixelRes[outSlot].path = A;
+        return;
+    }
+
+    // ---------------------------------------------- history lookup -------
+    // Reproject the current primary hit into the previous frame and
+    // validate the surface (position, material) - camera-only motion, so
+    // failures are disocclusions and screen edges.
+    vec2 prevPixF;
+    ivec2 prevPix = ivec2(-1);
+    bool histValid = false;
+    GBufferPixel gPrev;
+    if (RestirPrevProject(gCur.posDepth.xyz, prevPixF))
+    {
+        prevPix = ivec2(prevPixF);
+        if (prevPix.x >= 0 && prevPix.y >= 0 && prevPix.x < size.x && prevPix.y < size.y)
+        {
+            gPrev = gbuf[GBufPrevOffset() + RestirPixelIndex(prevPix)];
+            if (gPrev.posDepth.w >= 0.0 && GBufMaterial(gPrev) == GBufMaterial(gCur))
+            {
+                float depthScale = max(gCur.posDepth.w, 1e-3);
+                histValid = length(gPrev.posDepth.xyz - gCur.posDepth.xyz) < 0.02 * depthScale;
+            }
+        }
+    }
+
+    if (!histValid)
+    {
+        // The previous domain genuinely doesn't exist for this surface
+        // (disocclusion / off-screen): the candidate stands alone, m_A = 1.
+        pixelRes[outSlot].path = A;
+        return;
+    }
+
+    PathReservoir B = pixelRes[RestirRegionOffset(RestirHistoryRegion()) + RestirPixelIndex(prevPix)].path;
+    // Confidence counts processed samples and is independent of whether a
+    // sample survived - a NULL history (W=0) still weights the MIS terms,
+    // otherwise paths reachable from the previous frame get double-counted.
+    float cB = min(B.core.z, RESTIR_CONFIDENCE_CAP);
+    float cA = A.core.z;
+
+    // ------------------------------------- forward shift: B -> current ---
+    vec3 curWi = -RestirPrimaryRay(pixel).dir;
+    RestirShiftResult SB;
+    SB.ok = false;
+    SB.jacobian = 0.0;
+    if (B.core.x > 0.0 && B.core.y > 0.0)
+        SB = RestirShiftPath(B, gCur, curWi);
+    float omegaB = B.rcInfo.z;
+    float pHatB_cur = SB.ok ? omegaB * RestirLum(SB.f) : 0.0;
+
+    // ------------------------------------ backward shift: A -> previous --
+    // p-hat-from-prev of the current sample: shift A into the previous
+    // pixel's domain (previous camera + previous G-buffer surface).
+    float pHatA_prev = 0.0;
+    float JA_back = 0.0;
+    if (A.core.x > 0.0 && A.core.y > 0.0)
+    {
+        vec3 prevWi = -RestirPrevPrimaryRay(prevPix).dir;
+        RestirShiftResult SA = RestirShiftPath(A, gPrev, prevWi);
+        if (SA.ok)
+        {
+            pHatA_prev = A.rcInfo.z * RestirLum(SA.f);
+            JA_back = SA.jacobian;
+        }
+    }
+
+    // --------------------------------------------- balance heuristic -----
+    // Candidate B evaluated at its shifted position y_B:
+    //   pHat_from_B(y_B) = pHat_B(X_B) / J_B
+    float w_A = 0.0, w_B = 0.0;
+    if (pHatB_cur > 0.0 && SB.jacobian > 0.0)
+    {
+        float pHatFromB = B.core.y / SB.jacobian;
+        float mB = cB * pHatFromB / (cB * pHatFromB + cA * pHatB_cur);
+        w_B = mB * pHatB_cur * B.core.x * SB.jacobian;
+    }
+    if (A.core.y > 0.0)
+    {
+        float pHatFromPrevA = pHatA_prev * JA_back; // pHat_prev(T^-1 A) |dT^-1/dA|
+        float mA = cA * A.core.y / (cA * A.core.y + cB * pHatFromPrevA);
+        w_A = mA * A.core.y * A.core.x;
+    }
+    if (isnan(w_A) || isinf(w_A)) w_A = 0.0;
+    if (isnan(w_B) || isinf(w_B)) w_B = 0.0;
+
+    float wSum = w_A + w_B;
+    float cOut = min(cA + cB, RESTIR_CONFIDENCE_CAP);
+
+    PathReservoir outRes;
+    uint selRng = WangHash(idx * 9781u + uFrame.restirParams.z * 6151u + 0x3779FBB5u);
+    if (selRng == 0u) selRng = 0x9E3779B9u;
+
+    if (wSum <= 0.0)
+    {
+        outRes = A;
+        outRes.core.x = 0.0;
+        outRes.core.z = cOut;
+    }
+    else if (RestirRand(selRng) * wSum <= w_B)
+    {
+        // History wins: adopt the shifted path in the current domain.
+        outRes = B;
+        outRes.fSeed.xyz = SB.f;
+        outRes.core.y = pHatB_cur;
+        outRes.core.x = wSum / pHatB_cur;
+        outRes.core.z = cOut;
+        outRes.rcInfo = vec4(SB.rcCos, SB.rcDist2, omegaB, SB.replayPdf);
+    }
+    else
+    {
+        outRes = A;
+        outRes.core.x = wSum / A.core.y;
+        outRes.core.z = cOut;
+    }
+    if (isnan(outRes.core.x) || isinf(outRes.core.x)) outRes.core.x = 0.0;
+
+    pixelRes[outSlot].path = outRes;
+}

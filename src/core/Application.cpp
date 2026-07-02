@@ -87,8 +87,15 @@ namespace RoyalGL
         if (const char* v = std::getenv("ROYALGL_NEE")) m_settings.enableNEE = (v[0] != '0');
         if (const char* v = std::getenv("ROYALGL_RESTIR")) m_settings.enableRestir = (v[0] != '0');
         if (const char* v = std::getenv("ROYALGL_RESTIR_DEBUG")) m_settings.restirDebugView = std::atoi(v);
+        if (const char* v = std::getenv("ROYALGL_RESTIR_TEMPORAL")) m_settings.restirTemporal = (v[0] != '0');
+        if (const char* v = std::getenv("ROYALGL_RESTIR_SPATIAL")) m_settings.restirSpatial = (v[0] != '0');
+        // Ignore all camera input - keeps scripted soak tests deterministic
+        // even if the window is focused or the mouse passes over it.
+        m_cameraLocked = (std::getenv("ROYALGL_LOCK_CAMERA") != nullptr);
         if (const char* v = std::getenv("ROYALGL_LENS")) m_settings.cameraMode = (v[0] != '0') ? CameraMode::Lens : CameraMode::Pinhole;
         m_statsEnabled = (std::getenv("ROYALGL_STATS") != nullptr);
+        if (const char* v = std::getenv("ROYALGL_STATS_INTERVAL")) m_statsInterval = std::max(std::atoi(v), 1);
+        if (const char* v = std::getenv("ROYALGL_RESTIR_ACCUM")) m_settings.restirAccumulate = (v[0] != '0');
 
         m_lastCamera = m_scene->camera;
         m_lastSettings = m_settings;
@@ -152,6 +159,7 @@ namespace RoyalGL
 
     void Application::HandleCameraInput(float dt)
     {
+        if (m_cameraLocked) return;
         GLFWwindow* handle = m_window->Handle();
         ImGuiIO& io = ImGui::GetIO();
 
@@ -295,6 +303,9 @@ namespace RoyalGL
             bool materialsDirty = (m_scene->materials != m_lastMaterials);
             if (m_scene->camera != m_lastCamera || m_settings != m_lastSettings || materialsDirty)
             {
+                ROYALGL_LOG_INFO("Application: accumulation reset (camera=",
+                                 (m_scene->camera != m_lastCamera), " settings=",
+                                 (m_settings != m_lastSettings), " materials=", materialsDirty, ")");
                 if (materialsDirty)
                 {
                     m_bvh->UpdateMaterials(*m_scene);
@@ -325,7 +336,7 @@ namespace RoyalGL
             if (m_statsEnabled)
             {
                 uint32_t n = m_pathTracer->SampleCount();
-                if (n > 0 && n % 256 == 0 && n != m_lastStatsSample)
+                if (n > 0 && n % m_statsInterval == 0 && n != m_lastStatsSample)
                 {
                     m_lastStatsSample = n;
                     LogAccumulationStats();

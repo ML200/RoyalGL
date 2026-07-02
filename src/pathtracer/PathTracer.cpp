@@ -40,6 +40,10 @@ namespace RoyalGL
           m_bdptResolveShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "bdpt_resolve.comp")),
           m_lensPupilShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "lens_pupil.comp")),
           m_restirGbufferShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_gbuffer.comp")),
+          m_restirCameraShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_camera.comp")),
+          m_restirTemporalShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_temporal.comp")),
+          m_restirSpatialShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_spatial.comp")),
+          m_restirResolveShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_resolve.comp")),
           m_restirDebugShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_debug.comp"))
     {
         m_timersEnabled = (std::getenv("ROYALGL_STATS") != nullptr);
@@ -93,9 +97,10 @@ namespace RoyalGL
         m_restirWidth = m_width;
         m_restirHeight = m_height;
 
-        // Both ping-pong halves live in one buffer (see restir_common.glsl).
+        // The reservoir buffer holds 3 regions (two frame-alternating finals
+        // + scratch, see restir_common.glsl); the G-buffer two halves.
         size_t pixelCount = size_t(m_width) * size_t(m_height);
-        m_reservoirBuffer.Upload(nullptr, 2 * pixelCount * kPixelReservoirsBytes, GL_DYNAMIC_COPY);
+        m_reservoirBuffer.Upload(nullptr, 3 * pixelCount * kPixelReservoirsBytes, GL_DYNAMIC_COPY);
         m_gbufferBuffer.Upload(nullptr, 2 * pixelCount * kGBufferPixelBytes, GL_DYNAMIC_COPY);
         // Zero-filled: a zeroed reservoir is a valid empty reservoir
         // (W=0, confidence=0).
@@ -156,8 +161,16 @@ namespace RoyalGL
         frame.prevCamRight = m_prevCamValid ? m_prevCamRight : frame.camRight;
         frame.prevCamUp = m_prevCamValid ? m_prevCamUp : frame.camUp;
         frame.prevCameraParams = m_prevCamValid ? m_prevCameraParams : frame.cameraParams;
+        // z/w of prevCameraParams are unused by the projection helpers and
+        // carry the spatial reuse parameters instead.
+        frame.prevCameraParams.z = settings.restirSpatialRadius;
+        frame.prevCameraParams.w = static_cast<float>(settings.restirSpatialNeighbors);
+        uint32_t restirFlags = (restirActive ? 1u : 0u)
+                             | (settings.restirTemporal ? 2u : 0u)
+                             | (settings.restirSpatial ? 4u : 0u)
+                             | (settings.restirAccumulate ? 8u : 0u);
         frame.restirParams = glm::uvec4(static_cast<uint32_t>(settings.restirDebugView),
-                                        restirActive ? 1u : 0u, m_frameCounter, m_restirParity);
+                                        restirFlags, m_frameCounter, m_restirParity);
 
         m_frameUBO.Upload(&frame, sizeof(GPUFrameUBO), GL_DYNAMIC_DRAW);
         m_frameUBO.BindBase();
@@ -188,15 +201,56 @@ namespace RoyalGL
 
         if (restirActive)
         {
-            // Current/previous halves are selected by restirParams.w inside
-            // the shaders - see restir_common.glsl.
+            // ------------------------- ReSTIR frame path (per-frame) -----
+            // G-buffer -> initial candidates (Alg. 2, s<=1) -> temporal ->
+            // spatial -> resolve. Regions/halves are selected inside the
+            // shaders via restirParams - see restir_common.glsl.
             m_reservoirBuffer.BindBase();
             m_gbufferBuffer.BindBase();
+            m_lightVertexBuffer.BindBase();
+            m_splatBuffer.BindBase();
+            m_lightVertCountBuffer.BindBase();
+            if (m_lightSelPdfCount != std::max(lightTree.LightCount(), 1u))
+            {
+                m_lightSelPdfCount = std::max(lightTree.LightCount(), 1u);
+                m_lightSelPdfBuffer.Upload(nullptr, size_t(m_lightSelPdfCount) * sizeof(float), GL_DYNAMIC_COPY);
+            }
+            m_lightSelPdfBuffer.BindBase();
+
+            // Camera-anchored light-selection pdf cache (receiver-
+            // independent NEE pdfs, required for replayable shifts).
+            if (lightTree.LightCount() > 0)
+            {
+                m_bdptLightSelShader.Use();
+                m_bdptLightSelShader.Dispatch((lightTree.LightCount() + 63u) / 64u, 1u, 1u);
+                GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));
+            }
 
             // Deterministic V-buffer for this frame's camera.
             m_restirGbufferShader.Use();
             m_restirGbufferShader.Dispatch(groupsX, groupsY, 1u);
             GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));
+
+            m_restirCameraShader.Use();
+            m_restirCameraShader.Dispatch(groupsX, groupsY, 1u);
+            GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));
+
+            if (settings.restirTemporal)
+            {
+                m_restirTemporalShader.Use();
+                m_restirTemporalShader.Dispatch(groupsX, groupsY, 1u);
+                GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));
+            }
+            if (settings.restirSpatial)
+            {
+                m_restirSpatialShader.Use();
+                m_restirSpatialShader.Dispatch(groupsX, groupsY, 1u);
+                GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));
+            }
+
+            m_restirResolveShader.Use();
+            m_restirResolveShader.Dispatch(groupsX, groupsY, 1u);
+            m_sampleCount++;
         }
 
         // ---------------------------------------------- tiled dispatch ----
@@ -226,6 +280,8 @@ namespace RoyalGL
         };
 
         uint32_t sampleAtEntry = m_sampleCount;
+        if (!restirActive)
+        {
         do
         {
         if (!bidir)
@@ -306,6 +362,7 @@ namespace RoyalGL
         }
         } while (m_fullFrameNext && m_sampleCount == sampleAtEntry);
         m_fullFrameNext = false;
+        }
 
         if (restirActive)
         {

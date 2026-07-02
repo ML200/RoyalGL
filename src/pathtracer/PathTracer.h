@@ -51,6 +51,10 @@ namespace RoyalGL
         Shader m_bdptResolveShader;
         Shader m_lensPupilShader;
         Shader m_restirGbufferShader;
+        Shader m_restirCameraShader;
+        Shader m_restirTemporalShader;
+        Shader m_restirSpatialShader;
+        Shader m_restirResolveShader;
         Shader m_restirDebugShader;
         Texture m_accum;
         Buffer m_frameUBO{BufferType::Uniform, 0};

@@ -23,12 +23,12 @@ void main()
     if (IntersectScene(ray, hit))
     {
         g.posDepth = vec4(ray.origin + ray.dir * hit.t, hit.t);
-        g.normalMat = vec4(hit.normal, uintBitsToFloat(hit.materialIndex));
+        g.normalMat = vec4(hit.normal, PackGBufMatTri(hit.materialIndex, hit.triIndex));
     }
     else
     {
         g.posDepth = vec4(0.0, 0.0, 0.0, -1.0);
-        g.normalMat = vec4(0.0, 0.0, 0.0, uintBitsToFloat(NO_MATERIAL));
+        g.normalMat = vec4(0.0, 0.0, 0.0, PackGBufMatTri(0xFFu, 0u));
     }
-    gbuf[RestirCurOffset() + RestirPixelIndex(pixel)] = g;
+    gbuf[GBufCurOffset() + RestirPixelIndex(pixel)] = g;
 }

@@ -44,6 +44,16 @@ namespace RoyalGL
         // 0=off, then G-buffer normals / depth / motion vectors, reservoir
         // W / confidence / technique index (see shaders/restir_debug.comp).
         int restirDebugView = 0;
+        // Reuse passes; disable both for pure per-pixel RIS (the Phase 1.1
+        // unbiasedness baseline).
+        bool restirTemporal = true;
+        bool restirSpatial = true;
+        int restirSpatialNeighbors = 3;
+        float restirSpatialRadius = 30.0f; // pixels
+        // Off: the resolve pass overwrites the image with the raw per-frame
+        // estimate instead of averaging - what ReSTIR actually delivers at
+        // 1spp, for comparing reuse configurations live.
+        bool restirAccumulate = true;
 
         // Physical lens camera (Steinert et al. 2011). Lens mode renders
         // through the unidirectional pipeline regardless of enableBidir -
@@ -62,6 +72,11 @@ namespace RoyalGL
                    enableBidir == other.enableBidir &&
                    enableRestir == other.enableRestir &&
                    restirDebugView == other.restirDebugView &&
+                   restirTemporal == other.restirTemporal &&
+                   restirSpatial == other.restirSpatial &&
+                   restirSpatialNeighbors == other.restirSpatialNeighbors &&
+                   restirSpatialRadius == other.restirSpatialRadius &&
+                   restirAccumulate == other.restirAccumulate &&
                    cameraMode == other.cameraMode &&
                    lens == other.lens;
         }

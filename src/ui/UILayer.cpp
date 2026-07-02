@@ -138,6 +138,16 @@ namespace RoyalGL
         {
             if (settings.cameraMode == CameraMode::Lens)
                 ImGui::TextDisabled("Pinhole only - lens mode falls back to plain BDPT.");
+            ImGui::Checkbox("Temporal reuse", &settings.restirTemporal);
+            ImGui::Checkbox("Spatial reuse", &settings.restirSpatial);
+            ImGui::Checkbox("Accumulate frames", &settings.restirAccumulate);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Off: show the raw per-frame estimate (1spp + reuse)\ninstead of the progressive average.");
+            if (settings.restirSpatial)
+            {
+                ImGui::SliderInt("Spatial neighbors", &settings.restirSpatialNeighbors, 1, 8);
+                ImGui::SliderFloat("Spatial radius (px)", &settings.restirSpatialRadius, 4.0f, 100.0f);
+            }
             const char* dbgNames[] = {"Off", "G-buffer normals", "G-buffer depth", "Motion vectors",
                                       "Reservoir W", "Confidence", "Technique (s,t)"};
             ImGui::Combo("ReSTIR debug view", &settings.restirDebugView, dbgNames, 7);
