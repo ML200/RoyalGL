@@ -50,6 +50,8 @@ namespace RoyalGL
         Shader m_bdptEyeShader;
         Shader m_bdptResolveShader;
         Shader m_lensPupilShader;
+        Shader m_restirGbufferShader;
+        Shader m_restirDebugShader;
         Texture m_accum;
         Buffer m_frameUBO{BufferType::Uniform, 0};
 
@@ -63,6 +65,27 @@ namespace RoyalGL
         uint32_t m_numLightPaths = 0;
         uint32_t m_lightSelPdfCount = 0;
         bool m_pupilsDirty = true;
+
+        // ReSTIR state (docs/RESTIR_BDPT_PLAN.md). SSBO bindings above 15
+        // don't exist on common hardware, so each per-pixel buffer holds
+        // BOTH ping-pong halves (2 x pixelCount entries); the halves swap
+        // current/previous roles every frame via the parity uploaded in
+        // restirParams.w. Allocated lazily on the first ReSTIR frame -
+        // together ~600 B/pixel.
+        Buffer m_reservoirBuffer{BufferType::ShaderStorage, 15};
+        Buffer m_gbufferBuffer{BufferType::ShaderStorage, 0};
+        uint32_t m_restirParity = 0;
+        int m_restirWidth = 0;  // resolution the ReSTIR buffers were sized for
+        int m_restirHeight = 0;
+        bool m_prevCamValid = false;
+        glm::vec4 m_prevCamPos{0.0f};
+        glm::vec4 m_prevCamForward{0.0f};
+        glm::vec4 m_prevCamRight{0.0f};
+        glm::vec4 m_prevCamUp{0.0f};
+        glm::vec4 m_prevCameraParams{0.0f};
+        uint32_t m_frameCounter = 0; // never reset - decorrelates ReSTIR frames
+
+        void EnsureRestirBuffers();
 
         // GL_TIME_ELAPSED queries per pass (0=unidir/light, 1=eye,
         // 2=resolve), double-buffered so reading back the previous frame's

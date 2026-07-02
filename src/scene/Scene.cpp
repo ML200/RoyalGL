@@ -1,6 +1,8 @@
 #include "scene/Scene.h"
 #include "core/Log.h"
 
+#include <cmath>
+
 namespace RoyalGL
 {
     namespace
@@ -30,6 +32,46 @@ namespace RoyalGL
             triangles.push_back(t0);
             triangles.push_back(t1);
         }
+
+        // Appends an outward-wound UV sphere. The winding matters: it
+        // defines the geometric normal, which is the emission side for
+        // emissive materials (emitters are one-sided).
+        void AddSphere(std::vector<Triangle>& triangles, const glm::vec3& center, float radius,
+                       uint32_t materialIndex, int rings = 8, int segments = 12)
+        {
+            constexpr float kPi = 3.14159265358979323846f;
+            auto point = [&](int ring, int seg)
+            {
+                float theta = kPi * static_cast<float>(ring) / static_cast<float>(rings);
+                float phi = 2.0f * kPi * static_cast<float>(seg) / static_cast<float>(segments);
+                glm::vec3 n(std::sin(theta) * std::cos(phi), std::cos(theta), std::sin(theta) * std::sin(phi));
+                Vertex v;
+                v.position = center + radius * n;
+                v.normal = n;
+                return v;
+            };
+
+            for (int i = 0; i < rings; ++i)
+            {
+                for (int j = 0; j < segments; ++j)
+                {
+                    Vertex p00 = point(i, j), p01 = point(i, j + 1);
+                    Vertex p10 = point(i + 1, j), p11 = point(i + 1, j + 1);
+                    Triangle t;
+                    t.materialIndex = materialIndex;
+                    if (i > 0) // upper triangle degenerates at the top pole
+                    {
+                        t.v0 = p00; t.v1 = p01; t.v2 = p11;
+                        triangles.push_back(t);
+                    }
+                    if (i < rings - 1) // lower triangle degenerates at the bottom pole
+                    {
+                        t.v0 = p00; t.v1 = p11; t.v2 = p10;
+                        triangles.push_back(t);
+                    }
+                }
+            }
+        }
     }
 
     void Scene::LoadFallbackScene()
@@ -45,9 +87,15 @@ namespace RoyalGL
         materials.push_back(Material{glm::vec3(1.0f, 1.0f, 1.0f), glm::vec3(25.0f, 25.0f, 25.0f), 0.0f, 1.0f}); // 4: light
         materials.push_back(Material{glm::vec3(0.4f, 0.5f, 0.75f), glm::vec3(0.0f), 0.0f, 1.0f}); // 5: center box
 
+        // Flip to strip the scene down to just the duck (plus whatever
+        // else is added outside the gate).
+        constexpr bool kBuildCornellBox = true;
+
         const float ext = 2.0f;    // room half-extent in X/Z
         const float top = 4.0f;    // ceiling height
 
+        if (kBuildCornellBox)
+        {
         // Floor (y=0), normal +Y.
         AddQuad(triangles,
                 glm::vec3(-ext, 0.0f, -ext), glm::vec3(ext, 0.0f, -ext),
@@ -101,7 +149,10 @@ namespace RoyalGL
                         glm::vec3(0.0f, -1.0f, 0.0f), 4);
             }
         }
+        } // kBuildCornellBox
 
+        if (kBuildCornellBox)
+        {
         // Small box sitting on the floor (bottom face omitted - it is
         // coincident with the floor and never visible).
         const glm::vec3 boxMin(-1.0f, 0.0f, -0.2f);
@@ -127,6 +178,7 @@ namespace RoyalGL
                 glm::vec3(boxMin.x, boxMin.y, boxMin.z), glm::vec3(boxMax.x, boxMin.y, boxMin.z),
                 glm::vec3(boxMax.x, boxMax.y, boxMin.z), glm::vec3(boxMin.x, boxMax.y, boxMin.z),
                 glm::vec3(0.0f, 0.0f, -1.0f), 5);
+        } // kBuildCornellBox
 
         camera.target = glm::vec3(0.0f, 1.5f, 0.0f);
         camera.position = glm::vec3(0.0f, 1.8f, 6.5f);

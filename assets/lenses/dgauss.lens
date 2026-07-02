@@ -1,0 +1,20 @@
+# Double Gauss f/2, 22deg HFOV - Tronnier, US patent 2,673,491
+# (Smith, Modern Lens Design p.312; scaled to 50mm EFL).
+# Data from the pbrt distribution's dgauss.50mm.dat (aperture diameters
+# halved to semi-diameters). Materials are raw refractive indices - the
+# source gives no glass names, so dispersion uses a generic Abbe fallback.
+# Last thickness 0 = auto-focus the sensor at the paraxial focal plane.
+name: Double Gauss f/2 50mm (Tronnier, USP 2673491)
+fnumber: 2.0
+
+29.475    3.76    1.67    12.6
+84.83     0.12    air     12.6
+19.275    4.025   1.67    11.5
+40.77     3.275   1.699   11.5
+12.75     5.705   air     9.0
+aperture  4.5     8.55
+-14.495   1.18    1.603   8.5
+40.77     6.065   1.658   10.0
+-20.385   0.19    air     10.0
+437.065   3.22    1.717   10.0
+-39.73    0       air     10.0

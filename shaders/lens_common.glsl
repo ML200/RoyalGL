@@ -94,6 +94,27 @@ bool IntersectLensSurface(LensSurface s, vec3 O, vec3 D, out vec3 hitPos, out ve
     return dot(hitPos.xy, hitPos.xy) <= semiDiam * semiDiam;
 }
 
+// Nearest aperture-edge outward normal (2D, stop plane) and distance from
+// an inside point - the edge-proximity test for diffraction.
+void ApertureEdge(vec2 p, float radius, float blades, float rotation, out vec2 en, out float edgeDist)
+{
+    if (blades < 2.5)
+    {
+        float r = max(length(p), 1e-6);
+        en = p / r;
+        edgeDist = radius - r;
+        return;
+    }
+    float n = blades;
+    float apothem = radius * cos(PI / n);
+    float sector = 2.0 * PI / n;
+    float ang = atan(p.y, p.x) - rotation;
+    float local = mod(ang + 0.5 * sector, sector) - 0.5 * sector;
+    float edgeAng = (ang - local) + rotation;
+    en = vec2(cos(edgeAng), sin(edgeAng));
+    edgeDist = apothem - dot(p, en);
+}
+
 // Regular N-gon (or circular, blades==0) aperture containment.
 bool InsideAperture(vec2 p, float radius, float blades, float rotation)
 {
@@ -169,6 +190,46 @@ LensTraceResult WalkLens(vec3 O, vec3 D, float lambdaNm, bool flareOn, int start
         {
             // Aperture stop: flat, air both sides, blades decide.
             if (!InsideAperture(hitPos.xy, s.aperture.z, s.aperture.x, s.aperture.y)) return res;
+
+            // Aperture diffraction (paper sec. 4.4 / 3.1): light-side walks
+            // passing within an edge interval stochastically diffract onto
+            // the Keller cone (axis = edge tangent, half-angle = incidence
+            // angle), weighted by the paper's Eq. 1 wedge coefficient with
+            // alpha=0 (infinitely thin aperture, n=2). The lambda factor
+            // gives the streaks their chromatic fringing; the absolute
+            // scale carries the same artist multiplier caveat as the paper.
+            if (flareOn && uFrame.lensParams3.x > 0.5)
+            {
+                vec2 en;
+                float edgeDist;
+                ApertureEdge(hitPos.xy, s.aperture.z, s.aperture.x, s.aperture.y, en, edgeDist);
+                if (edgeDist < uFrame.lensParams3.z && RandomFloat() < 0.5)
+                {
+                    vec3 e = normalize(vec3(-en.y, en.x, 0.0)); // edge tangent
+                    float cosB = clamp(dot(D, e), -0.999, 0.999);
+                    float sinB = sqrt(1.0 - cosB * cosB);
+                    vec3 u = normalize(cross(e, vec3(0.0, 0.0, 1.0)));
+                    vec3 v = cross(e, u);
+                    float phi = 2.0 * PI * RandomFloat();
+                    vec3 dNew = normalize(cosB * e + sinB * (cos(phi) * u + sin(phi) * v));
+                    if (dNew.z * D.z <= 0.0) return res; // keep traversal direction
+
+                    vec3 nw = (D.z < 0.0) ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 0.0, -1.0);
+                    vec3 Dp = normalize(D - dot(D, e) * e);
+                    vec3 dp = normalize(dNew - dot(dNew, e) * e);
+                    float gam = acos(clamp(dot(-Dp, nw), -1.0, 1.0));
+                    float del = acos(clamp(dot(dp, nw), -1.0, 1.0));
+                    // n=2: coefficient = cos(pi/4)/(2 pi sinB) / (0 - cos((del-gam)/2));
+                    // epsilon-clamped near the shadow-boundary singularity.
+                    float denom = max(abs(cos(0.5 * (del - gam))), 0.05);
+                    float c = 0.70710678 / (2.0 * PI * max(sinB, 0.05)) / denom;
+                    float lambdaMm = lambdaNm * 1e-6;
+                    transmission *= lambdaMm * c * c * uFrame.lensParams3.y / 0.5; // / branch prob
+                    D = dNew;
+                    res.flared = true; // splats like a ghost: light-pass exclusive
+                }
+            }
+
             O = hitPos;
             k += step;
             continue;

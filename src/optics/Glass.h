@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cmath>
+#include <cstdlib>
 #include <string>
 
 namespace RoyalGL
@@ -73,6 +74,11 @@ namespace RoyalGL
                 g.C[0] = 0.00600069867f; g.C[1] = 0.0200179144f; g.C[2] = 103.560653f;
                 return g;
             }
+            // Raw refractive index (pbrt-style prescriptions carry no glass
+            // names): exact at the d line, generic crown-ish Abbe number.
+            char* end = nullptr;
+            float n = std::strtof(name.c_str(), &end);
+            if (end != name.c_str() && n > 1.0f && n < 3.0f) return FromNdVd(n, 55.0f);
             return FromNdVd(1.5f, 50.0f); // unknown glass: generic crown
         }
     };

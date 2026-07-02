@@ -1,0 +1,439 @@
+# ReSTIR BDPT Implementation Plan for RoyalGL
+
+Based on: *Hedstrom, Kettunen, Lin, Wyman, Li — "ReSTIR BDPT: Bidirectional ReSTIR
+Path Tracing with Caustics", ACM TOG 2025.*
+
+This document maps the paper's algorithm onto RoyalGL's existing OpenGL 4.6 compute
+BDPT and lays out a phased implementation plan.
+
+---
+
+## 1. What the paper does (condensed)
+
+ReSTIR BDPT = BDPT initial sampling + GRIS spatiotemporal reuse, with four key ideas:
+
+1. **Extended path space.** Reservoirs store *path–technique pairs* (x̄, τ) where
+   τ = (s, t) is the BDPT strategy that produced the path. The RIS target function is
+   `p̂(x̄, τ) = ω_τ(x̄) · luminance(f(x̄))` — the technique MIS weight is folded into the
+   target. Shift mappings never change τ (Eq. 18–26). This makes random replay
+   well-defined: knowing τ tells you which subpath seeds to replay and where the
+   connection sits.
+
+2. **Technique-specific bidirectional hybrid shift** (Sec. 5):
+   - **t ≥ 2** (camera-side techniques: PT hit s=0, NEE s=1, vertex connection s≥2):
+     camera subpath uses ReSTIR PT's hybrid shift (random replay until two consecutive
+     *connectable* vertices, then reconnect); light subpath is shifted by pure random
+     replay; the subpath connection edge is re-evaluated. Connections only occur
+     between connectable (rough) vertices, so the reconnection at the join always
+     succeeds. Shift fails if any vertex changes rough/non-rough classification
+     (bijectivity).
+   - **t ≤ 1, non-caustic** (light tracing where secondary hit x₂ is rough): *reverse
+     hybrid shift* — random replay from the light until x₂, then reconnect x₂ to the new
+     pixel's primary hit x₁′. Fails if x₁′ is not rough.
+   - **t ≤ 1, caustic** (x₂ non-rough): pure random replay from the light; the shifted
+     path lands wherever its new x₁ projects on screen. Temporal only; the shift
+     redistributes caustic samples into pixels (Appendix A justifies this in GRIS).
+
+3. **Caustic reservoirs** (Sec. 5.1): a second per-pixel reservoir that only holds
+   caustic t≤1 paths. Never spatially reused (spatial neighbors would starve
+   low-probability caustics). Temporally accumulated with confidence updated by a
+   *proxy* `c_i += c_v` where v is the motion-vector-mapped previous pixel (confidence
+   must not depend on realized samples). Final image = regular estimate + caustic
+   estimate.
+
+4. **Recursive reconnection MIS** (Sec. 6): after a shift, ω_τ must be recomputed for
+   the shifted path. Building on VCM-style recursive MIS (per-vertex d^p ≡ dVCM and
+   d^VC), the paper caches four extra scalars per stored camera suffix
+   (γ̄, λ̄^VC, λ̄^P, σ̄ — Eq. 42–45) plus a geometry ratio, so d^p_{t−1} and d^VC_{t−1}
+   can be reconstructed at the reconnection vertex without walking the suffix
+   (Eq. 46–47). Two cheaper alternatives: **copy ω_τ from the base path** (biased,
+   small darkening near corners, bounded by Sec. 6.4) and **lightweight BDPT**
+   (only s∈{0,1} and t=1 — no vertex connections — so the expensive general case
+   never arises).
+
+Implementation shape in the paper (Sec. 7, Algorithms 1–3):
+
+- **Algorithm 1 — light pass:** trace N_L light subpaths (N_L ≈ pixel count); append
+  connectable vertices to a **Light Vertex Cache (LVC)**; connect each to the camera
+  (t=1) and insert the resulting one-sample reservoir into a **Light Reservoir Map
+  (LRM)** — a GPU multimap keyed by pixel (insert + sort, to avoid atomic reservoir
+  merges).
+- **Algorithm 2 — camera pass:** per pixel, trace a camera subpath; at each vertex
+  generate s=0 / s=1(NEE) / s≥2 (uniform LVC pick, p_L = N_L/|LVC|) candidates and
+  stream-RIS them into the pixel reservoir with initial MIS weights m = 1/N_L for
+  t≤1 and m = 1 otherwise (Eq. 26); then merge this pixel's LRM entries, routing
+  caustic ones into the caustic reservoir. Confidence of the result is always 1.
+- **Algorithm 3 — shift:** used by both temporal and spatial reuse; retraces
+  light subpath (replay), camera prefix (replay+reconnect), connection edge.
+- Temporal reuse: balance heuristic, 2 candidates. Spatial reuse: pairwise MIS,
+  a few neighbors. Confidence cap 20. Integration in solid-angle measure with the
+  Jacobians of Appendix B (replay: pdf ratios; reconnection: geometry-term ratios).
+- Stability fix: reject non-caustic t≤1 candidates whose reconnection to the pixel's
+  V-buffer primary hit fails (tiny darkening bias in penumbras, big stability win).
+
+Paper stats to calibrate against: reservoir 244 B (160 B without recursive-MIS cache),
+LVC vertex 112 B, ~50 ms/frame at 1080p on a 4090, N_L = 2M, max 20 bounces /
+8 "diffuse" bounces, connectable-roughness threshold 0.08, RR
+p_terminate = 0.2·roughness, confidence cap 20.
+
+---
+
+## 2. Mapping onto RoyalGL — assets, gaps, simplifications
+
+### What we already have (big head start)
+
+| Paper ingredient | RoyalGL status |
+|---|---|
+| BDPT with light + camera passes | ✅ `bdpt_light.comp` / `bdpt_eye.comp`, 3-pass pipeline in `PathTracer.cpp` |
+| Recursive MIS (d^p/dVCM, d^VC/dVC) | ✅ `bdpt_common.glsl` implements the van Antwerpen/Georgiev recursion — the exact foundation Sec. 6 builds on |
+| LVC-style shared light vertices | ✅ `lightVerts[pathIdx*8+i]` SSBO (binding 8) + `lightVertCount` (11); eye pass connects to a random light path's vertices |
+| Receiver-independent light selection | ✅ camera-anchored power CDF + `bdpt_lightsel.comp` — replayable, exactly what shift PDF re-evaluation needs |
+| Per-pixel scatter from light pass | ✅ fixed-point splat buffer (binding 9) + `bdpt_resolve.comp` — the same binning problem the LRM solves, currently solved with additive atomics |
+| Rough/non-rough classification | ✅ trivially: material type 0 (diffuse) = connectable, type 1 (glass delta) = non-connectable. No roughness threshold needed until GGX lands |
+| Solid-angle integration | ✅ current code folds geometry terms into dVCM/dVC in solid angle; Appendix B Jacobians are the natural fit |
+
+### What's missing
+
+1. **Reservoirs / GRIS machinery** — nothing exists (no RIS, no UCW, no confidence).
+2. **Temporal infrastructure** — no G-buffer/V-buffer, no previous-frame camera, no
+   motion vectors, no ping-pong state. `Application.cpp` *resets* accumulation on any
+   camera move — the opposite of what ReSTIR needs.
+3. **Replayable RNG** — current shaders advance a stateful WangHash/xorshift stream.
+   Shift mappings need *counter-based* random numbers: `rand(pathSeed, bounce, dim)`
+   so any suffix can be replayed from a stored 32-bit seed.
+4. **LRM** — light-tracing candidates must be *reservoirs* per pixel, not additive
+   splats. Needs a binning structure (paper: insert + prefix-sum sort).
+5. **Per-frame full-frame dispatch** — the adaptive 30 ms tiling
+   (`m_rowsPerTile`/`m_pathsPerChunk`) slices one sample across frames; ReSTIR needs
+   the whole pass sequence to complete every frame.
+6. **Reconnection data in reservoirs** — reconnection vertex, partial throughputs,
+   MIS cache (γ̄, λ̄^VC, λ̄^P, σ̄, d^p_r, d^VC_r, geometry ratio).
+
+### RoyalGL-specific simplifications (v1 scope)
+
+- **Materials are binary** (Lambert diffuse / delta glass). The hybrid shift's
+  "two consecutive rough vertices" test is a material-type check. Caustic
+  classification (`x₂ non-rough`) = "x₂ is glass". This removes most of the paper's
+  roughness-threshold subtlety.
+- **Scenes are static** (no animation system). Diffuse motion vectors are pure camera
+  reprojection; light-subpath temporal replay of an unchanged scene reproduces the
+  identical subpath, so temporal light-subpath shifts are near-free (still implement
+  the replay path — it validates the machinery and future-proofs animation).
+- **Pinhole camera only for ReSTIR mode (v1).** The physical lens (stochastic pupil
+  samples, spectral wavelength per path, sensor splatting) makes the primary hit a
+  random variable per pixel — that's Area ReSTIR territory (Zhang et al. 2024), out
+  of scope. Lens mode falls back to the existing accumulation BDPT. Revisit later.
+- **t = 0 omitted** (paper does the same; zero probability for pinhole).
+- **Russian roulette**: paper requires p_terminate to not depend on camera-side info.
+  Use a material-only rule (e.g. terminate diffuse bounces with fixed prob after
+  bounce k, never on glass) applied identically in light and camera tracing and in
+  replay — RR decisions must be reproducible from the counter-based RNG.
+
+---
+
+## 3. Key design decisions
+
+1. **Separate ReSTIR frame path.** Add `enableRestir` next to `enableBidir` in
+   `RenderSettings`. ReSTIR mode uses its own dispatch sequence in
+   `PathTracer::Render()` (full-frame, fixed pass graph, resolution-scale option)
+   and its own output semantics: per-frame estimate written to the accum image
+   (optionally EMA-blended or progressively averaged when camera is static).
+   Existing PT/BDPT paths untouched.
+2. **Counter-based RNG first.** Replace stateful RNG in the BDPT shaders with
+   `pcg/philox-style hash(seed, bounce, dim)`; a subpath is fully determined by one
+   32-bit seed. This lands as its own refactor (Phase 0) and is verified by
+   image-diff against the old renderer (same convergence, different noise pattern).
+3. **LRM as count + prefix-sum + scatter** (paper-faithful), implemented as three
+   small compute passes over a `(pixelCount+1)`-entry counter buffer and a compact
+   entry array (entry = light-tracing candidate reservoir, ~48–64 B). A per-pixel
+   linked list (atomic head exchange) is the fallback if the scan is a pain —
+   correctness-equivalent, worse coherence. The same structure is reused for
+   temporal caustic re-binning.
+4. **MIS weight strategy is staged:** Phase A uses **copied ω_τ** (biased, Sec. 6.4)
+   to get end-to-end images, Phase B implements **recursive reconnection MIS**
+   (Eq. 42–47) behind a toggle, so bias can be A/B tested exactly like the paper's
+   Fig. 5. **Lightweight BDPT** (s≤1, t≤1 only) ships in between as a permanently
+   useful low-cost mode.
+5. **Two reservoir buffers per pixel (regular + caustic), ping-ponged** across frames
+   (4 buffers total). Target ≤ 192 B per regular reservoir at v1 (we can be smaller
+   than the paper's 244 B: no wavelength, binary materials, fewer flags).
+6. **Solid-angle Jacobians** (Appendix B): replay = ratio of solid-angle pdfs
+   (Eq. 53–54), reconnection = ratio of geometry terms (Eq. 55–56), including the
+   connection edge for s≥1, t≥2.
+
+---
+
+## 4. New GPU data structures
+
+> **Phase 0 status: DONE.** Counter-based RNG (`RngStream(vertex, purpose)` in
+> common.glsl), `enableRestir` plumbing + UI + `ROYALGL_RESTIR`/`ROYALGL_RESTIR_DEBUG`
+> env overrides, G-buffer pass, prev-camera reprojection + debug views, reservoir
+> allocation. Verified: unidirectional / BDPT / ReSTIR-mode converged means agree
+> (0.116647 / 0.116592 / 0.116592); motion debug view shows exactly zero motion for a
+> static camera.
+>
+> **Binding scheme changed from this section's original sketch:** the dev GPU
+> (Intel UHD) caps SSBO bindings at 16, so paired Cur/Prev bindings 16–24 are
+> impossible. Actual scheme (shaders/restir_common.glsl): reservoirs (PathReservoir +
+> CausticReservoir combined in one 272 B `PixelReservoirs` struct) at **binding 15**,
+> G-buffer at **binding 0**, each buffer holding BOTH ping-pong halves
+> (2 × pixelCount), the halves selected by a parity flag in `restirParams.w`.
+> Bindings 13/14 (lens-only) remain reclaimable for the Phase 2 LRM in shaders that
+> skip lens_common.glsl.
+
+Bindings 15+ are free. All structs are std430; exact packing finalized in-code.
+
+```glsl
+// binding 15/16 (ping/pong): regular path reservoirs, one per pixel
+struct PathReservoir {
+    // --- GRIS state ---
+    float W;              // unbiased contribution weight
+    float pHat;           // target value at this domain = omega_tau * lum(f)
+    float c;              // confidence
+    uint  techFlags;      // s:8 | t:8 | flags:16 (caustic, rcValid, deltaSuffix...)
+
+    vec3  f;              // RGB contribution of the selected path (for shading)
+    uint  camSeed;        // camera subpath replay seed
+
+    uint  lightSeed;      // light subpath replay seed (t<=1 or s>=1)
+    uint  lightPathIdx;   // this-frame LVC path index (spatial reuse fast path)
+    float lightSelPdf;    // cached p_L terms
+    uint  rcIndex;        // r = index of reconnection vertex on camera subpath
+
+    // --- reconnection vertex x_r (camera side) ---
+    vec4  rcPosMat;       // xyz pos, w material id
+    vec4  rcNormal;       // xyz normal
+    vec4  rcWoPdf;        // xyz outgoing dir on base path, w forward pdf
+    vec4  tputToRc;       // rgb prefix throughput, w unused
+    vec4  tputAfterRc;    // rgb suffix contribution (radiance arriving via wo)
+
+    // --- light subpath end y_{s-1} (connection endpoint) ---
+    vec4  lyPosMat;       // xyz pos, w material id
+    vec4  lyNormalLen;    // xyz normal, w = s (vertex count)
+    vec4  lyTput;         // rgb light-side throughput
+
+    // --- recursive reconnection MIS cache (Sec. 6.2) ---
+    vec4  misA;           // dP_r, dVC_r, geomRatio (Eq. 46), gammaBar
+    vec4  misB;           // lambdaVC, lambdaP, sigmaBar, omega_tau (base)
+};  // 208 B — trim during implementation
+```
+
+```glsl
+// binding 17/18 (ping/pong): caustic reservoirs, one per pixel
+// Same layout minus reconnection/MIS fields (pure replay): ~96 B.
+struct CausticReservoir {
+    float W; float pHat; float c; uint flags;
+    vec3  f; uint lightSeed;          // path fully determined by light replay
+    uint  sLen; float misOmega; vec2 subpixel; // landing position for filter h_i
+};
+```
+
+```glsl
+// binding 19: compacted global LVC (replaces per-path fixed slots for s>=2 picks)
+//   existing LightVertex (64 B) + one extra vec4:
+//     rcMis: dP, dVC at vertex, pathSeed (bits), vertexIndexInPath
+//   => 80 B per vertex, atomic-append counter in binding 20.
+
+// binding 21: LRM entry array  (uint pixel key + light-tracing candidate, ~64 B)
+// binding 22: LRM per-pixel counts / offsets (prefix sum)
+// binding 23: G-buffer current  (vec4 posDepth, vec4 normalMat)  [or RGBA32F images]
+// binding 24: G-buffer previous
+// UBO additions: previous-frame camera matrices for reprojection; restir params
+//   (N_L, spatialCount, spatialRadius, confidenceCap, flags).
+```
+
+Memory at 1080p (2.07 MP): regular 2×208 B + caustic 2×96 B + G-buffers 2×32 B
+≈ **1.4 GB** + LVC (2M × 80 B = 160 MB) + LRM (~2× N_L × 64 B ≈ 256 MB) ≈ **1.8 GB**.
+Comfortable on ≥8 GB GPUs; add a resolution scale and N_L slider regardless.
+
+---
+
+## 5. Frame graph (ReSTIR mode)
+
+```
+per frame:
+ 0. UBO upload (current + previous camera)                     [PathTracer.cpp]
+ 1. bdpt_lightsel.comp        camera-anchored light pdfs        (existing, unchanged)
+ 2. restir_light.comp         N_L light subpaths:
+                                - append connectable verts to LVC (atomic)
+                                - t=1 connect-to-camera -> candidate reservoir
+                                  -> LRM count pass (atomicAdd per pixel key)
+                                  (entries staged in a raw array with pixel keys)
+ 3. lrm_scan.comp             prefix sum over per-pixel counts
+ 4. lrm_scatter.comp          scatter staged entries into sorted slots
+ 5. restir_camera.comp        per pixel:
+                                - write G-buffer (primary hit)
+                                - trace camera subpath (counter-based RNG)
+                                - candidates: s=0 emitter hits, s=1 NEE,
+                                  s>=2 uniform LVC connections
+                                - stream-RIS into regular reservoir (Eq. 24-26)
+                                - merge LRM[pixel]: caustic -> caustic reservoir
+                                  (with t<=1 V-buffer rejection heuristic),
+                                  else -> regular reservoir
+                                - confidence := 1
+ 6. restir_temporal.comp      regular reservoirs:
+                                - motion vector via prev-camera reprojection of
+                                  G-buffer position + depth/normal validation
+                                - shift prev reservoir into current pixel
+                                  (Algorithm 3), balance heuristic 2-way merge,
+                                  c := min(c_prev + 1, cap)
+ 7. restir_caustic_temporal   caustic reservoirs:
+       (.comp)                  - replay prev caustic paths in current frame,
+                                  project new x1 -> pixel, re-bin via LRM passes
+                                - merge into caustic reservoir (Eq. 51-52)
+                                - c_i += c_v (motion-vector proxy), capped
+ 8. restir_spatial.comp       1-2 iterations, 3-5 neighbors in ~30 px radius,
+                                pairwise MIS, bidirectional hybrid shift;
+                                caustic reservoirs are NOT touched
+ 9. restir_resolve.comp       color = f_reg * W_reg + f_cau * W_cau
+                                -> accum image (direct, EMA, or progressive-if-static)
+10. tonemap                    (existing)
+```
+
+Passes 2–4 and 7 share the LRM helpers. Passes 6–8 all call the same
+`ShiftPath()` implemented in a new `restir_shift.glsl` include.
+
+### The shift kernel (heart of the system, `restir_shift.glsl`)
+
+Faithful port of Algorithm 3 specialized to our two-material world:
+
+```
+ShiftPath(Reservoir base, newPrimaryHit, mode):
+  1. light subpath: replay from base.lightSeed (static scene: fast path may reuse
+     this frame's LVC entry when spatial-in-frame); recompute dP/dVC along it
+  2. if caustic t<=1: connect y_{s-1} to camera; landing pixel = project(x1');
+     Jacobian = reverse-reconnection (Eq. 56, i=1); done
+  3. if non-caustic t<=1: replay light path to x2', reconnect x2' -> newPrimaryHit;
+     fail if primary hit is glass; Jacobian Eq. 56 (i=2)
+  4. else (t>=2): trace camera prefix from newPrimaryHit replaying base.camSeed dims;
+     at first diffuse vertex pair, reconnect to base.rc vertex (occlusion test);
+     replay suffix direction rcWoPdf onward if r < t-1;
+     connect z_{t-1} to y_{s-1} (occlusion test) if s > 0
+  5. recompute omega_tau:  v1 = copy base omega (biased)
+                           v2 = Eq. 46/47 from misA/misB cache (unbiased)
+  6. return pHat' = omega * lum(f'), f', Jacobian (solid-angle, Eq. 53-56)
+```
+
+Shift failure ⇒ contribution 0 (m_i handles it, Eq. 15–17).
+
+---
+
+## 6. Phased milestones
+
+Each phase compiles, runs, and has an explicit acceptance test. Roughly in order of
+increasing risk.
+
+### Phase 0 — Infrastructure (no visual change)
+- **0.1 Counter-based RNG.** New `Rand(seed, bounce, dim)` in `common.glsl`; migrate
+  `bdpt_light.comp` + `bdpt_eye.comp` (and RR) to it. *Test:* converged renders match
+  old ones (image diff < noise floor).
+- **0.2 Full-frame ReSTIR dispatch mode + settings plumbing.** `enableRestir`,
+  resolution scale, N_L, UI toggles in `UILayer.cpp`; frame path skeleton in
+  `PathTracer.cpp` that for now just runs 1spp BDPT full-frame per frame.
+- **0.3 G-buffer + previous camera + motion vectors.** New pass writes pos/normal/mat;
+  debug view visualizing reprojection error. *Test:* reprojected previous position
+  matches current within epsilon for a static camera; sensible vectors when orbiting.
+- **0.4 Ping-pong reservoir buffers allocated; debug heatmap views** (W, c, technique
+  index) wired into the tonemap pass or a debug output switch.
+
+### Phase 1 — GRIS core with camera-side techniques only (≈ ReSTIR PT lite)
+- **1.1 Initial RIS in `restir_camera.comp`:** candidates from s=0 and s=1 only
+  (ignore LVC and t=1 for now); reservoir stores path, seeds, reconnection vertex.
+  Resolve pass shades `f·W`. *Test:* accumulated output (temporal/spatial OFF, average
+  many independent frames) matches plain BDPT-with-s≤1 reference. This validates
+  UCW bookkeeping — the single most bug-prone piece.
+- **1.2 Temporal reuse** with hybrid shift on camera subpaths (replay + reconnect,
+  copied ω_τ for now). *Test:* static camera → variance drops hard, no brightness
+  drift over 1000 frames (unbiasedness soak: long-average vs reference).
+- **1.3 Spatial reuse** with pairwise MIS. *Test:* same soak; inspect for
+  correlation blotches; verify confidence capping.
+
+### Phase 2 — Light tracing (t=1) + LRM  → "Lightweight ReSTIR BDPT"
+- **2.1 LRM passes** (count/scan/scatter) replacing additive splatting *in ReSTIR
+  mode only*. `restir_light.comp` emits candidate reservoirs with m = 1/N_L.
+- **2.2 Merge LRM into pixel reservoirs** in `restir_camera.comp`; caustic/non-caustic
+  split on x₂ material; caustic reservoir populated but temporally naive at first.
+- **2.3 Reverse hybrid shift** for non-caustic t=1 in temporal + spatial passes;
+  V-buffer rejection heuristic. *Test:* glass-bulb scene — lightweight mode (s≤1,t=1)
+  resolves filament lighting that ReSTIR-PT-lite can't; soak test again.
+- Milestone: **LW BDPT mode** from the paper, a shippable quality tier.
+
+### Phase 3 — Caustic reservoirs
+- **3.1 Temporal caustic replay + re-binning** (pass 7): replay previous frame's
+  caustic paths, project, LRM re-bin, merge with Eq. 51–52 weights.
+- **3.2 Proxy confidence** `c_i += c_v` via motion vectors, cap 20.
+- *Test:* glass egg / Cornell caustic scene: caustics sharpen over frames while
+  orbiting camera slowly; no energy gain/loss in soak test; toggling caustic
+  reservoirs off shows the paper's Fig. 8-style degradation.
+
+### Phase 4 — Full BDPT: s ≥ 2 vertex connections
+- **4.1 Compacted global LVC** (atomic append, uniform selection, p_L = N_L/|LVC|)
+  with per-vertex dP/dVC + replay metadata.
+- **4.2 s≥2 candidates in initial RIS** (Eq. 25 UCW incl. 1/p_L); connection-edge
+  reconnection Jacobian (Eq. 55 note).
+- **4.3 Shift support:** light-subpath replay inside `ShiftPath`, double reconnection
+  case (x_r then y_{s-1}). *Test:* Veach-Bidir-style scene; compare against plain
+  full BDPT accumulation.
+
+### Phase 5 — Unbiased MIS: recursive reconnection MIS
+- **5.1 Cache γ̄, λ̄^VC, λ̄^P, σ̄, geometry ratio** during camera subpath sampling
+  (incremental updates per bounce as in the paper's supplemental Python).
+- **5.2 Recompute ω_τ at shift time** via Eq. 46/47 (r = t−1, r = t−2, and general
+  cases). Toggle: copied vs recomputed. *Test:* reproduce Fig. 5 — biased-vs-unbiased
+  difference image shows the corner darkening disappearing; soak test converges to
+  reference within noise.
+
+### Phase 6 — Performance & polish
+- Profile with existing `ROYALGL_STATS=1` GL timer queries per pass.
+- Reservoir packing (fp16 normals/throughputs where safe), register pressure in the
+  shift kernel (consider splitting caustic vs non-caustic shifts into separate
+  dispatches — the paper lists this as a known win).
+- Progressive accumulation when camera static (ReSTIR frame estimates averaged after
+  reservoirs warm up; note temporal correlation — offer spatial-only offline mode
+  like the paper's Fig. 12).
+- Optional: lens-mode ReSTIR investigation (Area ReSTIR), GGX materials (real
+  roughness threshold 0.08 semantics kick in here).
+
+---
+
+## 7. Files touched / created
+
+| File | Change |
+|---|---|
+| `shaders/restir_common.glsl` | **new** — reservoir structs, RIS/merge helpers, pairwise MIS |
+| `shaders/restir_shift.glsl` | **new** — ShiftPath (Algorithm 3), Jacobians (App. B), recursive reconnection MIS (Sec. 6) |
+| `shaders/restir_light.comp` | **new** — Algorithm 1 (light subpaths, LVC append, t=1 candidates, LRM stage) |
+| `shaders/lrm_scan.comp`, `lrm_scatter.comp` | **new** — LRM sort |
+| `shaders/restir_camera.comp` | **new** — Algorithm 2 (G-buffer, initial RIS, LRM merge) |
+| `shaders/restir_temporal.comp`, `restir_caustic_temporal.comp`, `restir_spatial.comp`, `restir_resolve.comp` | **new** — reuse + resolve passes |
+| `shaders/common.glsl` | counter-based RNG; material-only RR helper |
+| `shaders/bdpt_common.glsl` | expose dP/dVC update as shared functions used by both classic BDPT and ReSTIR passes |
+| `src/pathtracer/PathTracer.{h,cpp}` | ReSTIR frame path, new buffers/bindings 15–24, ping-pong, prev-camera tracking |
+| `src/pathtracer/RenderSettings.h` | `enableRestir`, N_L, spatial params, confidence cap, MIS mode, debug view enum |
+| `src/gfx/GPUTypes.h` | UBO additions (prev camera, restir params) |
+| `src/core/Application.cpp` | don't reset reservoirs on camera move in ReSTIR mode; reset on scene/material edits |
+| `src/ui/UILayer.cpp` | ReSTIR panel + debug views |
+
+---
+
+## 8. Risks & open questions
+
+1. **UCW bookkeeping bugs** manifest as subtle brightness bias, not crashes. Mitigation:
+   the Phase 1.1 "RIS-only, no reuse" checkpoint and soak tests (long average vs
+   reference image, per-phase) are non-negotiable.
+2. **Register pressure / divergence** in the unified shift kernel on GL compute
+   (no Shader Execution Reordering here, unlike the paper's Falcor/OptiX context).
+   The paper already flags this; splitting dispatches by technique class is the
+   known fix. Budget for it in Phase 6.
+3. **Prefix-sum LRM on GL** — a workgroup-hierarchical scan is standard but fiddly;
+   linked-list fallback documented in Sec. 3.
+4. **32-bit seed entropy** — one seed per subpath per frame is plenty (paper does the
+   same via random replay), but seeds must be decorrelated across pixels/frames;
+   reuse existing WangHash seeding discipline.
+5. **Glass-only "roughness"** means every diffuse vertex is connectable — reconnection
+   shifts will succeed more often than in the paper's scenes (good), but caustic
+   classification is binary and aggressive (all glass-touching t≤1 paths are caustic).
+   Watch the regular/caustic split ratio in debug views.
+6. **Temporal accumulation semantics** — ReSTIR is per-frame; RoyalGL is progressive.
+   Decide UX: default ReSTIR shows the live 1spp-reuse estimate (+optional OIDN);
+   "converge" button switches to spatial-only accumulation (paper Fig. 12 mode).

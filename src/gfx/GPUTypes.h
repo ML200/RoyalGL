@@ -47,7 +47,20 @@ namespace RoyalGL
         glm::vec4 lensParams;  // x=sensor half width mm, y=sensor half height mm,
                                // z=front vertex z mm, w=pupil plane z mm (lens camera mode)
         glm::vec4 lensParams2; // x=camera mode (0=pinhole, 1=lens), y=flare enabled (0/1),
-                               // z=rear element semi-diameter mm, w unused
+                               // z=rear element semi-diameter mm, w=front element semi-diameter mm
+        glm::vec4 lensParams3; // x=diffraction enabled (0/1), y=diffraction intensity,
+                               // z=diffraction edge width mm, w unused
+
+        // Previous frame's pinhole camera, for ReSTIR temporal reprojection
+        // (motion vectors, temporal shift domains). Equal to the current
+        // camera on the very first ReSTIR frame.
+        glm::vec4 prevCamPos;      // xyz, w unused
+        glm::vec4 prevCamForward;  // xyz, w unused
+        glm::vec4 prevCamRight;    // xyz, w unused
+        glm::vec4 prevCamUp;       // xyz, w unused
+        glm::vec4 prevCameraParams;// x=tanHalfFovY, y=aspect, z/w unused
+        glm::uvec4 restirParams;   // x=debug view index, y=ReSTIR active (0/1),
+                                   // z=frame counter (never reset), w=ping-pong parity
     };
 
     // One lens surface in walk order (rear -> front), uploaded to SSBO

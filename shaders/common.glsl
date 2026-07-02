@@ -44,7 +44,14 @@ layout(std140, binding = 0) uniform FrameUBO
     vec4 renderParams; // x=exposure, y=total light power
     uvec4 lightInfo;   // x=light triangle count, y=NEE enabled (0/1), z=BDPT light path count, w=lens flare samples
     vec4 lensParams;   // x=sensor half width mm, y=sensor half height mm, z=front vertex z mm, w=pupil plane z mm
-    vec4 lensParams2;  // x=camera mode (0=pinhole 1=lens), y=flare enabled, z=rear semi-diameter mm
+    vec4 lensParams2;  // x=camera mode (0=pinhole 1=lens), y=flare enabled, z=rear semi-diameter mm, w=front semi-diameter mm
+    vec4 lensParams3;  // x=diffraction enabled, y=diffraction intensity, z=diffraction edge width mm
+    vec4 prevCamPos;       // previous frame's camera (ReSTIR reprojection)
+    vec4 prevCamForward;
+    vec4 prevCamRight;
+    vec4 prevCamUp;
+    vec4 prevCameraParams; // x=tanHalfFovY, y=aspect
+    uvec4 restirParams;    // x=debug view, y=ReSTIR active (0/1), z=frame counter, w=ping-pong parity
 } uFrame;
 
 layout(std430, binding = 1) readonly buffer BVHNodesSSBO   { BVHNode bvhNodes[]; };
@@ -94,6 +101,31 @@ float RandomFloat()
     g_rngState ^= (g_rngState >> 17u);
     g_rngState ^= (g_rngState << 5u);
     return float(g_rngState) * (1.0 / 4294967296.0);
+}
+
+// Replayable streams (ReSTIR, docs/RESTIR_BDPT_PLAN.md): a subpath is fully
+// determined by one base seed, and every (vertex, purpose) pair gets its own
+// xorshift stream derived from it. Restarting at a purpose boundary means the
+// number of draws one purpose makes can never shift another purpose's values -
+// so a shift mapping can replay, say, vertex 3's BSDF sample of a stored path
+// without re-executing the NEE sampling that preceded it (whose draw count
+// varies with the light-tree descent depth). The unidirectional kernel keeps
+// seeding g_rngState directly; these streams are the bidirectional/ReSTIR
+// convention.
+uint g_rngSeed = 0u;
+
+const uint RNG_PIXEL   = 0u; // subpixel jitter + lens eye-ray sampling (vertex 0)
+const uint RNG_EMIT    = 1u; // light pick + point + emission direction (vertex 0)
+const uint RNG_BSDF    = 2u; // BSDF direction sampling (incl. the Fresnel choice)
+const uint RNG_NEE     = 3u; // s=1 light sampling (tree descent + point)
+const uint RNG_CONNECT = 4u; // s>=2 light-vertex pick
+const uint RNG_CAMCONN = 5u; // t=1 lens-connection sampling (pupil point + lambdas)
+
+void RngStream(uint vertex, uint purpose)
+{
+    uint h = g_rngSeed + WangHash(vertex * 6971u + purpose * 0x9E3779B9u);
+    h = WangHash(h);
+    g_rngState = (h != 0u) ? h : 0x9E3779B9u; // xorshift32 must not start at 0
 }
 
 vec2 RandomFloat2() { return vec2(RandomFloat(), RandomFloat()); }

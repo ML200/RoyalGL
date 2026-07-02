@@ -14,6 +14,70 @@
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
+// The paper's lens flares (sec. 4.3): connect the EMISSION POINT itself to
+// the front element and walk scene -> sensor with stochastic Fresnel
+// reflections. Only flared walks splat (weight 1 - the eye pass cannot
+// sample ghost paths); transmitted walks are dropped, since that path is
+// the eye pass's direct image of the source (weight 1 there). This is the
+// paper's "sum of forward flare pass and backward pass" split, and it is
+// the dominant flare mechanism - a bright source shining into the lens -
+// which vertex connections alone never sample (the source terminates
+// light subpaths before any connectible vertex exists).
+void ConnectLightToLens(vec3 pos, vec3 lightN, vec3 Le, float pdfA)
+{
+    float frontSemi = uFrame.lensParams2.w;
+    vec2 r = RandomFloat2();
+    float rad = frontSemi * sqrt(r.x);
+    float phi = 2.0 * PI * r.y;
+    vec3 qLocal = vec3(rad * cos(phi), rad * sin(phi), uFrame.lensParams.z);
+    vec3 qWorld = LensToWorld(qLocal);
+
+    vec3 toQ = qWorld - pos;
+    float d2 = dot(toQ, toQ);
+    if (d2 <= 1e-12) return;
+    float d = sqrt(d2);
+    vec3 dir = toQ / d;
+    float cosY = dot(lightN, dir);
+    if (cosY <= 1e-6) return; // one-sided emitter
+    vec3 dLocal = LensWorldDirToLocal(dir);
+    if (dLocal.z >= -1e-4) return;
+    float cosQ = -dLocal.z;
+
+    Ray shadowRay = MakeRay(pos + lightN * 1e-4, dir);
+    if (IntersectSceneOccluded(shadowRay, d * 0.999)) return;
+
+    float aFront = PI * (frontSemi * 1e-3) * (frontSemi * 1e-3);
+    float zP = uFrame.lensParams.w * 1e-3;
+    float aRear = PI * (uFrame.lensParams2.z * 1e-3) * (uFrame.lensParams2.z * 1e-3);
+    float pixH = 2.0 * uFrame.lensParams.y * 1e-3 / float(uFrame.frameInfo.y);
+    float aPixel = pixH * pixH;
+    float K = (zP * zP) / aRear;
+    uint flareN = max(uFrame.lightInfo.w, 1u);
+
+    // renderParams.w = artist flare intensity multiplier.
+    vec3 base = Le * (cosY * cosQ / d2) * aFront * K * uFrame.renderParams.w
+                / (aPixel * float(BdptNumLightPaths()) * pdfA * float(flareN));
+    vec3 walkO = qLocal - dLocal * 2.0;
+
+    for (uint i = 0u; i < flareN; ++i)
+    {
+        float lambdaPdf;
+        float lambda = SampleLambda(lambdaPdf);
+        float transmission;
+        vec2 sensorMm;
+        bool flared;
+        if (!TraceLensToSensor(walkO, dLocal, lambda, true, sensorMm, transmission, flared)) continue;
+        if (!flared) continue;
+
+        ivec2 pixel;
+        if (!SensorPosToPixel(sensorMm, pixel)) continue;
+
+        vec3 contrib = base * transmission * SpectralWeightRGB(lambda, lambdaPdf);
+        if (any(isnan(contrib)) || any(isinf(contrib))) continue;
+        BdptSplat(pixel, max(contrib, vec3(0.0)));
+    }
+}
+
 void ConnectToCamera(vec3 pos, vec3 n, vec3 wi, Material mat, vec3 throughput,
                      float dVCM, float dVC)
 {
@@ -138,7 +202,7 @@ void ConnectToCamera(vec3 pos, vec3 n, vec3 wi, Material mat, vec3 throughput,
         if (!SensorPosToPixel(sensorMm, pixel)) continue;
 
         vec3 contrib = base * transmission * SpectralWeightRGB(lambda, lambdaPdf)
-                       * (flared ? 1.0 : misWeight);
+                       * (flared ? uFrame.renderParams.w : misWeight);
         if (any(isnan(contrib)) || any(isinf(contrib))) continue;
         contrib = max(contrib, vec3(0.0)); // spectral RGB weights can dip negative
         BdptSplat(pixel, contrib);
@@ -154,8 +218,10 @@ void main()
     lightVertCount[pathIdx] = 0u;
     if (uFrame.lightInfo.x == 0u) return;
 
-    g_rngState = WangHash(pathIdx * 7877u + uFrame.frameInfo.z * 15859u + 0x9e3779bu);
-    RandomFloat();
+    // Per-subpath base seed; every draw below comes from a (vertex, purpose)
+    // stream of it so the subpath is replayable from this one value.
+    g_rngSeed = WangHash(pathIdx * 7877u + uFrame.frameInfo.z * 15859u + 0x9e3779bu);
+    RngStream(0u, RNG_EMIT);
 
     // ------------------------------------------------------- emission ----
     float pickPdfTrue;
@@ -180,6 +246,13 @@ void main()
     vec3 throughput = lt.emissionWeight.rgb * cosTheta / emissionPdfTrue;
     float dVCM = directPdfA / emissionPdfW; // = PI / cosTheta
     float dVC = cosTheta / emissionPdfW;
+
+    // Lens flares: deterministic emission-point -> lens connection.
+    if (uFrame.lensParams2.x > 0.5 && uFrame.lensParams2.y > 0.5)
+    {
+        RngStream(0u, RNG_CAMCONN);
+        ConnectLightToLens(origin, lightNormal, lt.emissionWeight.rgb, pickPdfTrue * invArea);
+    }
 
     Ray ray = MakeRay(origin + lightNormal * 1e-4, dir);
 
@@ -224,11 +297,15 @@ void main()
             }
 
             if (pathLength + 1u <= maxLen)
+            {
+                RngStream(pathLength, RNG_CAMCONN);
                 ConnectToCamera(hitPos, hit.normal, wi, mat, throughput, dVCM, dVC);
+            }
         }
 
         if (pathLength + 2u > maxLen) break;
 
+        RngStream(pathLength, RNG_BSDF);
         BsdfSample bs = SampleBsdf(mat, hit.normal, wi, true);
         if (bs.weight == vec3(0.0)) break;
         if (!bs.specular && bs.pdfDir <= 0.0) break;

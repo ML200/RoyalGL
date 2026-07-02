@@ -49,4 +49,9 @@ namespace RoyalGL
     {
         GL_CALL(glBindBufferBase(m_target, m_bindingPoint, m_id));
     }
+
+    void Buffer::BindBase(GLuint bindingPoint) const
+    {
+        GL_CALL(glBindBufferBase(m_target, bindingPoint, m_id));
+    }
 }

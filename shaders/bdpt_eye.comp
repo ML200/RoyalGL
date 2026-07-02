@@ -27,8 +27,10 @@ void main()
     if (pixel.x >= size.x || pixel.y >= size.y || pixel.y >= int(uFrame.renderParams.z)) return;
 
     uint sampleIndex = uFrame.frameInfo.z;
-    g_rngState = WangHash(uint(pixel.x) * 1973u + uint(pixel.y) * 9277u + sampleIndex * 26699u + 1u);
-    RandomFloat();
+    // Per-subpath base seed (see common.glsl): every draw comes from a
+    // (vertex, purpose) stream so the eye subpath replays from this value.
+    g_rngSeed = WangHash(uint(pixel.x) * 1973u + uint(pixel.y) * 9277u + sampleIndex * 26699u + 1u);
+    RngStream(0u, RNG_PIXEL);
 
     vec2 jitter = RandomFloat2();
     vec2 ndc = (vec2(pixel) + jitter) / vec2(size) * 2.0 - 1.0;
@@ -140,6 +142,7 @@ void main()
             // -------------------------------------------------- s = 1 ----
             if (haveLights)
             {
+                RngStream(pathLength, RNG_NEE);
                 float pickPdfTrue;
                 uint lightIdx = BdptSampleLightIndex(pickPdfTrue);
                 LightTri lt = lightTris[lightIdx];
@@ -195,6 +198,7 @@ void main()
             }
             if (nValid > 0u)
             {
+                RngStream(pathLength, RNG_CONNECT);
                 uint k = min(uint(RandomFloat() * float(nValid)), nValid - 1u);
                 LightVertex lv = lightVerts[lightVertBase + k];
 
@@ -231,6 +235,7 @@ void main()
         }
 
         // -------------------------------------------------- BSDF bounce ---
+        RngStream(pathLength, RNG_BSDF);
         BsdfSample bs = SampleBsdf(mat, hit.normal, wi, false);
         if (bs.weight == vec3(0.0)) break;
         if (!bs.specular && bs.pdfDir <= 0.0) break;

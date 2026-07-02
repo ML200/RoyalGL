@@ -1,0 +1,72 @@
+#version 460 core
+#include "common.glsl"
+#include "restir_common.glsl"
+
+// ReSTIR debug views: overwrites the accumulation image with a
+// visualization selected by uFrame.restirParams.x. Values still pass
+// through the tonemapper (exposure/ACES/gamma), so colors are qualitative.
+// Runs last in the frame; toggling the view off resets accumulation (any
+// settings change does), so clobbering the accumulator here is harmless.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(rgba32f, binding = 0) uniform image2D uAccum;
+
+const uint DEBUG_NORMALS    = 1u;
+const uint DEBUG_DEPTH      = 2u;
+const uint DEBUG_MOTION     = 3u;
+const uint DEBUG_W          = 4u;
+const uint DEBUG_CONFIDENCE = 5u;
+const uint DEBUG_TECHNIQUE  = 6u;
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = ivec2(uFrame.frameInfo.xy);
+    if (pixel.x >= size.x || pixel.y >= size.y) return;
+
+    uint idx = RestirCurOffset() + RestirPixelIndex(pixel);
+    GBufferPixel g = gbuf[idx];
+    bool hit = g.posDepth.w >= 0.0;
+
+    vec3 color = vec3(0.0);
+    uint view = uFrame.restirParams.x;
+
+    if (view == DEBUG_NORMALS)
+    {
+        if (hit) color = g.normalMat.xyz * 0.5 + 0.5;
+    }
+    else if (view == DEBUG_DEPTH)
+    {
+        if (hit) color = vec3(1.0 / (1.0 + 0.2 * g.posDepth.w));
+    }
+    else if (view == DEBUG_MOTION)
+    {
+        // Reproject the current primary hit through the previous camera:
+        // green at zero motion, red/blue encode the motion vector, black
+        // where reprojection fails (miss, behind, or off-screen).
+        vec2 prevPixel;
+        if (hit && RestirPrevProject(g.posDepth.xyz, prevPixel))
+        {
+            vec2 mv = prevPixel - (vec2(pixel) + 0.5);
+            color = vec3(0.5 + mv.x / 64.0, 0.25, 0.5 + mv.y / 64.0);
+        }
+    }
+    else if (view == DEBUG_W)
+    {
+        color = vec3(pixelRes[idx].path.core.x);
+    }
+    else if (view == DEBUG_CONFIDENCE)
+    {
+        color = vec3(pixelRes[idx].path.core.z / 20.0);
+    }
+    else if (view == DEBUG_TECHNIQUE)
+    {
+        uint tech = floatBitsToUint(pixelRes[idx].path.core.w);
+        uint s = RestirTechS(tech);
+        uint t = RestirTechT(tech);
+        color = vec3(float(s) / 8.0, float(t) / 8.0, (s + t) > 0u ? 0.2 : 0.0);
+    }
+
+    imageStore(uAccum, pixel, vec4(color, 1.0));
+}

@@ -33,6 +33,10 @@ namespace RoyalGL
         // Binds this buffer to its configured indexed binding point.
         void BindBase() const;
 
+        // Binds to an explicit binding point instead (used for ping-ponged
+        // buffers whose current/previous roles swap every frame).
+        void BindBase(GLuint bindingPoint) const;
+
         GLuint Id() const { return m_id; }
         size_t SizeBytes() const { return m_sizeBytes; }
         bool IsValid() const { return m_id != 0; }

@@ -1,0 +1,9 @@
+# Single symmetric biconvex BK7 lens with a stop behind it - the fully
+# uncorrected demo case (Steinert et al. 2011 Fig. 14 uses a single
+# biconvex lens to show every aberration at once). ~50mm EFL.
+name: Biconvex single lens ~50mm (all aberrations)
+fnumber: 4.0
+
+50.0      6.0     BK7     15.0
+-50.0     2.0     air     15.0
+aperture  0       12.0

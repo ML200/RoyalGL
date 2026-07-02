@@ -87,30 +87,15 @@ namespace RoyalGL
         if (m_rows.empty()) LoadBuiltinTessar();
         const size_t n = m_rows.size();
 
-        // Axial vertex positions in the tracing frame: sensor plane at z=0,
-        // +z toward the scene. Row i's thickness is the gap on its image
-        // side, so the rear vertex sits at the last row's thickness (plus
-        // focus shift); everything scales uniformly (the paper: "all values
-        // are scaled with the same factor" to change the focal length).
-        float s = settings.scale;
-        std::vector<float> zVertex(n);
-        float z = m_rows[n - 1].thicknessMm * s + settings.focusShiftMm;
-        for (size_t i = n; i-- > 0;)
+        // Paraxial marginal-ray trace at the d line (h=1, u=0, front to
+        // back): EFL = -1/u_exit, and the back focal distance (last vertex
+        // to the paraxial focus) = -h_at_last_surface / u_exit. The latter
+        // auto-focuses prescriptions whose last thickness is 0 (the pbrt
+        // convention: the film distance is solved, not stated).
+        float eflUnscaled = 50.0f;
+        float bflUnscaled = m_rows[n - 1].thicknessMm;
         {
-            zVertex[i] = z;
-            if (i > 0) z += m_rows[i - 1].thicknessMm * s;
-        }
-        m_frontVertexZMm = zVertex[0];
-        m_rearVertexZMm = zVertex[n - 1];
-        m_rearSemiDiameterMm = m_rows[n - 1].semiDiameterMm * s;
-        m_frontSemiDiameterMm = m_rows[0].semiDiameterMm * s;
-
-        // Paraxial EFL at the d line (587.6nm): trace a parallel marginal
-        // ray (h=1, u=0) front to back; EFL = -h0 / u_exit. Scales linearly
-        // with the prescription scale.
-        {
-            float h = 1.0f, u = 0.0f;
-            float nPrev = 1.0f;
+            float h = 1.0f, u = 0.0f, nPrev = 1.0f;
             for (size_t i = 0; i < n; ++i)
             {
                 const LensRow& row = m_rows[i];
@@ -120,11 +105,34 @@ namespace RoyalGL
                     float phi = (nNext - nPrev) / row.radiusMm;
                     u = (nPrev * u - h * phi) / nNext;
                 }
+                if (i == n - 1 && std::fabs(u) > 1e-9f)
+                {
+                    eflUnscaled = -1.0f / u;
+                    if (m_rows[n - 1].thicknessMm < 1e-3f) bflUnscaled = -h / u;
+                }
                 h += u * row.thicknessMm;
                 nPrev = nNext;
             }
-            m_eflMm = (std::fabs(u) > 1e-9f) ? (-1.0f / u) * s : 50.0f * s;
         }
+
+        // Axial vertex positions in the tracing frame: sensor plane at z=0,
+        // +z toward the scene. Row i's thickness is the gap on its image
+        // side, so the rear vertex sits at the last row's thickness (plus
+        // focus shift); everything scales uniformly (the paper: "all values
+        // are scaled with the same factor" to change the focal length).
+        float s = settings.scale;
+        std::vector<float> zVertex(n);
+        float z = bflUnscaled * s + settings.focusShiftMm;
+        for (size_t i = n; i-- > 0;)
+        {
+            zVertex[i] = z;
+            if (i > 0) z += m_rows[i - 1].thicknessMm * s;
+        }
+        m_frontVertexZMm = zVertex[0];
+        m_rearVertexZMm = zVertex[n - 1];
+        m_rearSemiDiameterMm = m_rows[n - 1].semiDiameterMm * s;
+        m_frontSemiDiameterMm = m_rows[0].semiDiameterMm * s;
+        m_eflMm = eflUnscaled * s;
 
         // f-number: the prescription's stop radius corresponds to its design
         // f-number; entrance pupil diameter scales linearly with the stop

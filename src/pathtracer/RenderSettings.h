@@ -34,6 +34,17 @@ namespace RoyalGL
         // only reachable efficiently here (t=1 light tracing).
         bool enableBidir = true;
 
+        // ReSTIR BDPT (docs/RESTIR_BDPT_PLAN.md): per-frame spatiotemporal
+        // reservoir reuse over bidirectional path candidates. Forces the
+        // bidirectional pipeline and full-frame (non-tiled) dispatch.
+        // Pinhole cameras only - lens mode falls back to plain BDPT (the
+        // stochastic pupil makes the primary hit a random variable, which
+        // is Area-ReSTIR territory).
+        bool enableRestir = false;
+        // 0=off, then G-buffer normals / depth / motion vectors, reservoir
+        // W / confidence / technique index (see shaders/restir_debug.comp).
+        int restirDebugView = 0;
+
         // Physical lens camera (Steinert et al. 2011). Lens mode renders
         // through the unidirectional pipeline regardless of enableBidir -
         // exact BDPT MIS through a lens is future work.
@@ -49,6 +60,8 @@ namespace RoyalGL
                    maxSamples == other.maxSamples &&
                    enableNEE == other.enableNEE &&
                    enableBidir == other.enableBidir &&
+                   enableRestir == other.enableRestir &&
+                   restirDebugView == other.restirDebugView &&
                    cameraMode == other.cameraMode &&
                    lens == other.lens;
         }

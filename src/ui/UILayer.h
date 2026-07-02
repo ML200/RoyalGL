@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 #include <cstdint>
 #include "pathtracer/RenderSettings.h"
 #include "scene/Scene.h"
@@ -35,7 +36,7 @@ namespace RoyalGL
         void EndFrame() const;
 
         UIFrameResult Draw(RenderSettings& settings, Scene& scene, uint32_t sampleCount, float frameTimeMs,
-                            bool oidnAvailable);
+                            bool oidnAvailable, const std::vector<std::string>& lensPresetNames);
 
     private:
         GLFWwindow* m_window = nullptr;

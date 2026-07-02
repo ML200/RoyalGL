@@ -25,6 +25,11 @@ namespace RoyalGL
         // statistically fresh subpath (re-drawn by hash every frame), small
         // enough that the vertex buffer stays ~130 MB at worst.
         constexpr uint32_t kMaxLightPaths = 262144;
+
+        // sizeof(PixelReservoirs) / sizeof(GBufferPixel) in
+        // shaders/restir_common.glsl.
+        constexpr size_t kPixelReservoirsBytes = 272;
+        constexpr size_t kGBufferPixelBytes = 32;
     }
 
     PathTracer::PathTracer()
@@ -33,7 +38,9 @@ namespace RoyalGL
           m_bdptLightShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "bdpt_light.comp")),
           m_bdptEyeShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "bdpt_eye.comp")),
           m_bdptResolveShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "bdpt_resolve.comp")),
-          m_lensPupilShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "lens_pupil.comp"))
+          m_lensPupilShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "lens_pupil.comp")),
+          m_restirGbufferShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_gbuffer.comp")),
+          m_restirDebugShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_debug.comp"))
     {
         m_timersEnabled = (std::getenv("ROYALGL_STATS") != nullptr);
         if (m_timersEnabled)
@@ -80,6 +87,23 @@ namespace RoyalGL
             GL_CALL(glClearNamedBufferData(m_splatBuffer.Id(), GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr));
     }
 
+    void PathTracer::EnsureRestirBuffers()
+    {
+        if (m_restirWidth == m_width && m_restirHeight == m_height) return;
+        m_restirWidth = m_width;
+        m_restirHeight = m_height;
+
+        // Both ping-pong halves live in one buffer (see restir_common.glsl).
+        size_t pixelCount = size_t(m_width) * size_t(m_height);
+        m_reservoirBuffer.Upload(nullptr, 2 * pixelCount * kPixelReservoirsBytes, GL_DYNAMIC_COPY);
+        m_gbufferBuffer.Upload(nullptr, 2 * pixelCount * kGBufferPixelBytes, GL_DYNAMIC_COPY);
+        // Zero-filled: a zeroed reservoir is a valid empty reservoir
+        // (W=0, confidence=0).
+        GL_CALL(glClearNamedBufferData(m_reservoirBuffer.Id(), GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr));
+        GL_CALL(glClearNamedBufferData(m_gbufferBuffer.Id(), GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr));
+        m_prevCamValid = false; // stale prev G-buffer after a resize
+    }
+
     void PathTracer::Render(const Camera& camera, const BVHBuilder& bvh, const LightTree& lightTree,
                              const LensSystem& lensSystem, const RenderSettings& settings)
     {
@@ -87,7 +111,16 @@ namespace RoyalGL
         if (settings.maxSamples > 0 && m_sampleCount >= static_cast<uint32_t>(settings.maxSamples)) return;
 
         bool lensMode = settings.cameraMode == CameraMode::Lens;
-        bool bidir = settings.enableBidir;
+        // ReSTIR needs a deterministic pinhole primary hit; lens mode falls
+        // back to plain progressive BDPT. ReSTIR always uses the
+        // bidirectional pipeline and full-frame dispatch.
+        bool restirActive = settings.enableRestir && !lensMode;
+        bool bidir = settings.enableBidir || restirActive;
+        if (restirActive)
+        {
+            EnsureRestirBuffers(); // may invalidate m_prevCamValid on resize
+            m_fullFrameNext = true;
+        }
 
         GPUFrameUBO frame{};
         frame.camPos = glm::vec4(camera.position, 0.0f);
@@ -101,7 +134,8 @@ namespace RoyalGL
         frame.background = glm::vec4(settings.backgroundColor, settings.backgroundIntensity);
         frame.frameInfo = glm::uvec4(static_cast<uint32_t>(m_width), static_cast<uint32_t>(m_height),
                                       m_sampleCount, static_cast<uint32_t>(settings.maxBounces));
-        frame.renderParams = glm::vec4(settings.exposure, lightTree.TotalPower(), 0.0f, 0.0f);
+        frame.renderParams = glm::vec4(settings.exposure, lightTree.TotalPower(), 0.0f,
+                                        settings.lens.flareIntensity);
         frame.lightInfo = glm::uvec4(lightTree.LightCount(), settings.enableNEE ? 1u : 0u, m_numLightPaths,
                                      static_cast<uint32_t>(std::max(settings.lens.flareSamples, 1)));
 
@@ -111,6 +145,19 @@ namespace RoyalGL
                                      lensSystem.FrontVertexZMm(), lensSystem.RearVertexZMm());
         frame.lensParams2 = glm::vec4(lensMode ? 1.0f : 0.0f, settings.lens.enableFlare ? 1.0f : 0.0f,
                                       lensSystem.RearSemiDiameterMm(), lensSystem.FrontSemiDiameterMm());
+        frame.lensParams3 = glm::vec4(settings.lens.enableDiffraction ? 1.0f : 0.0f,
+                                      settings.lens.diffractionIntensity,
+                                      settings.lens.diffractionEdgeWidthMm, 0.0f);
+
+        // Previous frame's camera for ReSTIR reprojection; identical to the
+        // current camera until a ReSTIR frame has completed.
+        frame.prevCamPos = m_prevCamValid ? m_prevCamPos : frame.camPos;
+        frame.prevCamForward = m_prevCamValid ? m_prevCamForward : frame.camForward;
+        frame.prevCamRight = m_prevCamValid ? m_prevCamRight : frame.camRight;
+        frame.prevCamUp = m_prevCamValid ? m_prevCamUp : frame.camUp;
+        frame.prevCameraParams = m_prevCamValid ? m_prevCameraParams : frame.cameraParams;
+        frame.restirParams = glm::uvec4(static_cast<uint32_t>(settings.restirDebugView),
+                                        restirActive ? 1u : 0u, m_frameCounter, m_restirParity);
 
         m_frameUBO.Upload(&frame, sizeof(GPUFrameUBO), GL_DYNAMIC_DRAW);
         m_frameUBO.BindBase();
@@ -137,6 +184,19 @@ namespace RoyalGL
             m_lensPupilShader.Dispatch(groupsX, groupsY, 1u);
             GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));
             m_pupilsDirty = false;
+        }
+
+        if (restirActive)
+        {
+            // Current/previous halves are selected by restirParams.w inside
+            // the shaders - see restir_common.glsl.
+            m_reservoirBuffer.BindBase();
+            m_gbufferBuffer.BindBase();
+
+            // Deterministic V-buffer for this frame's camera.
+            m_restirGbufferShader.Use();
+            m_restirGbufferShader.Dispatch(groupsX, groupsY, 1u);
+            GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));
         }
 
         // ---------------------------------------------- tiled dispatch ----
@@ -246,6 +306,28 @@ namespace RoyalGL
         }
         } while (m_fullFrameNext && m_sampleCount == sampleAtEntry);
         m_fullFrameNext = false;
+
+        if (restirActive)
+        {
+            if (settings.restirDebugView != 0)
+            {
+                // Overwrite the accumulator with the selected visualization
+                // (write-after-write on the image, hence the barrier).
+                GL_CALL(glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT));
+                m_restirDebugShader.Use();
+                m_restirDebugShader.Dispatch(groupsX, groupsY, 1u);
+            }
+
+            m_prevCamPos = frame.camPos;
+            m_prevCamForward = frame.camForward;
+            m_prevCamRight = frame.camRight;
+            m_prevCamUp = frame.camUp;
+            m_prevCameraParams = frame.cameraParams;
+            m_prevCamValid = true;
+            m_restirParity = 1u - m_restirParity;
+        }
+        m_frameCounter++;
+
         GL_CALL(glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT));
 
         if (m_timersEnabled)

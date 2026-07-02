@@ -39,13 +39,30 @@ namespace RoyalGL
         // only in the reflect/refract branches and the wavelength).
         bool enableFlare = false;
         int flareSamples = 8;
+        // Artist multiplier on flared splats only - uncoated 2-bounce
+        // ghosts carry ~0.2% of the source flux, which can need a boost to
+        // read against a bright image.
+        float flareIntensity = 1.0f;
+        // Aperture diffraction glare streaks (paper sec. 4.4), a stochastic
+        // branch near blade edges inside the flare walks. The coefficient's
+        // absolute scale is not independently verified (the paper's own
+        // caveat), hence the artist intensity multiplier.
+        bool enableDiffraction = true;
+        float diffractionIntensity = 1.0f;
+        float diffractionEdgeWidthMm = 0.05f;
+        // Index into Application's scan of assets/lenses/*.lens.
+        int presetIndex = 0;
 
         bool operator==(const LensSettings& o) const
         {
             return fNumber == o.fNumber && focusShiftMm == o.focusShiftMm && scale == o.scale &&
                    apertureBlades == o.apertureBlades && bladeRotationDeg == o.bladeRotationDeg &&
                    sensorHeightMm == o.sensorHeightMm && enableFlare == o.enableFlare &&
-                   flareSamples == o.flareSamples;
+                   flareSamples == o.flareSamples && flareIntensity == o.flareIntensity &&
+                   enableDiffraction == o.enableDiffraction &&
+                   diffractionIntensity == o.diffractionIntensity &&
+                   diffractionEdgeWidthMm == o.diffractionEdgeWidthMm &&
+                   presetIndex == o.presetIndex;
         }
         bool operator!=(const LensSettings& o) const { return !(*this == o); }
     };

@@ -1,7 +1,9 @@
 #pragma once
 
+#include <filesystem>
 #include <memory>
 #include <string>
+#include <vector>
 #include "core/Window.h"
 #include "scene/Scene.h"
 #include "bvh/BVHBuilder.h"
@@ -59,6 +61,11 @@ namespace RoyalGL
         // members, but for scene.materials specifically since Scene itself
         // isn't otherwise snapshotted/compared.
         std::vector<Material> m_lastMaterials;
+
+        // assets/lenses/*.lens, scanned once at startup; parallel arrays of
+        // file paths and display names for the UI preset dropdown.
+        std::vector<std::filesystem::path> m_lensPresetPaths;
+        std::vector<std::string> m_lensPresetNames;
         bool m_dirty = true; // forces an accumulation reset next frame
 
         // ROYALGL_STATS=1: periodically log luminance tail statistics of the

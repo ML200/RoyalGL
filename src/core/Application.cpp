@@ -51,8 +51,25 @@ namespace RoyalGL
         m_lightTree = std::make_unique<LightTree>();
         m_lightTree->Build(*m_scene);
 
+        // Scan the lens preset directory; default to the Tessar when found.
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator(
+                 std::filesystem::path(ROYALGL_ASSET_DIR) / "lenses", ec))
+        {
+            if (entry.path().extension() == ".lens")
+                m_lensPresetPaths.push_back(entry.path());
+        }
+        std::sort(m_lensPresetPaths.begin(), m_lensPresetPaths.end());
         m_lensSystem = std::make_unique<LensSystem>();
-        if (!m_lensSystem->LoadLensFile(std::filesystem::path(ROYALGL_ASSET_DIR) / "lenses/tessar.lens"))
+        for (size_t i = 0; i < m_lensPresetPaths.size(); ++i)
+        {
+            LensSystem probe;
+            m_lensPresetNames.push_back(probe.LoadLensFile(m_lensPresetPaths[i]) ? probe.Name()
+                                                                                  : m_lensPresetPaths[i].stem().string());
+            if (m_lensPresetPaths[i].stem() == "tessar") m_settings.lens.presetIndex = static_cast<int>(i);
+        }
+        if (m_lensPresetPaths.empty() ||
+            !m_lensSystem->LoadLensFile(m_lensPresetPaths[m_settings.lens.presetIndex]))
             m_lensSystem->LoadBuiltinTessar();
         m_lensSystem->Derive(m_settings.lens);
 
@@ -68,6 +85,8 @@ namespace RoyalGL
         // ROYALGL_BIDIR=0/1, ROYALGL_NEE=0/1, ROYALGL_STATS=1.
         if (const char* v = std::getenv("ROYALGL_BIDIR")) m_settings.enableBidir = (v[0] != '0');
         if (const char* v = std::getenv("ROYALGL_NEE")) m_settings.enableNEE = (v[0] != '0');
+        if (const char* v = std::getenv("ROYALGL_RESTIR")) m_settings.enableRestir = (v[0] != '0');
+        if (const char* v = std::getenv("ROYALGL_RESTIR_DEBUG")) m_settings.restirDebugView = std::atoi(v);
         if (const char* v = std::getenv("ROYALGL_LENS")) m_settings.cameraMode = (v[0] != '0') ? CameraMode::Lens : CameraMode::Pinhole;
         m_statsEnabled = (std::getenv("ROYALGL_STATS") != nullptr);
 
@@ -285,6 +304,12 @@ namespace RoyalGL
                 }
                 if (m_settings.lens != m_lastSettings.lens || m_settings.cameraMode != m_lastSettings.cameraMode)
                 {
+                    if (m_settings.lens.presetIndex != m_lastSettings.lens.presetIndex &&
+                        m_settings.lens.presetIndex >= 0 &&
+                        m_settings.lens.presetIndex < static_cast<int>(m_lensPresetPaths.size()))
+                    {
+                        m_lensSystem->LoadLensFile(m_lensPresetPaths[m_settings.lens.presetIndex]);
+                    }
                     m_lensSystem->Derive(m_settings.lens);
                     m_pathTracer->MarkPupilsDirty();
                 }
@@ -316,7 +341,7 @@ namespace RoyalGL
 
             m_ui->BeginFrame();
             UIFrameResult result = m_ui->Draw(m_settings, *m_scene, m_pathTracer->SampleCount(),
-                                               dt * 1000.0f, Denoiser::IsAvailable());
+                                               dt * 1000.0f, Denoiser::IsAvailable(), m_lensPresetNames);
             if (result.denoiseRequested) RunDenoiser();
             if (result.exportRequested) ExportPNG(result.exportPath);
             m_ui->EndFrame();

@@ -48,7 +48,7 @@ namespace RoyalGL
     }
 
     UIFrameResult UILayer::Draw(RenderSettings& settings, Scene& scene, uint32_t sampleCount, float frameTimeMs,
-                                 bool oidnAvailable)
+                                 bool oidnAvailable, const std::vector<std::string>& lensPresetNames)
     {
         UIFrameResult result;
 
@@ -84,6 +84,21 @@ namespace RoyalGL
             settings.cameraMode = static_cast<CameraMode>(camIdx);
         if (settings.cameraMode == CameraMode::Lens)
         {
+            if (!lensPresetNames.empty())
+            {
+                int idx = settings.lens.presetIndex;
+                const char* current = (idx >= 0 && idx < static_cast<int>(lensPresetNames.size()))
+                    ? lensPresetNames[idx].c_str() : "?";
+                if (ImGui::BeginCombo("Prescription", current))
+                {
+                    for (int i = 0; i < static_cast<int>(lensPresetNames.size()); ++i)
+                    {
+                        if (ImGui::Selectable(lensPresetNames[i].c_str(), i == idx))
+                            settings.lens.presetIndex = i;
+                    }
+                    ImGui::EndCombo();
+                }
+            }
             ImGui::SliderFloat("F-number", &settings.lens.fNumber, 1.0f, 22.0f, "f/%.1f",
                                 ImGuiSliderFlags_Logarithmic);
             ImGui::SliderFloat("Focus shift (mm)", &settings.lens.focusShiftMm, -5.0f, 20.0f);
@@ -95,6 +110,16 @@ namespace RoyalGL
             if (settings.lens.enableFlare)
             {
                 ImGui::SliderInt("Flare samples", &settings.lens.flareSamples, 1, 64);
+                ImGui::SliderFloat("Flare intensity", &settings.lens.flareIntensity, 0.1f, 100.0f, "%.1f",
+                                    ImGuiSliderFlags_Logarithmic);
+                ImGui::Checkbox("Aperture diffraction streaks", &settings.lens.enableDiffraction);
+                if (settings.lens.enableDiffraction)
+                {
+                    ImGui::SliderFloat("Diffraction intensity", &settings.lens.diffractionIntensity,
+                                        0.1f, 100.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
+                    ImGui::SliderFloat("Diffraction edge width (mm)", &settings.lens.diffractionEdgeWidthMm,
+                                        0.005f, 0.5f, "%.3f", ImGuiSliderFlags_Logarithmic);
+                }
                 if (!settings.enableBidir)
                     ImGui::TextDisabled("Flares need the bidirectional pipeline.");
             }
@@ -107,6 +132,16 @@ namespace RoyalGL
         ImGui::EndDisabled();
         if (settings.enableBidir && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("Unidirectional-only: BDPT has its own light sampling strategy.");
+
+        ImGui::Checkbox("ReSTIR BDPT (WIP)", &settings.enableRestir);
+        if (settings.enableRestir)
+        {
+            if (settings.cameraMode == CameraMode::Lens)
+                ImGui::TextDisabled("Pinhole only - lens mode falls back to plain BDPT.");
+            const char* dbgNames[] = {"Off", "G-buffer normals", "G-buffer depth", "Motion vectors",
+                                      "Reservoir W", "Confidence", "Technique (s,t)"};
+            ImGui::Combo("ReSTIR debug view", &settings.restirDebugView, dbgNames, 7);
+        }
 
         result.settingsChanged = (settings != before);
 

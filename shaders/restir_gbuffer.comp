@@ -1,0 +1,34 @@
+#version 460 core
+#include "common.glsl"
+#include "restir_common.glsl"
+
+// ReSTIR pass: deterministic per-pixel V-buffer. One primary ray through
+// each pixel center; position/depth/normal/material go to the current
+// G-buffer SSBO. Runs full-frame once per frame before the candidate pass;
+// consumers are temporal reprojection (motion vectors), the t<=1 rejection
+// heuristic, and the debug views.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = ivec2(uFrame.frameInfo.xy);
+    if (pixel.x >= size.x || pixel.y >= size.y) return;
+
+    Ray ray = RestirPrimaryRay(pixel);
+
+    GBufferPixel g;
+    Hit hit;
+    if (IntersectScene(ray, hit))
+    {
+        g.posDepth = vec4(ray.origin + ray.dir * hit.t, hit.t);
+        g.normalMat = vec4(hit.normal, uintBitsToFloat(hit.materialIndex));
+    }
+    else
+    {
+        g.posDepth = vec4(0.0, 0.0, 0.0, -1.0);
+        g.normalMat = vec4(0.0, 0.0, 0.0, uintBitsToFloat(NO_MATERIAL));
+    }
+    gbuf[RestirCurOffset() + RestirPixelIndex(pixel)] = g;
+}
