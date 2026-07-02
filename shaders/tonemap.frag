@@ -25,7 +25,10 @@ void main()
     ivec2 texel = ivec2(int(gl_FragCoord.x), size.y - 1 - int(gl_FragCoord.y));
     vec4 accum = texelFetch(uAccum, texel, 0);
 
-    vec3 color = accum.rgb / max(uSampleCount, 1.0);
+    // Per-pixel sample count from the accumulator's alpha channel (the
+    // kernels add 1 per eye sample): with tiled dispatch, rows finish at
+    // different times within a sample, so a global count would flicker.
+    vec3 color = accum.rgb / max(accum.a, 1.0);
     color *= uExposure;
     color = ACESFilm(color);
     color = pow(color, vec3(1.0 / 2.2));

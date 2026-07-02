@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 
@@ -45,6 +46,7 @@ namespace RoyalGL
         m_width = width;
         m_height = height;
         m_accum.Resize(width, height);
+        m_accum.Clear(); // fresh allocation: alpha (per-pixel counts) must start at 0
 
         uint32_t pixelCount = static_cast<uint32_t>(width) * static_cast<uint32_t>(height);
         m_numLightPaths = std::min(pixelCount, kMaxLightPaths);
@@ -64,8 +66,18 @@ namespace RoyalGL
 
     void PathTracer::Reset()
     {
-        m_accum.Clear();
+        // No accumulation clear: sample 0 overwrites per pixel (the kernels
+        // write prev=0 at sampleIndex 0), so during continuous camera moves
+        // the not-yet-retraced rows keep showing the previous image instead
+        // of black while tiles progress top to bottom.
         m_sampleCount = 0;
+        m_phase = 0;
+        m_cursor = 0;
+        m_fullFrameNext = true;
+        // Drop splats of an abandoned in-flight sample - the next resolve
+        // would otherwise add them into the fresh image.
+        if (m_splatBuffer.IsValid())
+            GL_CALL(glClearNamedBufferData(m_splatBuffer.Id(), GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr));
     }
 
     void PathTracer::Render(const Camera& camera, const BVHBuilder& bvh, const LightTree& lightTree,
@@ -90,7 +102,8 @@ namespace RoyalGL
         frame.frameInfo = glm::uvec4(static_cast<uint32_t>(m_width), static_cast<uint32_t>(m_height),
                                       m_sampleCount, static_cast<uint32_t>(settings.maxBounces));
         frame.renderParams = glm::vec4(settings.exposure, lightTree.TotalPower(), 0.0f, 0.0f);
-        frame.lightInfo = glm::uvec4(lightTree.LightCount(), settings.enableNEE ? 1u : 0u, m_numLightPaths, 0u);
+        frame.lightInfo = glm::uvec4(lightTree.LightCount(), settings.enableNEE ? 1u : 0u, m_numLightPaths,
+                                     static_cast<uint32_t>(std::max(settings.lens.flareSamples, 1)));
 
         float aspectRatio = static_cast<float>(m_width) / static_cast<float>(m_height);
         float sensorHalfH = settings.lens.sensorHeightMm * 0.5f;
@@ -112,8 +125,9 @@ namespace RoyalGL
         GLuint groupsY = (static_cast<GLuint>(m_height) + 7u) / 8u;
 
         int q = m_timerFrame & 1;
-        auto beginTimer = [&](int slot) { if (m_timersEnabled) glBeginQuery(GL_TIME_ELAPSED, m_timerQueries[q][slot]); };
-        auto endTimer = [&]() { if (m_timersEnabled) glEndQuery(GL_TIME_ELAPSED); };
+        bool allowTimer = m_timersEnabled && !m_fullFrameNext; // one query per frame max
+        auto beginTimer = [&](int slot) { if (allowTimer) glBeginQuery(GL_TIME_ELAPSED, m_timerQueries[q][slot]); };
+        auto endTimer = [&]() { if (allowTimer) glEndQuery(GL_TIME_ELAPSED); };
 
         if (lensMode && m_pupilsDirty)
         {
@@ -125,12 +139,49 @@ namespace RoyalGL
             m_pupilsDirty = false;
         }
 
+        // ---------------------------------------------- tiled dispatch ----
+        // One slice of the current sample per UI frame, sized so the frame
+        // stays near kTargetFrameMs - the swap no longer waits on a full
+        // sample and ImGui stays responsive at any render cost. Slice sizes
+        // adapt to the measured frame time.
+        constexpr double kTargetFrameMs = 30.0;
+        double nowMs = static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch()).count()) * 1e-3;
+        if (m_lastRenderTime > 0.0)
+        {
+            double frameMs = nowMs - m_lastRenderTime;
+            double f = std::clamp(kTargetFrameMs / std::max(frameMs, 1.0), 0.6, 1.4);
+            m_rowsPerTile = std::clamp(static_cast<uint32_t>(m_rowsPerTile * f + 0.5), 16u,
+                                        static_cast<uint32_t>(m_height));
+            m_pathsPerChunk = std::clamp(static_cast<uint32_t>(m_pathsPerChunk * f + 0.5), 4096u, m_numLightPaths);
+        }
+        m_lastRenderTime = nowMs;
+
+        auto uploadFrame = [&](uint32_t offset, uint32_t end)
+        {
+            frame.cameraParams.w = static_cast<float>(offset);
+            frame.renderParams.z = static_cast<float>(end);
+            m_frameUBO.Upload(&frame, sizeof(GPUFrameUBO), GL_DYNAMIC_DRAW);
+            m_frameUBO.BindBase();
+        };
+
+        uint32_t sampleAtEntry = m_sampleCount;
+        do
+        {
         if (!bidir)
         {
+            uint32_t rows = std::min(m_rowsPerTile, static_cast<uint32_t>(m_height) - m_cursor);
+            uploadFrame(m_cursor, m_cursor + rows);
             beginTimer(0);
             m_computeShader.Use();
-            m_computeShader.Dispatch(groupsX, groupsY, 1u);
+            m_computeShader.Dispatch(groupsX, (rows + 7u) / 8u, 1u);
             endTimer();
+            m_cursor += rows;
+            if (m_cursor >= static_cast<uint32_t>(m_height))
+            {
+                m_cursor = 0;
+                m_sampleCount++;
+            }
         }
         else
         {
@@ -145,39 +196,56 @@ namespace RoyalGL
             }
             m_lightSelPdfBuffer.BindBase();
 
-            // Pass 0: cache the camera-anchored per-light selection pdf
-            // (pixel-independent, so once per frame).
-            if (lightTree.LightCount() > 0)
+            if (m_phase == 0)
             {
-                m_bdptLightSelShader.Use();
-                m_bdptLightSelShader.Dispatch((lightTree.LightCount() + 63u) / 64u, 1u, 1u);
+                // Sample start: refresh the camera-anchored selection pdf
+                // cache, then trace a chunk of light subpaths.
+                if (m_cursor == 0 && lightTree.LightCount() > 0)
+                {
+                    uploadFrame(0, 0);
+                    m_bdptLightSelShader.Use();
+                    m_bdptLightSelShader.Dispatch((lightTree.LightCount() + 63u) / 64u, 1u, 1u);
+                    GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));
+                }
+
+                uint32_t chunk = std::min(m_pathsPerChunk, m_numLightPaths - m_cursor);
+                uploadFrame(m_cursor, m_cursor + chunk);
+                beginTimer(0);
+                m_bdptLightShader.Use();
+                m_bdptLightShader.Dispatch((chunk + 63u) / 64u, 1u, 1u);
+                endTimer();
                 GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));
+                m_cursor += chunk;
+                if (m_cursor >= m_numLightPaths)
+                {
+                    m_phase = 1;
+                    m_cursor = 0;
+                }
             }
-
-            // Pass 1: light subpaths (vertex storage + t=1 splats).
-            beginTimer(0);
-            m_bdptLightShader.Use();
-            m_bdptLightShader.Dispatch((m_numLightPaths + 63u) / 64u, 1u, 1u);
-            endTimer();
-            // Light vertices/counts written above are SSBO-read by the eye
-            // pass; splats only matter after the eye pass, same barrier.
-            GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));
-
-            // Pass 2: eye subpaths, connections, image accumulation.
-            beginTimer(1);
-            m_bdptEyeShader.Use();
-            m_bdptEyeShader.Dispatch(groupsX, groupsY, 1u);
-            endTimer();
-            // Resolve reads the splat SSBO and read-modify-writes the same
-            // accumulation image the eye pass just image-stored.
-            GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT));
-
-            // Pass 3: drain splats into the accumulation image.
-            beginTimer(2);
-            m_bdptResolveShader.Use();
-            m_bdptResolveShader.Dispatch(groupsX, groupsY, 1u);
-            endTimer();
+            else
+            {
+                uint32_t rows = std::min(m_rowsPerTile, static_cast<uint32_t>(m_height) - m_cursor);
+                uploadFrame(m_cursor, m_cursor + rows);
+                beginTimer(0);
+                m_bdptEyeShader.Use();
+                m_bdptEyeShader.Dispatch(groupsX, (rows + 7u) / 8u, 1u);
+                endTimer();
+                m_cursor += rows;
+                if (m_cursor >= static_cast<uint32_t>(m_height))
+                {
+                    // Sample complete: drain the splat buffer into the image.
+                    GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT));
+                    uploadFrame(0, static_cast<uint32_t>(m_height));
+                    m_bdptResolveShader.Use();
+                    m_bdptResolveShader.Dispatch(groupsX, groupsY, 1u);
+                    m_phase = 0;
+                    m_cursor = 0;
+                    m_sampleCount++;
+                }
+            }
         }
+        } while (m_fullFrameNext && m_sampleCount == sampleAtEntry);
+        m_fullFrameNext = false;
         GL_CALL(glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT));
 
         if (m_timersEnabled)
@@ -186,28 +254,18 @@ namespace RoyalGL
             if (m_timerFrame > 0)
             {
                 int prev = 1 - q;
-                int slots = bidir ? 3 : 1;
-                for (int s = 0; s < slots; ++s)
-                {
-                    GLuint64 ns = 0;
-                    glGetQueryObjectui64v(m_timerQueries[prev][s], GL_QUERY_RESULT, &ns);
-                    m_passMsSum[s] += static_cast<double>(ns) * 1e-6;
-                }
+                GLuint64 ns = 0;
+                glGetQueryObjectui64v(m_timerQueries[prev][0], GL_QUERY_RESULT, &ns);
+                m_passMsSum[0] += static_cast<double>(ns) * 1e-6;
                 m_passMsCount++;
                 if (m_passMsCount == 128)
                 {
-                    if (bidir)
-                        ROYALGL_LOG_INFO("GPU pass times (avg over 128): light=", m_passMsSum[0] / 128.0,
-                                         "ms eye=", m_passMsSum[1] / 128.0, "ms resolve=", m_passMsSum[2] / 128.0, "ms");
-                    else
-                        ROYALGL_LOG_INFO("GPU pass times (avg over 128): unidir=", m_passMsSum[0] / 128.0, "ms");
+                    ROYALGL_LOG_INFO("GPU tile time (avg over 128 frames): ", m_passMsSum[0] / 128.0, "ms");
                     m_passMsSum[0] = m_passMsSum[1] = m_passMsSum[2] = 0.0;
                     m_passMsCount = 0;
                 }
             }
             m_timerFrame++;
         }
-
-        m_sampleCount++;
     }
 }

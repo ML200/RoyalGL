@@ -22,8 +22,9 @@ layout(rgba32f, binding = 0) uniform image2D uAccum;
 void main()
 {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    pixel.y += int(uFrame.cameraParams.w); // tile row offset
     ivec2 size = ivec2(uFrame.frameInfo.xy);
-    if (pixel.x >= size.x || pixel.y >= size.y) return;
+    if (pixel.x >= size.x || pixel.y >= size.y || pixel.y >= int(uFrame.renderParams.z)) return;
 
     uint sampleIndex = uFrame.frameInfo.z;
     g_rngState = WangHash(uint(pixel.x) * 1973u + uint(pixel.y) * 9277u + sampleIndex * 26699u + 1u);

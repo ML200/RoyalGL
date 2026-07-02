@@ -228,11 +228,12 @@ LensTraceResult TraceLensFromSensor(vec3 O, vec3 D, float lambdaNm, bool flareOn
 // front element, D pointing rearward. On success returns the ray past the
 // rear element; `sensorPosMm` is its z=0 plane crossing.
 bool TraceLensToSensor(vec3 O, vec3 D, float lambdaNm, bool flareOn,
-                       out vec2 sensorPosMm, out float transmission)
+                       out vec2 sensorPosMm, out float transmission, out bool flared)
 {
     int n = int(lensSurfaces.length());
     LensTraceResult res = WalkLens(O, D, lambdaNm, flareOn, n - 1, -1, true, transmission);
     sensorPosMm = vec2(0.0);
+    flared = res.flared;
     if (!res.valid || res.dir.z >= -1e-6) return false;
     float t = -res.origin.z / res.dir.z;
     sensorPosMm = res.origin.xy + res.dir.xy * t;
@@ -371,9 +372,12 @@ bool LensGenerateEyeRay(ivec2 pixel, vec2 ndc, out Ray rayWorld, out vec3 sensor
     float lambdaPdf;
     float lambda = SampleLambda(lambdaPdf);
 
+    // Eye-side walks are always transmission-only: ghost paths belong
+    // exclusively to the t=1 light-tracing strategy (paper sec. 4.3),
+    // which samples them with a dedicated per-connection sample count and
+    // MIS weight 1 - eye-side stochastic branches were pure fireflies.
     float transmission;
-    LensTraceResult lt = TraceLensFromSensor(sensorPos, dir, lambda,
-                                             uFrame.lensParams2.y > 0.5, transmission);
+    LensTraceResult lt = TraceLensFromSensor(sensorPos, dir, lambda, false, transmission);
     if (!lt.valid) return false;
 
     rayWorld = MakeRay(LensToWorld(lt.origin), LensDirToWorld(lt.dir));

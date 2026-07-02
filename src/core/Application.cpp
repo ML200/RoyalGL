@@ -20,16 +20,14 @@ namespace RoyalGL
 {
     namespace
     {
-        // The accumulation image stores a running sum, not an average (see
-        // PathTracer::Render / shaders/pathtrace.comp) - anything that reads
-        // it back for denoising or export needs to divide by the sample
-        // count first to get linear HDR color.
-        void AverageInPlace(std::vector<float>& rgba, uint32_t sampleCount)
+        // The accumulation image stores a running sum, not an average; the
+        // per-pixel sample count lives in alpha (rows finish at different
+        // times under tiled dispatch, so a global count would be wrong).
+        void AverageInPlace(std::vector<float>& rgba)
         {
-            if (sampleCount == 0) return;
-            float inv = 1.0f / static_cast<float>(sampleCount);
             for (size_t i = 0; i + 3 < rgba.size(); i += 4)
             {
+                float inv = 1.0f / std::max(rgba[i + 3], 1.0f);
                 rgba[i + 0] *= inv;
                 rgba[i + 1] *= inv;
                 rgba[i + 2] *= inv;
@@ -189,9 +187,8 @@ namespace RoyalGL
         std::vector<float> raw = m_pathTracer->AccumulationImage().ReadPixelsFloat();
         std::vector<float> lum;
         lum.reserve(raw.size() / 4);
-        float inv = 1.0f / static_cast<float>(n);
         for (size_t i = 0; i + 3 < raw.size(); i += 4)
-            lum.push_back((raw[i] + raw[i + 1] + raw[i + 2]) * (inv / 3.0f));
+            lum.push_back((raw[i] + raw[i + 1] + raw[i + 2]) / (3.0f * std::max(raw[i + 3], 1.0f)));
 
         // High-frequency noise: mean |pixel - 4-neighbor average| over
         // non-emitter pixels, relative to the image mean. Pure variance
@@ -235,7 +232,7 @@ namespace RoyalGL
         }
 
         std::vector<float> raw = m_pathTracer->AccumulationImage().ReadPixelsFloat();
-        AverageInPlace(raw, sampleCount);
+        AverageInPlace(raw);
 
         std::vector<float> denoised = m_denoiser->Denoise(raw, m_pathTracer->Width(), m_pathTracer->Height());
         if (ImageExport::SavePNG("denoised.png", denoised, m_pathTracer->Width(), m_pathTracer->Height(), m_settings.exposure))
@@ -254,7 +251,7 @@ namespace RoyalGL
         }
 
         std::vector<float> raw = m_pathTracer->AccumulationImage().ReadPixelsFloat();
-        AverageInPlace(raw, sampleCount);
+        AverageInPlace(raw);
 
         if (ImageExport::SavePNG(path, raw, m_pathTracer->Width(), m_pathTracer->Height(), m_settings.exposure))
             ROYALGL_LOG_INFO("Application: exported ", path);

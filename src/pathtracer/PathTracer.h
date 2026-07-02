@@ -74,6 +74,21 @@ namespace RoyalGL
         double m_passMsSum[3] = {};
         int m_passMsCount = 0;
 
+        // Tiled dispatch: each Render() call submits only a slice of the
+        // current sample (a light-path chunk or a run of eye rows), sized
+        // adaptively so the UI keeps its own framerate while a full sample
+        // spans several frames. Per-pixel sample counts live in the
+        // accumulator's alpha channel.
+        int m_phase = 0;        // 0 = light subpaths (bidir), 1 = eye rows
+        uint32_t m_cursor = 0;  // paths done (phase 0) / rows done (phase 1)
+        uint32_t m_rowsPerTile = 64;
+        uint32_t m_pathsPerChunk = 32768;
+        double m_lastRenderTime = 0.0;
+        // Set by Reset(): the next frame runs its whole sample in one go so
+        // the image updates every frame while the camera moves (a per-frame
+        // reset would otherwise only ever retrace the topmost tile).
+        bool m_fullFrameNext = true;
+
         int m_width = 0;
         int m_height = 0;
         uint32_t m_sampleCount = 0;

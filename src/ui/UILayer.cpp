@@ -91,7 +91,13 @@ namespace RoyalGL
             ImGui::SliderInt("Aperture blades", &settings.lens.apertureBlades, 0, 12);
             ImGui::SliderFloat("Blade rotation", &settings.lens.bladeRotationDeg, 0.0f, 60.0f, "%.1f deg");
             ImGui::SliderFloat("Sensor height (mm)", &settings.lens.sensorHeightMm, 8.0f, 60.0f);
-            ImGui::Checkbox("Eye-side Fresnel ghosts", &settings.lens.enableFlare);
+            ImGui::Checkbox("Lens flares (light-traced)", &settings.lens.enableFlare);
+            if (settings.lens.enableFlare)
+            {
+                ImGui::SliderInt("Flare samples", &settings.lens.flareSamples, 1, 64);
+                if (!settings.enableBidir)
+                    ImGui::TextDisabled("Flares need the bidirectional pipeline.");
+            }
         }
 
         ImGui::Separator();

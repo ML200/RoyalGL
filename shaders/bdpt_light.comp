@@ -101,16 +101,6 @@ void ConnectToCamera(vec3 pos, vec3 n, vec3 wi, Material mat, vec3 throughput,
     Ray shadowRay = MakeRay(pos + nf * 1e-4, dirToQ);
     if (IntersectSceneOccluded(shadowRay, dQ * 0.999)) return;
 
-    float lambdaPdf;
-    float lambda = SampleLambda(lambdaPdf);
-    float transmission;
-    vec2 sensorMm;
-    // Start the walk 2mm before the vertex plane so the front cap is ahead.
-    if (!TraceLensToSensor(qLocal - dLocal * 2.0, dLocal, lambda, false, sensorMm, transmission)) return;
-
-    ivec2 pixel;
-    if (!SensorPosToPixel(sensorMm, pixel)) return;
-
     // Flux through the sampled front-element area, normalized to the eye
     // estimator's per-pixel irradiance measurement: pixel = K * flux /
     // (A_pixel * numLightPaths) with K = zPupil^2 / A_rear (the constant
@@ -122,19 +112,44 @@ void ConnectToCamera(vec3 pos, vec3 n, vec3 wi, Material mat, vec3 throughput,
     float aPixel = pixH * pixH;
     float K = (zP * zP) / aRear;
 
-    vec3 contrib = misWeight * throughput * f * (cosToCam * cosQ / dQ2)
-                   * aFront * transmission * K / (aPixel * numLightPaths)
-                   * SpectralWeightRGB(lambda, lambdaPdf);
-    if (any(isnan(contrib)) || any(isinf(contrib))) return;
-    contrib = max(contrib, vec3(0.0)); // spectral RGB weights can dip negative
-    BdptSplat(pixel, contrib);
+    // With flares enabled, run several stochastic-Fresnel walks from the
+    // same (already shadow-tested) entry ray: the walks differ only in the
+    // reflect/refract branches and the wavelength, which is exactly the
+    // variance the ghost paths need extra samples for (the paper's flares
+    // are light-traced for the same reason). Ghost walks get MIS weight 1:
+    // the eye-side walk is transmission-only, so t=1 is their only sampler.
+    bool flareOn = uFrame.lensParams2.y > 0.5;
+    uint flareN = flareOn ? max(uFrame.lightInfo.w, 1u) : 1u;
+
+    vec3 base = throughput * f * (cosToCam * cosQ / dQ2)
+                * aFront * K / (aPixel * numLightPaths * float(flareN));
+    vec3 walkO = qLocal - dLocal * 2.0; // 2mm before the vertex plane: front cap ahead
+
+    for (uint i = 0u; i < flareN; ++i)
+    {
+        float lambdaPdf;
+        float lambda = SampleLambda(lambdaPdf);
+        float transmission;
+        vec2 sensorMm;
+        bool flared;
+        if (!TraceLensToSensor(walkO, dLocal, lambda, flareOn, sensorMm, transmission, flared)) continue;
+
+        ivec2 pixel;
+        if (!SensorPosToPixel(sensorMm, pixel)) continue;
+
+        vec3 contrib = base * transmission * SpectralWeightRGB(lambda, lambdaPdf)
+                       * (flared ? 1.0 : misWeight);
+        if (any(isnan(contrib)) || any(isinf(contrib))) continue;
+        contrib = max(contrib, vec3(0.0)); // spectral RGB weights can dip negative
+        BdptSplat(pixel, contrib);
+    }
 }
 
 void main()
 {
-    uint pathIdx = gl_GlobalInvocationID.x;
+    uint pathIdx = gl_GlobalInvocationID.x + uint(uFrame.cameraParams.w); // chunk offset
     uint numPaths = BdptNumLightPaths();
-    if (pathIdx >= numPaths) return;
+    if (pathIdx >= numPaths || pathIdx >= uint(uFrame.renderParams.z)) return;
 
     lightVertCount[pathIdx] = 0u;
     if (uFrame.lightInfo.x == 0u) return;

@@ -42,7 +42,8 @@ namespace RoyalGL
         glm::vec4 background;  // .rgb sky color, .a intensity multiplier
         glm::uvec4 frameInfo;  // x=width, y=height, z=sampleIndex, w=maxBounces
         glm::vec4 renderParams;// x=exposure, y=total light power, z/w reserved
-        glm::uvec4 lightInfo;  // x=light triangle count, y=NEE enabled (0/1), z=BDPT light path count, w unused
+        glm::uvec4 lightInfo;  // x=light triangle count, y=NEE enabled (0/1), z=BDPT light path count,
+                               // w=lens flare samples per t=1 connection
         glm::vec4 lensParams;  // x=sensor half width mm, y=sensor half height mm,
                                // z=front vertex z mm, w=pupil plane z mm (lens camera mode)
         glm::vec4 lensParams2; // x=camera mode (0=pinhole, 1=lens), y=flare enabled (0/1),

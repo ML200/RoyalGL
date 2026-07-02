@@ -32,17 +32,20 @@ namespace RoyalGL
         int apertureBlades = 6;      // 0 = circular
         float bladeRotationDeg = 0.0f;
         float sensorHeightMm = 24.0f;
-        // Stochastic Fresnel reflection ghosts in the eye-side lens walk.
-        // Off by default: eye-side ghost branches are rare high-variance
-        // events (fireflies); the BDPT t=1 lens connection samples flare
-        // paths far more effectively.
+        // Light-traced lens flares (Fresnel ghosts) in the BDPT t=1 lens
+        // connection - the paper's sec. 4.3 architecture. Ghost paths are
+        // rare stochastic branches, so each connection runs `flareSamples`
+        // extra walks (sharing one shadow ray and entry point, differing
+        // only in the reflect/refract branches and the wavelength).
         bool enableFlare = false;
+        int flareSamples = 8;
 
         bool operator==(const LensSettings& o) const
         {
             return fNumber == o.fNumber && focusShiftMm == o.focusShiftMm && scale == o.scale &&
                    apertureBlades == o.apertureBlades && bladeRotationDeg == o.bladeRotationDeg &&
-                   sensorHeightMm == o.sensorHeightMm && enableFlare == o.enableFlare;
+                   sensorHeightMm == o.sensorHeightMm && enableFlare == o.enableFlare &&
+                   flareSamples == o.flareSamples;
         }
         bool operator!=(const LensSettings& o) const { return !(*this == o); }
     };
