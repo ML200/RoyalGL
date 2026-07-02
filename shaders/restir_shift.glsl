@@ -12,6 +12,11 @@
 // replay the light subpath from the stored seed up to y_{s-2}, reconnect
 // y_{s-2} to the destination pixel's primary hit (which becomes the new
 // y_{s-1} = x_1), and re-evaluate the deterministic camera connection.
+// Vertex connections (s>=2, t>=2): if the camera prefix has a reconnection
+// vertex, the cached L_suf already covers the (fixed) connection edge and
+// light subpath - the ordinary camera-side branch handles it; otherwise
+// (RESTIR_FLAG_LIGHTRC) the prefix is replayed to x'_{t-1} and the
+// connection edge to the cached y_{s-1} is re-evaluated.
 //
 // Everything is measured in solid angle (paper Sec. 7 / Appendix B):
 //   replayed scatter Jacobian  = pdf_base / pdf_shifted      (Eq. 53)
@@ -24,6 +29,14 @@
 // emitter prematurely, ends in the wrong terminal (env vs emitter), or if
 // the reconnection is occluded / lands on the back side of x_r.
 
+// OCCUPANCY: the base reservoir is passed as a BUFFER SLOT, not by value.
+// A by-value PathReservoir parameter (10 vec4s = 40 scalars) stays live in
+// registers across every BVH traversal inside the shift, which caps
+// resident warps on NVIDIA at single-digit occupancy. Reading the fields
+// on demand through this macro keeps their live ranges confined to the
+// branches that use them.
+#define RS_BASE pixelRes[baseSlot].path
+
 struct RestirShiftResult
 {
     bool ok;
@@ -32,6 +45,10 @@ struct RestirShiftResult
     float rcCos;     // updated rcInfo.x for the shifted path
     float rcDist2;   // updated rcInfo.y
     float replayPdf; // updated rcInfo.w
+    float omega;     // omega_tau of the shifted path: recomputed via the
+                     // recursive reconnection MIS (Phase 5) when
+                     // RestirMisRecomputeEnabled(), else copied from the
+                     // base (Sec. 6.4 biased variant)
 };
 
 RestirShiftResult RestirShiftFail()
@@ -43,6 +60,7 @@ RestirShiftResult RestirShiftFail()
     res.rcCos = 0.0;
     res.rcDist2 = 0.0;
     res.replayPdf = 1.0;
+    res.omega = 0.0;
     return res;
 }
 
@@ -58,13 +76,13 @@ RestirShiftResult RestirShiftFail()
 // connection (imageToSurface) changes f only - nothing samples it, so it
 // contributes no Jacobian. omega_tau is copied (Sec. 6.4 biased variant,
 // like the camera-side shift; Phase 5 recomputes it).
-RestirShiftResult RestirShiftLightPath(PathReservoir base, GBufferPixel dstG, vec3 dstWi,
+RestirShiftResult RestirShiftLightPath(uint baseSlot, GBufferPixel dstG, vec3 dstWi,
                                        vec3 dstCamPos, vec3 dstCamForward, float dstIpd)
 {
     RestirShiftResult res = RestirShiftFail();
     if (dstG.posDepth.w < 0.0) return res;
 
-    uint tech = floatBitsToUint(base.core.w);
+    uint tech = floatBitsToUint(RS_BASE.core.w);
     uint s = RestirTechS(tech);
     uint flags = RestirTechFlags(tech);
     if ((flags & RESTIR_FLAG_CAUSTIC) != 0u) return res; // caustics: Phase 3, never shifted here
@@ -79,7 +97,7 @@ RestirShiftResult RestirShiftLightPath(PathReservoir base, GBufferPixel dstG, ve
     if (dot(mX1.emissive.rgb, mX1.emissive.rgb) > 0.0) return res;
 
     // ---------------------------------------------------- light replay ---
-    g_rngSeed = floatBitsToUint(base.fSeed.w);
+    g_rngSeed = floatBitsToUint(RS_BASE.fSeed.w);
     RngStream(0u, RNG_EMIT);
     float pdfDescent, pdfLeaf;
     uint leaf = LT_Descend(dstCamPos, dstCamForward, pdfDescent);
@@ -98,6 +116,13 @@ RestirShiftResult RestirShiftLightPath(PathReservoir base, GBufferPixel dstG, ve
     vec3 prevWi = vec3(0.0);
     Material prevMat = mX1; // overwritten before use; keeps GLSL happy
     bool prevIsLight = (s == 2u);
+    bool misRecompute = RestirMisRecomputeEnabled();
+
+    // Light-side MIS recursion state (Phase 5, restir_light.comp
+    // conventions): mVCM/mVC classic, mLW the lightweight restriction.
+    // For s=2 the emission direction itself is replaced by the
+    // reconnection, so the seeds are computed there.
+    float mVCM = 0.0, mVC = 0.0, mLW = 0.0;
 
     if (s == 2u)
     {
@@ -117,6 +142,13 @@ RestirShiftResult RestirShiftLightPath(PathReservoir base, GBufferPixel dstG, ve
         f = lt.emissionWeight.rgb * cosTheta;
         replayPdf = pickPdf * invArea * cosTheta / PI;
 
+        float directPdfA, emissionPdfW;
+        RestirLightPdfs(lightIdx, cosTheta, directPdfA, emissionPdfW);
+        if (emissionPdfW <= 0.0) return res;
+        mVCM = directPdfA / emissionPdfW;
+        mVC = cosTheta / emissionPdfW;
+        mLW = mVC;
+
         Ray ray = MakeRay(origin + lightN * 1e-4, dir);
         bool reached = false;
         for (uint j = 1u; j + 1u < s; ++j) // vertices y_1 .. y_{s-2}
@@ -128,6 +160,12 @@ RestirShiftResult RestirShiftLightPath(PathReservoir base, GBufferPixel dstG, ve
             if (dot(mat.emissive.rgb, mat.emissive.rgb) > 0.0) return res;
             bool isDelta = MatIsDelta(mat);
             if (isDelta != (((deltaMask >> (j - 1u)) & 1u) == 1u)) return res;
+
+            float cosInJ = abs(dot(hit.normal, ray.dir));
+            if (cosInJ <= 1e-6) return res;
+            mVCM *= hit.t * hit.t / cosInJ;
+            mVC /= cosInJ;
+            mLW /= cosInJ;
 
             vec3 hitPos = ray.origin + ray.dir * hit.t;
             vec3 wi = -ray.dir;
@@ -149,6 +187,19 @@ RestirShiftResult RestirShiftLightPath(PathReservoir base, GBufferPixel dstG, ve
             f *= bs.weight * pdfStep;
             replayPdf *= pdfStep;
 
+            if (bs.specular)
+            {
+                mVC *= bs.cosOut;
+                mLW *= bs.cosOut;
+                mVCM = 0.0;
+            }
+            else
+            {
+                mVC = (bs.cosOut / bs.pdfDir) * (mVCM + bs.pdfRev * mVC);
+                mLW = (bs.cosOut / bs.pdfDir) * ((j == 1u ? mVCM : 0.0) + bs.pdfRev * mLW);
+                mVCM = 1.0 / bs.pdfDir;
+            }
+
             vec3 offN = (dot(bs.dir, hit.normal) >= 0.0) ? hit.normal : -hit.normal;
             ray = MakeRay(hitPos + offN * 1e-4, bs.dir);
         }
@@ -163,15 +214,25 @@ RestirShiftResult RestirShiftLightPath(PathReservoir base, GBufferPixel dstG, ve
     float dist = sqrt(d2);
     vec3 dirTo = toX1 / dist;
 
+    float pd = 0.0, pr = 0.0, cosOut = 0.0;
     if (prevIsLight)
     {
         float cosL = dot(prevN, dirTo);
         if (cosL <= 1e-6) return res; // one-sided emitter
         f *= cosL;
+        // Emission-direction eval seeds for the reconnected direction.
+        float directPdfA, emissionPdfW;
+        RestirLightPdfs(lightIdx, cosL, directPdfA, emissionPdfW);
+        if (emissionPdfW <= 0.0) return res;
+        mVCM = directPdfA / emissionPdfW;
+        mVC = cosL / emissionPdfW;
+        mLW = mVC;
+        pd = cosL / PI; // cosine emission pdf of the reconnected direction
+        pr = 0.0;
+        cosOut = cosL;
     }
     else
     {
-        float pd, pr, cosOut;
         vec3 fb = EvalBsdf(prevMat, prevN, prevWi, dirTo, pd, pr, cosOut);
         if (fb == vec3(0.0)) return res;
         f *= fb * cosOut;
@@ -198,10 +259,25 @@ RestirShiftResult RestirShiftLightPath(PathReservoir base, GBufferPixel dstG, ve
                            * cosToCam / max(d2cam, 1e-12);
     f *= fbX * imageToSurface;
 
+    // omega_tau: COPIED, deliberately, even in Phase 5's recompute mode.
+    // The t=1 reverse shift re-anchors the free landing point x_1 onto the
+    // destination V-buffer hit - an approximation (paper Appendix A's pixel
+    // redistribution argument); soaks show that evaluating omega at the
+    // anchor AMPLIFIES that approximation's darkening under
+    // confidence-weighted chained reuse (temporal+spatial: -0.03% ->
+    // -0.06%), while copied omega partially cancels it. Camera-side (t>=2)
+    // and caustic (pure replay, exact identity) shifts do recompute.
+    // Revisit together with a proper pixel-filter (h_i) treatment of t=1
+    // candidates. The recursion state maintained above (mVCM/mVC/mLW) is
+    // what a recompute would consume - kept for that future fix:
+    //   nVCM = (d2/cosRc)/pd; nVC = (cosOut/pd)(mVCM + pr*mVC)/cosRc; ...
+    //   wL = (imageToSurface/N_L) * (nVCM + pdX*nVC); omega = 1/(1+wL)
+    res.omega = RS_BASE.rcInfo.z;
+
     // Jacobians: reverse reconnection (Eq. 56, i=2) + random replay (Eq. 53).
-    if (base.rcInfo.x <= 0.0 || base.rcInfo.y <= 0.0 || replayPdf <= 0.0) return res;
-    float J = (cosRc / base.rcInfo.x) * (base.rcInfo.y / d2);
-    J *= base.rcInfo.w / replayPdf;
+    if (RS_BASE.rcInfo.x <= 0.0 || RS_BASE.rcInfo.y <= 0.0 || replayPdf <= 0.0) return res;
+    float J = (cosRc / RS_BASE.rcInfo.x) * (RS_BASE.rcInfo.y / d2);
+    J *= RS_BASE.rcInfo.w / replayPdf;
 
     res.f = f;
     res.jacobian = J;
@@ -220,7 +296,7 @@ RestirShiftResult RestirShiftLightPath(PathReservoir base, GBufferPixel dstG, ve
 // (current or previous frame's) - used only by t=1 shifts, which must
 // re-evaluate the camera connection and replay the light-tree descent in
 // the destination domain.
-RestirShiftResult RestirShiftPath(PathReservoir base, GBufferPixel dstG, vec3 dstWi,
+RestirShiftResult RestirShiftPath(uint baseSlot, GBufferPixel dstG, vec3 dstWi,
                                   vec3 dstCamPos, vec3 dstCamForward, float dstIpd)
 {
     RestirShiftResult res;
@@ -233,18 +309,19 @@ RestirShiftResult RestirShiftPath(PathReservoir base, GBufferPixel dstG, vec3 ds
 
     if (dstG.posDepth.w < 0.0) return res;
 
-    uint tech = floatBitsToUint(base.core.w);
+    uint tech = floatBitsToUint(RS_BASE.core.w);
     uint s = RestirTechS(tech);
     uint t = RestirTechT(tech);
     if (t == 1u)
-        return RestirShiftLightPath(base, dstG, dstWi, dstCamPos, dstCamForward, dstIpd);
+        return RestirShiftLightPath(baseSlot, dstG, dstWi, dstCamPos, dstCamForward, dstIpd);
     uint flags = RestirTechFlags(tech);
     bool rcValid = (flags & RESTIR_FLAG_RCVALID) != 0u;
     bool envEnd = (flags & RESTIR_FLAG_ENVEND) != 0u;
+    bool lightRc = (flags & RESTIR_FLAG_LIGHTRC) != 0u;
     uint r = RestirFlagsRcIndex(flags);
     uint deltaMask = RestirFlagsDeltaMask(flags);
 
-    g_rngSeed = floatBitsToUint(base.fSeed.w);
+    g_rngSeed = floatBitsToUint(RS_BASE.fSeed.w);
 
     vec3 x = dstG.posDepth.xyz;
     vec3 n = dstG.normalMat.xyz;
@@ -254,7 +331,7 @@ RestirShiftResult RestirShiftPath(PathReservoir base, GBufferPixel dstG, vec3 ds
 
     // Directly visible emitter (s=0, t=2, no rc): the shifted path is just
     // the new primary hit, which must itself be a front-facing emitter.
-    if (!rcValid && !envEnd && t == 2u)
+    if (!rcValid && !envEnd && !lightRc && t == 2u)
     {
         Material m1 = materials[matId];
         if (dot(m1.emissive.rgb, m1.emissive.rgb) <= 0.0) return res;
@@ -264,12 +341,33 @@ RestirShiftResult RestirShiftPath(PathReservoir base, GBufferPixel dstG, vec3 ds
         res.ok = true;
         res.f = m1.emissive.rgb;
         res.jacobian = 1.0;
+        res.omega = RS_BASE.rcInfo.z; // 1 either way: s=0 is the only sampler
         return res;
     }
 
     vec3 f = vec3(1.0);
     float replayPdf = 1.0;
     float J = 1.0;
+
+    // Eye-side MIS recursion at the destination anchor (Phase 5; mirrors
+    // restir_camera.comp): dVCM/dVC classic, dT1 the t=1-only restriction.
+    // The seed is the t=1 pdf ratio at the destination primary hit.
+    bool misRecompute = RestirMisRecomputeEnabled();
+    bool conn = RestirConnectionsEnabled();
+    float dVCM = 0.0, dVC = 0.0, dT1 = 0.0;
+    if (RestirLightTracingEnabled())
+    {
+        float cosAtCam = dot(dstCamForward, -dstWi);
+        float cosIn1 = abs(dot(n, wi));
+        if (cosAtCam > 1e-3 && cosIn1 > 1e-6)
+        {
+            float imagePointToCamDist = dstIpd / cosAtCam;
+            float cameraPdfW = (imagePointToCamDist * imagePointToCamDist) / cosAtCam;
+            float d2v = dstG.posDepth.w * dstG.posDepth.w;
+            dVCM = (float(BdptNumLightPaths()) / cameraPdfW) * (d2v / cosIn1);
+            dT1 = dVCM;
+        }
+    }
 
     // Vertex loop; i is the index of the current shifted vertex x'_i.
     for (uint i = 1u; i <= RESTIR_MAX_VERTS; ++i)
@@ -287,11 +385,65 @@ RestirShiftResult RestirShiftPath(PathReservoir base, GBufferPixel dstG, vec3 ds
         // shifted path terminating here has no counterpart.
         if (dot(mat.emissive.rgb, mat.emissive.rgb) > 0.0) return res;
 
+        if (lightRc && i == t - 1u)
+        {
+            // ---------------------- connection-edge reconnection ---------
+            // s>=2 path whose camera prefix has no connectable pair: the
+            // prefix was replayed to x'_{t-1}; re-evaluate the connection
+            // to the CACHED light subpath end y_{s-1}. (Static scene: the
+            // cached light side is exactly what pure replay would rebuild,
+            // and identity-on-the-light-side keeps temporal shifts alive
+            // across light-tree anchor changes.) y_{s-1}'s position is
+            // parametrized by the light-side solid angle at y_{s-2}, which
+            // this shift never touches - the connection edge changes f
+            // (geometry term) but contributes NO Jacobian, unlike the
+            // camera-side reconnection below.
+            if (isDelta) return res; // guaranteed by mask, kept for clarity
+            vec3 toY = RS_BASE.lyPosMat.xyz - x;
+            float d2y = dot(toY, toY);
+            if (d2y <= 1e-12) return res;
+            float distY = sqrt(d2y);
+            vec3 dirY = toY / distY;
+
+            float cosY = dot(RS_BASE.lyNormal.xyz, -dirY);
+            if (cosY <= 1e-6) return res; // wrong side of y_{s-1}
+
+            float pdfDirY, pdfRevY, cosOutY;
+            vec3 fbY = EvalBsdf(mat, n, wi, dirY, pdfDirY, pdfRevY, cosOutY);
+            if (fbY == vec3(0.0)) return res;
+
+            vec3 nfY = (dot(n, dirY) >= 0.0) ? n : -n;
+            Ray shadowRayY = MakeRay(x + nfY * 1e-4, dirY);
+            if (IntersectSceneOccluded(shadowRayY, distY * 0.999)) return res;
+
+            f *= fbY * (cosOutY * cosY / d2y); // fCam * geometry term
+            f *= RS_BASE.lyTput.xyz;              // rho_y * light prefix numerator
+
+            // omega_tau: the full s>=2 connection weight at the shifted
+            // connection edge; misCache.x is the light side's fixed ratio
+            // sum (LIGHTRC paths only exist with connections enabled).
+            res.omega = RS_BASE.rcInfo.z;
+            if (misRecompute)
+            {
+                float camDirPdfA = pdfDirY * cosY / d2y;
+                float lightDirPdfA = (cosY / PI) * cosOutY / d2y;
+                float denom = camDirPdfA * RS_BASE.misCache.x + 1.0
+                            + lightDirPdfA * (dVCM + pdfRevY * dVC);
+                if (isnan(denom) || isinf(denom)) return res;
+                res.omega = 1.0 / max(denom, 1.0);
+            }
+
+            res.ok = true;
+            res.rcCos = 0.0; // no reconnection-vertex Jacobian data (see above)
+            res.rcDist2 = 0.0;
+            break;
+        }
+
         if (rcValid && i == r - 1u)
         {
             // ------------------------------------------ reconnection -----
             if (isDelta) return res; // guaranteed by mask, kept for clarity
-            vec3 toRc = base.rcPosMat.xyz - x;
+            vec3 toRc = RS_BASE.rcPosMat.xyz - x;
             float d2 = dot(toRc, toRc);
             if (d2 <= 1e-12) return res;
             float dist = sqrt(d2);
@@ -300,7 +452,7 @@ RestirShiftResult RestirShiftPath(PathReservoir base, GBufferPixel dstG, vec3 ds
             // The stored normal is oriented toward valid observers; the new
             // predecessor must be on that side (Lambertian hemisphere /
             // emitter one-sidedness).
-            float cosRc = dot(base.rcNormal.xyz, -dir);
+            float cosRc = dot(RS_BASE.rcNormal.xyz, -dir);
             if (cosRc <= 1e-6) return res;
 
             float pdfDir, pdfRev, cosOut;
@@ -311,11 +463,49 @@ RestirShiftResult RestirShiftPath(PathReservoir base, GBufferPixel dstG, vec3 ds
             Ray shadowRay = MakeRay(x + nf * 1e-4, dir);
             if (IntersectSceneOccluded(shadowRay, dist * 0.999)) return res;
 
-            if (base.rcInfo.x <= 0.0 || base.rcInfo.y <= 0.0) return res;
+            if (RS_BASE.rcInfo.x <= 0.0 || RS_BASE.rcInfo.y <= 0.0) return res;
 
             f *= fb * cosOut;          // rho*cos at x'_{r-1}
-            f *= base.rcLsuf.xyz;      // cached suffix radiance
-            J *= (cosRc / base.rcInfo.x) * (base.rcInfo.y / d2); // Eq. 55
+            f *= RS_BASE.rcLsuf.xyz;      // cached suffix radiance
+            J *= (cosRc / RS_BASE.rcInfo.x) * (RS_BASE.rcInfo.y / d2); // Eq. 55
+
+            // ----------------- omega_tau recomputation (Phase 5) ---------
+            // The technique-MIS denominator of the shifted path is affine
+            // in the prefix state at x_r (see misCache in
+            // restir_common.glsl). pRev'_r = cosRc/PI (Lambertian x_r).
+            res.omega = RS_BASE.rcInfo.z;
+            if (misRecompute)
+            {
+                float dVCMr = (d2 / cosRc) / pdfDir;
+                float dVCr = (cosOut / pdfDir) * (dVCM + pdfRev * dVC) / cosRc;
+                float dT1r = (cosOut / pdfDir) * (i == 1u ? dT1 : pdfRev * dT1) / cosRc;
+                float denom;
+                if (floatBitsToUint(RS_BASE.rcPosMat.w) == NO_MATERIAL)
+                {
+                    // s=1 with the sampled light point as rc vertex: full
+                    // split-vertex recompute at the moved NEE vertex.
+                    float directPdfW = RS_BASE.misCache.y * d2 / cosRc;
+                    if (directPdfW <= 1e-20) return res;
+                    float prefac = RS_BASE.misCache.z * cosOut / (directPdfW * cosRc);
+                    float wCam = conn ? prefac * (dVCM + pdfRev * dVC)
+                                      : prefac * (i == 1u ? dT1 : pdfRev * dT1);
+                    denom = 1.0 + pdfDir / directPdfW + wCam;
+                }
+                else if (s == 0u && r == t - 1u)
+                {
+                    // rc vertex IS the terminal emitter.
+                    denom = RS_BASE.misCache.x + RS_BASE.misCache.y * dVCMr
+                          + RS_BASE.misCache.z * (conn ? dVCr : dT1r);
+                }
+                else
+                {
+                    float X = conn ? (dVCMr + (cosRc / PI) * dVCr)
+                                   : ((cosRc / PI) * dT1r);
+                    denom = RS_BASE.misCache.x + RS_BASE.misCache.y * X;
+                }
+                if (isnan(denom) || isinf(denom)) return res;
+                res.omega = 1.0 / max(denom, 1.0);
+            }
 
             res.ok = true;
             res.rcCos = cosRc;
@@ -333,6 +523,20 @@ RestirShiftResult RestirShiftPath(PathReservoir base, GBufferPixel dstG, vec3 ds
         f *= bs.weight * pdfStep; // = rho*cos under our delta convention
         replayPdf *= pdfStep;
 
+        // MIS recursions (Phase 5; identical to restir_camera.comp).
+        if (bs.specular)
+        {
+            dVC *= bs.cosOut;
+            dT1 = (i == 1u) ? 0.0 : dT1 * bs.cosOut;
+            dVCM = 0.0;
+        }
+        else
+        {
+            dVC = (bs.cosOut / bs.pdfDir) * (dVCM + bs.pdfRev * dVC);
+            dT1 = (bs.cosOut / bs.pdfDir) * (i == 1u ? dT1 : dT1 * bs.pdfRev);
+            dVCM = 1.0 / bs.pdfDir;
+        }
+
         vec3 offN = (dot(bs.dir, n) >= 0.0) ? n : -n;
         Ray ray = MakeRay(x + offN * 1e-4, bs.dir);
         Hit hit;
@@ -342,6 +546,7 @@ RestirShiftResult RestirShiftPath(PathReservoir base, GBufferPixel dstG, vec3 ds
             // at the environment after this exact scatter.
             if (!envEnd || rcValid || (i + 2u) != t) return res;
             f *= uFrame.background.rgb * uFrame.background.a;
+            res.omega = RS_BASE.rcInfo.z; // 1 either way: eye-only technique
             res.ok = true;
             break;
         }
@@ -353,10 +558,14 @@ RestirShiftResult RestirShiftPath(PathReservoir base, GBufferPixel dstG, vec3 ds
         matId = hit.materialIndex;
         triIdx = hit.triIndex;
         wi = -bs.dir;
+        float cosArr = max(abs(dot(hit.normal, bs.dir)), 1e-6);
+        dVCM *= hit.t * hit.t / cosArr;
+        dVC /= cosArr;
+        dT1 /= cosArr;
 
         // Pure-replay terminal: the final surface vertex must be a
         // front-facing emitter (s=0 with a specular chain).
-        if (!rcValid && !envEnd && (i + 1u) == t - 1u)
+        if (!rcValid && !envEnd && !lightRc && (i + 1u) == t - 1u)
         {
             Material em = materials[matId];
             if (dot(em.emissive.rgb, em.emissive.rgb) <= 0.0) return res;
@@ -364,6 +573,23 @@ RestirShiftResult RestirShiftPath(PathReservoir base, GBufferPixel dstG, vec3 ds
             vec3 lightN = (lightIdx != LT_SENTINEL) ? lightTris[lightIdx].normalArea.xyz : n;
             if (dot(lightN, wi) <= 1e-6) return res;
             f *= em.emissive.rgb;
+
+            // omega_tau: everything was replayed, so recompute the s=0
+            // terminal weight directly (restir_camera.comp's formula).
+            res.omega = RS_BASE.rcInfo.z;
+            if (misRecompute)
+            {
+                float denom = 1.0;
+                if (lightIdx != LT_SENTINEL)
+                {
+                    float directPdfA, emissionPdfW;
+                    RestirLightPdfs(lightIdx, dot(lightN, wi), directPdfA, emissionPdfW);
+                    denom = 1.0 + directPdfA * dVCM
+                          + emissionPdfW * (conn ? dVC : dT1);
+                }
+                if (isnan(denom) || isinf(denom)) return res;
+                res.omega = 1.0 / max(denom, 1.0);
+            }
             res.ok = true;
             break;
         }
@@ -374,7 +600,7 @@ RestirShiftResult RestirShiftPath(PathReservoir base, GBufferPixel dstG, vec3 ds
     // Replay Jacobian (Eq. 53): base pdf product over the replayed scatters
     // is cached in rcInfo.w.
     if (replayPdf <= 0.0) { res.ok = false; return res; }
-    J *= base.rcInfo.w / replayPdf;
+    J *= RS_BASE.rcInfo.w / replayPdf;
 
     res.f = f;
     res.jacobian = J;

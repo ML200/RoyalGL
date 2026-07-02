@@ -54,6 +54,21 @@ namespace RoyalGL
         // into per-pixel reservoirs through the LRM, with caustic paths in
         // a second reservoir. Off = Phase 1 camera-side techniques only.
         bool restirLightTracing = true;
+        // Phase 4 full BDPT: s>=2 vertex connections against the compacted
+        // global LVC. Off = lightweight mode; the MIS weights track the
+        // active technique set either way.
+        bool restirConnections = true;
+        // Phase 5: recompute omega_tau for camera-side (t>=2) and caustic
+        // shifts via the recursive reconnection MIS; off = copy omega
+        // through shifts (paper Sec. 6.4). Default OFF for now: in our
+        // Lambert-only world copied omega is near shift-invariant (no
+        // Fig. 5 corner darkening to fix), and soaks show the recompute's
+        // t=1-competitor terms amplify the t=1 re-anchoring
+        // approximation's darkening under chained reuse (-0.026% ->
+        // -0.048%). Flip the default when GGX materials land - that is
+        // where copied omega actually bites. See RESTIR_BDPT_PLAN.md
+        // Phase 5 status.
+        bool restirRecomputeMis = false;
 
         // Global: off = every pipeline overwrites the image with its latest
         // sample instead of averaging, so naive PT / NEE / BDPT / ReSTIR
@@ -82,6 +97,8 @@ namespace RoyalGL
                    restirSpatialNeighbors == other.restirSpatialNeighbors &&
                    restirSpatialRadius == other.restirSpatialRadius &&
                    restirLightTracing == other.restirLightTracing &&
+                   restirConnections == other.restirConnections &&
+                   restirRecomputeMis == other.restirRecomputeMis &&
                    accumulate == other.accumulate &&
                    cameraMode == other.cameraMode &&
                    lens == other.lens;

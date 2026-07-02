@@ -16,23 +16,30 @@
 // flagged for the caustic reservoir, since no camera-side technique can
 // sample them and their shift is pure replay.
 //
-// Technique MIS (omega_tau): with only {s=0, s=1, t=1} in play, both
-// competing techniques split a t=1 path at its light end - s=0 samples the
-// whole path from the camera, s=1 all but the light point. The classic
-// recursive quantities (bdpt_common.glsl) restrict cleanly:
-//   dVCM - unchanged seed directPdfA/emissionPdfW (the s=1 pdf ratio),
-//   dLW  - the classic dVC recursion WITHOUT the interior dVCM additions:
-//          those additions are the s>=2 vertex-connection techniques, which
-//          don't exist until Phase 4. The addition at the FIRST scatter
-//          (y_1 -> y_2) is the s=1 term and is kept; delta vertices scale
-//          by cosOut exactly as in the full recursion.
-// At a connection from y_j:
-//   wLight = (imageToSurface/N_L) * (j==1 ? dVCM + pdfRev*dLW : pdfRev*dLW)
-//   omega  = 1 / (1 + wLight)
-// which mirrors bdpt_light.comp's classic weight with the s>=2 terms
-// removed. restir_camera.comp applies the matching restriction on the eye
-// side (its dT1 accumulator), so the weights of the three techniques form
-// an exact partition of unity on every path.
+// Technique MIS (omega_tau): the weights must partition unity over the
+// ACTIVE technique set, which the s>=2 toggle changes, so both recursions
+// are maintained:
+//   dVCM/dVC - the full classic recursion (bdpt_common.glsl), used when
+//          vertex connections are enabled: wLight = (imageToSurface/N_L) *
+//          (dVCM + pdfRev*dVC), exactly bdpt_light.comp's weight.
+//   dLW  - the lightweight restriction (technique set {s=0, s=1, t=1}):
+//          the dVC recursion WITHOUT the interior dVCM additions (those
+//          are the s>=2 vertex connections). Only the addition at the
+//          FIRST scatter (the s=1 split) is kept; delta vertices scale by
+//          cosOut exactly as in the full recursion. Used when connections
+//          are off: wLight = (i2s/N_L) * (j==1 ? dVCM + pdfRev*dLW
+//                                             : pdfRev*dLW).
+// restir_camera.comp applies the matching selection on the eye side
+// (dVCM/dVC vs its dT1 accumulator).
+//
+// Phase 4: every connectable vertex that can still take part in a
+// connection is also appended to the compacted global LVC - the classic
+// lightVerts buffer reused as a flat atomic-append array (allocator in
+// lightVertCount[0], cleared per frame by PathTracer.cpp) with
+// ReSTIR-specific field semantics: tputMat.xyz holds the NUMERATOR
+// fLightNum (not throughput - RIS needs the true f for the shared target
+// function) with materialIndex<<8|pathLength packed in .w, and wiLen.w
+// holds the light-prefix pdf product pLight.
 //
 // f / pdf convention (restir_common.glsl): fNum is the pure numerator
 // (Le * cos products; choicePdf*tint at delta scatters), pProd the product
@@ -110,8 +117,10 @@ void main()
 
     float invArea = 1.0 / max(lt.normalArea.w, 1e-10);
     float emissionPdfTrue = pickPdfTrue * invArea * cosTheta / PI;
+    // Frame-independent EVAL pdfs seed the MIS quantities (see
+    // restir_common.glsl); the sampled pdf divides the contribution.
     float directPdfA, emissionPdfW;
-    BdptLightPdfs(lightIdx, cosTheta, directPdfA, emissionPdfW);
+    RestirLightPdfs(lightIdx, cosTheta, directPdfA, emissionPdfW);
     if (emissionPdfW <= 0.0 || emissionPdfTrue <= 0.0) return;
 
     vec3 fNum = lt.emissionWeight.rgb * cosTheta;
@@ -123,7 +132,10 @@ void main()
     float pdfPrevArrival = pickPdfTrue * invArea;
 
     float dVCM = directPdfA / emissionPdfW;
+    float dVC = cosTheta / emissionPdfW;
     float dLW = cosTheta / emissionPdfW;
+    bool lightTracing = RestirLightTracingEnabled();
+    bool connections = RestirConnectionsEnabled();
 
     // Previous path vertex y_{j-1}, starting at the emission point y_0.
     vec3 prevPos = origin;
@@ -151,6 +163,7 @@ void main()
 
         dVCM *= hit.t * hit.t;
         dVCM /= cosIn;
+        dVC /= cosIn;
         dLW /= cosIn;
 
         Material mat = materials[hit.materialIndex];
@@ -163,7 +176,24 @@ void main()
         bool isDelta = MatIsDelta(mat);
         if (isDelta) deltaMask |= 1u << (pathLength - 1u);
 
-        if (!isDelta && pathLength + 1u <= maxLen)
+        if (!isDelta && connections && pathLength + 2u <= maxLen)
+        {
+            // --------------------------- LVC append (paper Alg. 1) -------
+            // Vertices that can still take part in an s>=2 connection
+            // (light segments + connection + at least one eye segment).
+            uint slot = atomicAdd(lightVertCount[0], 1u);
+            if (slot < BdptNumLightPaths() * BDPT_MAX_LIGHT_VERTS)
+            {
+                LightVertex v;
+                v.posDvcm = vec4(hitPos, dVCM);
+                v.normalDvc = vec4(hit.normal, dVC);
+                v.tputMat = vec4(fNum, uintBitsToFloat((hit.materialIndex << 8) | pathLength));
+                v.wiLen = vec4(wi, pProd);
+                lightVerts[slot] = v;
+            }
+        }
+
+        if (!isDelta && lightTracing && pathLength + 1u <= maxLen)
         {
             // --------------------------------------- t=1 candidate -------
             vec3 toCam = uFrame.camPos.xyz - hitPos;
@@ -189,8 +219,10 @@ void main()
                                            * cosToCam / dist2;
 
                     float wLight = (imageToSurface / numLightPaths)
-                                 * (pathLength == 1u ? (dVCM + bsdfRevPdfW * dLW)
-                                                     : (bsdfRevPdfW * dLW));
+                                 * (connections
+                                        ? (dVCM + bsdfRevPdfW * dVC)
+                                        : (pathLength == 1u ? (dVCM + bsdfRevPdfW * dLW)
+                                                            : (bsdfRevPdfW * dLW)));
                     float omega = 1.0 / (1.0 + wLight);
 
                     vec3 fPix = fNum * fb * imageToSurface;
@@ -232,13 +264,22 @@ void main()
         if (bs.weight == vec3(0.0)) break;
         if (!bs.specular && bs.pdfDir <= 0.0) break;
 
-        // Lightweight MIS recursion: the dVCM addition at the first scatter
-        // is the s=1 technique; later additions would be s>=2 vertex
-        // connections and are dropped.
+        // Full classic recursion + the lightweight restriction (its dVCM
+        // addition only at the first scatter - the s=1 split; later
+        // additions are the s>=2 vertex connections it excludes). Both use
+        // the OLD dVCM; dVCM updates after.
         if (bs.specular)
+        {
+            dVC *= bs.cosOut;
             dLW *= bs.cosOut;
+            dVCM = 0.0;
+        }
         else
+        {
+            dVC = (bs.cosOut / bs.pdfDir) * (dVCM + bs.pdfRev * dVC);
             dLW = (bs.cosOut / bs.pdfDir) * ((pathLength == 1u ? dVCM : 0.0) + bs.pdfRev * dLW);
+            dVCM = 1.0 / bs.pdfDir;
+        }
 
         float pdfStep = bs.choicePdf * (bs.specular ? 1.0 : bs.pdfDir);
         pdfPrevArrival = pProd; // arrival pdf of the vertex we now leave

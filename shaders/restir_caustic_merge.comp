@@ -47,16 +47,17 @@ void main()
     GBufferPixel gCur = gbuf[GBufCurOffset() + idx];
     if (gCur.posDepth.w < 0.0) return; // canonical (empty) stands
 
-    CausticReservoir can = pixelRes[slot].caustic;
-    float cCan = max(can.core.z, 1.0); // camera pass writes confidence 1
+    // OCCUPANCY: field-wise reads by slot (see restir_caustic_shift.comp).
+    vec4 canCore = pixelRes[slot].caustic.core;
+    float cCan = max(canCore.z, 1.0); // camera pass writes confidence 1
 
     // ------------------- backward map: canonical into the prev domain ----
     float pFromPrevC = 0.0;
-    if (can.core.x > 0.0 && can.core.y > 0.0 && uFrame.lightInfo.x > 0u)
+    if (canCore.x > 0.0 && canCore.y > 0.0 && uFrame.lightInfo.x > 0u)
     {
-        uint tech = floatBitsToUint(can.core.w);
+        uint tech = floatBitsToUint(canCore.w);
         RestirCausticReplayResult back = RestirCausticReplay(
-            floatBitsToUint(can.fSeed.w), RestirTechS(tech),
+            floatBitsToUint(pixelRes[slot].caustic.fSeed.w), RestirTechS(tech),
             RestirFlagsDeltaMask(RestirTechFlags(tech)),
             uFrame.prevCamPos.xyz, uFrame.prevCamForward.xyz,
             uFrame.prevCamRight.xyz, uFrame.prevCamUp.xyz,
@@ -66,8 +67,12 @@ void main()
             uint vIdx = RestirPixelIndex(back.pixel);
             if (gbuf[GBufPrevOffset() + vIdx].posDepth.w >= 0.0)
             {
-                float pHatPrevC = can.meta.x * RestirLum(back.f);
-                float Jb = can.meta.y / back.replayPdf; // |dT^-1/dC|
+                // omega of T^-1(canonical) in the PREVIOUS domain:
+                // recomputed (Phase 5) or copied.
+                float omegaPrev = RestirMisRecomputeEnabled()
+                    ? back.omega : pixelRes[slot].caustic.meta.x;
+                float pHatPrevC = omegaPrev * RestirLum(back.f);
+                float Jb = pixelRes[slot].caustic.meta.y / back.replayPdf; // |dT^-1/dC|
                 float cV = min(pixelRes[RestirRegionOffset(RestirHistoryRegion()) + vIdx].caustic.core.z,
                                RESTIR_CONFIDENCE_CAP);
                 pFromPrevC = cV * pHatPrevC * Jb;
@@ -85,19 +90,19 @@ void main()
     float selPHat = 0.0, selOmega = 0.0, selReplayPdf = 0.0;
     uint selTech = 0u, selSeed = 0u;
 
-    if (can.core.y > 0.0)
+    if (canCore.y > 0.0)
     {
-        float mC = cCan * can.core.y / (cCan * can.core.y + pFromPrevC);
-        float wC = mC * can.core.y * can.core.x;
+        float mC = cCan * canCore.y / (cCan * canCore.y + pFromPrevC);
+        float wC = mC * canCore.y * canCore.x;
         if (wC > 0.0 && !isnan(wC) && !isinf(wC))
         {
             wSum += wC;
-            selF = can.fSeed.xyz;
-            selPHat = can.core.y;
-            selOmega = can.meta.x;
-            selReplayPdf = can.meta.y;
-            selTech = floatBitsToUint(can.core.w);
-            selSeed = floatBitsToUint(can.fSeed.w);
+            selF = pixelRes[slot].caustic.fSeed.xyz;
+            selPHat = canCore.y;
+            selOmega = pixelRes[slot].caustic.meta.x;
+            selReplayPdf = pixelRes[slot].caustic.meta.y;
+            selTech = floatBitsToUint(canCore.w);
+            selSeed = floatBitsToUint(pixelRes[slot].caustic.fSeed.w);
         }
     }
 

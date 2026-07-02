@@ -54,4 +54,9 @@ namespace RoyalGL
     {
         GL_CALL(glBindBufferBase(m_target, bindingPoint, m_id));
     }
+
+    void Buffer::SetLabel(const char* name) const
+    {
+        if (m_id != 0) GL_CALL(glObjectLabel(GL_BUFFER, m_id, -1, name));
+    }
 }

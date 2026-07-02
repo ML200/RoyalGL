@@ -172,9 +172,11 @@ p_terminate = 0.2·roughness, confidence cap 20.
 > (0.116647 / 0.116592 / 0.116592); motion debug view shows exactly zero motion for a
 > static camera.
 >
-> **Binding scheme changed from this section's original sketch:** the dev GPU
-> (Intel UHD) caps SSBO bindings at 16, so paired Cur/Prev bindings 16–24 are
-> impossible. Actual scheme (shaders/restir_common.glsl): reservoirs (PathReservoir +
+> **Binding scheme changed from this section's original sketch:** common
+> hardware (Intel iGPUs) caps SSBO bindings at 16, so paired Cur/Prev bindings
+> 16–24 would not be portable. (The actual dev GPU turned out to be an RTX
+> 5090 — see the Phase 6 status — which exposes 96 bindings; the 16-binding
+> budget is kept anyway for portability.) Actual scheme (shaders/restir_common.glsl): reservoirs (PathReservoir +
 > CausticReservoir combined in one 272 B `PixelReservoirs` struct) at **binding 15**,
 > G-buffer at **binding 0**, each buffer holding BOTH ping-pong halves
 > (2 × pixelCount), the halves selected by a parity flag in `restirParams.w`.
@@ -445,6 +447,48 @@ increasing risk.
   reservoirs off shows the paper's Fig. 8-style degradation.
 
 ### Phase 4 — Full BDPT: s ≥ 2 vertex connections
+
+> **Phase 4 status: DONE.** Compacted global LVC without new bindings: the
+> classic lightVerts buffer (binding 8) reused as a flat atomic-append array
+> in ReSTIR mode with the allocator in lightVertCount[0] (cleared per frame)
+> and ReSTIR-specific field semantics — tputMat.xyz = NUMERATOR fLightNum
+> (RIS needs the true f for the shared target p̂; storing classic throughput
+> would leak sampling pdfs into the target), tputMat.w = matId<<8|pathLength,
+> wiLen.w = light-prefix pdf pLight, posDvcm.w/normalDvc.w = classic
+> dVCM/dVC. restir_camera.comp draws ONE uniform LVC pick per eye vertex
+> (RNG_CONNECT; p_L = N_L/|LVC| in the candidate pdf; the pick subsamples
+> subpath AND technique index, unbiased like bdpt_eye's nValid trick).
+>
+> MIS: both passes now carry the FULL classic dVCM/dVC recursion alongside
+> the Phase 2 restrictions (dT1 eye / dLW light); the `restirConnections`
+> toggle (+ `ROYALGL_RESTIR_CONN`) selects which set weights every
+> technique, so the partition of unity tracks the active technique set in
+> all four toggle combinations (lightTracing kill switch = zero dVCM seed).
+>
+> Shifts: s≥2 winners whose camera prefix has a reconnection vertex need NO
+> new code — the cached L_suf transparently covers the (fixed) connection
+> edge + light subpath. Winners without a connectable camera pair carry
+> RESTIR_FLAG_LIGHTRC + the cached light subpath end (lyPosMat/lyNormal/
+> lyTput = rho_y·fLightNum): the shift replays the whole prefix and
+> re-evaluates the connection edge — pure f change, NO Eq. 55 Jacobian,
+> because y_{s-1} is parametrized by light-side solid angle the shift never
+> touches (unlike the s=1 case, where the light point is area-sampled and
+> counted in solid angle at the eye vertex). Deviation from the paper: the
+> light side is CACHED, not replayed, in s≥2 shifts — exact for static
+> scenes (identity-on-light-side is a valid GRIS shift), cheaper, and it
+> survives temporal light-tree-anchor changes; revisit if animation lands.
+>
+> Soak results (fallback Cornell+duck, locked camera, RIS-only unless
+> noted): conn OFF reproduces Phase 2 exactly (0.116468); full BDPT
+> 0.116472; conn ON + light OFF 0.116480 (≈ no-rejection baseline
+> 0.116481) — all technique-set combinations conserve energy. Reuse:
+> temporal 0.116472 (= RIS, bias-free static shifts), spatial 0.116448 /
+> both 0.116443 (the same −0.02% copied-ω_τ darkening as Phases 2–3,
+> Phase 5's target). Technique debug view confirms s≥2 reservoir winners
+> (small share — the Cornell scene is direct-light dominated; a
+> Veach-Bidir-style scene would exercise them harder and is still worth
+> adding to assets).
+
 - **4.1 Compacted global LVC** (atomic append, uniform selection, p_L = N_L/|LVC|)
   with per-vertex dP/dVC + replay metadata.
 - **4.2 s≥2 candidates in initial RIS** (Eq. 25 UCW incl. 1/p_L); connection-edge
@@ -454,6 +498,52 @@ increasing risk.
   full BDPT accumulation.
 
 ### Phase 5 — Unbiased MIS: recursive reconnection MIS
+
+> **Phase 5 status: DONE (machinery), default OFF (measured).**
+>
+> **Implementation.** In our two-material world the paper's per-suffix cache
+> (γ̄, λ̄^VC, λ̄^P, σ̄) collapses further: Lambertian forward pdfs depend only
+> on the outgoing direction, so every suffix pdf is fixed under a shift and
+> the technique-MIS denominator of the shifted path is AFFINE in the prefix
+> state at the reconnection vertex:
+> `denom' = C0 + C1·(dVCM'_r + p⃖'_r·dVC'_r)` with `p⃖'_r = rcCos'/π`.
+> restir_camera.comp maintains the affine pair (misK1/misK2) incrementally
+> from x_r onward (the paper's per-bounce updates) and folds each
+> candidate's fixed terms into `misCache` (C0, C1) — with two special
+> layouts: rc = terminal emitter (s=0, r=t−1: directPdfA/emissionPdfW,
+> no p⃖ pairing) and rc = NEE light point (full split-vertex recompute).
+> LIGHTRC caches the light side's ratio sum. Pure-replay paths (specular
+> s=0 chains, t=1, caustics) recompute ω by carrying the dVCM/dVC/dT1(/dLW)
+> recursions along the replay — restir_shift.glsl seeds them from the
+> DESTINATION anchor and camera. All ReSTIR MIS quantities switched from
+> the camera-anchored tree eval pdf to the power-CDF eval
+> (`RestirLightPdfs`, binding 10) so recomputed ω is a frame-independent
+> function of the path (required for exact temporal partitions under
+> motion; costs weight optimality only).
+>
+> **Validation & the surprise.** Camera-side recompute is EXACT: temporal /
+> spatial / temporal+spatial soaks without light tracing all sit on the RIS
+> baseline (0.116481/0.116486/0.116488 vs 0.116480) in both MIS modes, and
+> temporal identity shifts reproduce stored ω (0.116472 = RIS with light).
+> But the residual spatial darkening that Phases 2–4 attributed to copied
+> ω_τ turned out NOT to be: spatial+light gives 0.116449 in BOTH modes
+> (copied ω is near shift-invariant for Lambert — no Fig. 5 effect exists
+> to fix in this scene). The true source is the **t=1 re-anchoring
+> approximation** (we collapse free-landing x₁ onto the V-buffer anchor
+> with a point Jacobian instead of the paper's continuous landing + pixel
+> filter h_i): −0.023% under spatial, compounding to −0.026% under
+> temporal+spatial (copied), and recompute mode AMPLIFIES it to −0.048%
+> (deterministic, reproducible) because ω evaluated at the anchor
+> re-weights exactly the paths the approximation mis-measures — the t=1
+> reverse shift therefore always copies ω (code comment in
+> restir_shift.glsl), caustic shifts recompute (pure replay = exact
+> identity).
+>
+> **Decision:** `restirRecomputeMis` defaults to false; flip it when GGX
+> lands (glossy reconnections are where copied ω actually darkens corners,
+> Fig. 5) and revisit the t=1 machinery with a proper h_i-filter treatment
+> at the same time. Env override `ROYALGL_RESTIR_MISFIX`.
+
 - **5.1 Cache γ̄, λ̄^VC, λ̄^P, σ̄, geometry ratio** during camera subpath sampling
   (incremental updates per bounce as in the paper's supplemental Python).
 - **5.2 Recompute ω_τ at shift time** via Eq. 46/47 (r = t−1, r = t−2, and general
@@ -462,6 +552,59 @@ increasing risk.
   reference within noise.
 
 ### Phase 6 — Performance & polish
+
+> **Phase 6 status: instrumentation + first wins DONE.**
+>
+> Per-pass GL timers now cover the whole ReSTIR frame graph
+> (`ROYALGL_STATS=1` logs avg ms per pass every 128 frames; slots:
+> gbuffer/light/camera/temporal/caustic-shift/caustic-merge/spatial/
+> resolve). Profile — **RTX 5090** (GL_RENDERER confirms the context lands
+> on it via main.cpp's NvOptimusEnablement export; earlier "Intel UHD dev
+> GPU" references in this doc described an assumption, not this machine),
+> 1600×900 window, all reuse on, full BDPT: **spatial 51-60 ms (≈60%)**,
+> temporal 18-19 ms, camera 10-12 ms, caustic-shift 4-5 ms, light 2-3 ms,
+> gbuffer+merge+resolve ≈1 ms; ~86-110 ms total (spread is boost-clock
+> behavior). These numbers are expected for GL compute: no RT cores are
+> reachable from GLSL, so every shift evaluation walks the BVH2 in
+> software — the spatial pass performs 6 full-frame shift evaluations
+> (3 neighbors × forward+backward at ~8.5 ms each), so the neighbor-count
+> slider IS the perf dial.
+>
+> Applied: PathReservoir trimmed 208→160 B (dropped the three unused
+> reserved vec4s; PixelReservoirs 272→224 B) — ~18% less reservoir
+> bandwidth in every reuse pass and ~290 MB saved at 1080p; soaks
+> unchanged (RIS 0.116473, temporal+spatial 0.116431).
+>
+> **Occupancy round (Nsight-driven):** profiling showed ≤9% theoretical /
+> ~2% achieved occupancy — the megakernels kept whole 160 B PathReservoir
+> structs live in registers across BVH traversals, and the 64-entry
+> traversal stacks burned 256 B of per-thread local memory. Fixes:
+> (1) shift kernels take a buffer SLOT and read base-reservoir fields on
+> demand (`RS_BASE` in restir_shift.glsl); the spatial aggregate and the
+> camera pass's RIS winner live in their output buffer slot (`SEL`),
+> written field-wise on wins — stale unrelated fields are intentional and
+> guarded by the tech flags; (2) BVH stacks 64→32 entries
+> (`BVH_STACK_SIZE`, fine to ~2*log2(N) depth — bump for multi-million-tri
+> scenes). Result at 1600×900, all reuse + full BDPT on the RTX 5090:
+> **101.6 → 24 ms** (~4.2×): spatial 60→13.9, temporal 19→3.6, camera
+> 12→3.1, caustic-shift 5.4→1.5, light 3.4→1.0. Soak means unchanged
+> (RIS 0.116473, temporal 0.116473, spatial 0.116447).
+>
+> **Debug tooling:** `ROYALGL_GL_DEBUG=1` = debug GL context + KHR_debug
+> message callback; object labels on every buffer/program and
+> glPushDebugGroup markers around every pass are always on, so Nsight /
+> RenderDoc captures show a named frame graph.
+>
+> Deferred: splitting the shift mega-kernel by technique class (the
+> paper's known divergence win — the next lever if Nsight still shows
+> divergence-bound warps), fp16 packing of normals/throughputs, workgroup
+> size tuning (8x8 kept; retest once register counts settle), the N_L and
+> resolution-scale sliders, a Vulkan/RT-core backend as the ultimate
+> answer to the software-traversal cost, and the "spatial-only offline
+> converge" preset (already reachable via the existing temporal/spatial
+> toggles — temporal correlation shows up in soaks as slower
+> accumulated-relNoise decay).
+
 - Profile with existing `ROYALGL_STATS=1` GL timer queries per pass.
 - Reservoir packing (fp16 normals/throughputs where safe), register pressure in the
   shift kernel (consider splitting caustic vs non-caustic shifts into separate

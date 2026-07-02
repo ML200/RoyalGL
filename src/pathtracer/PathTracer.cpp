@@ -28,7 +28,7 @@ namespace RoyalGL
 
         // sizeof(PixelReservoirs) / sizeof(GBufferPixel) in
         // shaders/restir_common.glsl.
-        constexpr size_t kPixelReservoirsBytes = 272;
+        constexpr size_t kPixelReservoirsBytes = 224;
         constexpr size_t kGBufferPixelBytes = 32;
         // sizeof(LrmEntry) in shaders/restir_lrm.glsl, and the worst-case
         // t=1 candidates per light subpath (must match LrmCapacity() there;
@@ -56,7 +56,20 @@ namespace RoyalGL
     {
         m_timersEnabled = (std::getenv("ROYALGL_STATS") != nullptr);
         if (m_timersEnabled)
-            GL_CALL(glGenQueries(6, &m_timerQueries[0][0]));
+            GL_CALL(glGenQueries(2 * kTimerSlots, &m_timerQueries[0][0]));
+
+        // KHR_debug labels: buffer ids are stable for the object lifetime,
+        // so naming them once here covers every Nsight/RenderDoc capture.
+        m_frameUBO.SetLabel("frame UBO");
+        m_lightVertexBuffer.SetLabel("BDPT light vertices / ReSTIR LVC");
+        m_splatBuffer.SetLabel("BDPT t=1 splat accumulator");
+        m_lightVertCountBuffer.SetLabel("light vertex counts / LVC allocator");
+        m_lightSelPdfBuffer.SetLabel("light selection pdf cache");
+        m_pixelPupilBuffer.SetLabel("lens pixel pupils");
+        m_reservoirBuffer.SetLabel("ReSTIR reservoirs (3 regions)");
+        m_gbufferBuffer.SetLabel("ReSTIR G-buffer (2 halves)");
+        m_lrmEntryBuffer.SetLabel("LRM entries");
+        m_lrmHeadBuffer.SetLabel("LRM heads + allocator");
     }
 
     void PathTracer::Resize(int width, int height)
@@ -182,7 +195,9 @@ namespace RoyalGL
                              | (settings.restirTemporal ? 2u : 0u)
                              | (settings.restirSpatial ? 4u : 0u)
                              | (settings.accumulate ? 8u : 0u)
-                             | (settings.restirLightTracing ? 16u : 0u);
+                             | (settings.restirLightTracing ? 16u : 0u)
+                             | (settings.restirConnections ? 32u : 0u)
+                             | (settings.restirRecomputeMis ? 64u : 0u);
         frame.restirParams = glm::uvec4(static_cast<uint32_t>(settings.restirDebugView),
                                         restirFlags, m_frameCounter, m_restirParity);
 
@@ -199,9 +214,28 @@ namespace RoyalGL
         GLuint groupsY = (static_cast<GLuint>(m_height) + 7u) / 8u;
 
         int q = m_timerFrame & 1;
-        bool allowTimer = m_timersEnabled && !m_fullFrameNext; // one query per frame max
-        auto beginTimer = [&](int slot) { if (allowTimer) glBeginQuery(GL_TIME_ELAPSED, m_timerQueries[q][slot]); };
+        if (m_timersEnabled) m_timerMask[q] = 0;
+        bool allowTimer = m_timersEnabled && !restirActive && !m_fullFrameNext; // one query per frame max
+        auto beginTimer = [&](int slot) {
+            if (!allowTimer) return;
+            m_timerMask[q] |= 1u << slot;
+            glBeginQuery(GL_TIME_ELAPSED, m_timerQueries[q][slot]);
+        };
         auto endTimer = [&]() { if (allowTimer) glEndQuery(GL_TIME_ELAPSED); };
+        // ReSTIR-mode per-pass timers (the full pass graph runs every frame,
+        // so each slot gets exactly one query per frame) + KHR_debug groups
+        // so profiler captures show a named pass tree.
+        bool restirTimer = m_timersEnabled && restirActive;
+        auto rtBegin = [&](int slot, const char* name) {
+            GL_CALL(glPushDebugGroup(GL_DEBUG_SOURCE_APPLICATION, static_cast<GLuint>(slot), -1, name));
+            if (!restirTimer) return;
+            m_timerMask[q] |= 1u << slot;
+            glBeginQuery(GL_TIME_ELAPSED, m_timerQueries[q][slot]);
+        };
+        auto rtEnd = [&]() {
+            if (restirTimer) glEndQuery(GL_TIME_ELAPSED);
+            GL_CALL(glPopDebugGroup());
+        };
 
         if (lensMode && m_pupilsDirty)
         {
@@ -240,18 +274,23 @@ namespace RoyalGL
             // independent NEE pdfs, required for replayable shifts).
             if (lightTree.LightCount() > 0)
             {
+                GL_CALL(glPushDebugGroup(GL_DEBUG_SOURCE_APPLICATION, 100u, -1, "restir lightsel"));
                 m_bdptLightSelShader.Use();
                 m_bdptLightSelShader.Dispatch((lightTree.LightCount() + 63u) / 64u, 1u, 1u);
                 GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));
+                GL_CALL(glPopDebugGroup());
             }
 
             // Deterministic V-buffer for this frame's camera (before the
             // light pass - it anchors the t<=1 V-buffer rejection test).
+            rtBegin(0, "restir gbuffer");
             m_restirGbufferShader.Use();
             m_restirGbufferShader.Dispatch(groupsX, groupsY, 1u);
+            rtEnd();
             GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));
 
             bool lightTracing = settings.restirLightTracing && lightTree.LightCount() > 0;
+            bool connections = settings.restirConnections && lightTree.LightCount() > 0;
             auto clearLrmHeads = [&]()
             {
                 // Reset the LRM: allocator = 0, per-pixel heads = empty.
@@ -265,23 +304,36 @@ namespace RoyalGL
                                                   GL_RED_INTEGER, GL_UNSIGNED_INT, &sentinel));
             };
 
-            if (lightTracing)
+            if (lightTracing || connections)
             {
-                // Trace N_L light subpaths binning t=1 candidates per pixel.
+                // Trace N_L light subpaths: t=1 candidates binned per pixel
+                // (if light tracing) and connectable vertices appended to
+                // the compacted LVC (if s>=2 connections; allocator in
+                // lightVertCount[0]).
                 clearLrmHeads();
+                const uint32_t zero = 0u;
+                GL_CALL(glClearNamedBufferSubData(m_lightVertCountBuffer.Id(), GL_R32UI, 0,
+                                                  sizeof(uint32_t), GL_RED_INTEGER,
+                                                  GL_UNSIGNED_INT, &zero));
+                rtBegin(1, "restir light + LRM");
                 m_restirLightShader.Use();
                 m_restirLightShader.Dispatch((m_numLightPaths + 63u) / 64u, 1u, 1u);
+                rtEnd();
                 GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));
             }
 
+            rtBegin(2, "restir camera RIS");
             m_restirCameraShader.Use();
             m_restirCameraShader.Dispatch(groupsX, groupsY, 1u);
+            rtEnd();
             GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));
 
             if (settings.restirTemporal)
             {
+                rtBegin(3, "restir temporal");
                 m_restirTemporalShader.Use();
                 m_restirTemporalShader.Dispatch(groupsX, groupsY, 1u);
+                rtEnd();
                 GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));
             }
             if (settings.restirTemporal && lightTracing)
@@ -292,22 +344,30 @@ namespace RoyalGL
                 // the camera pass has consumed the light entries), then
                 // merge per pixel with proxy confidence.
                 clearLrmHeads();
+                rtBegin(4, "restir caustic shift");
                 m_restirCausticShiftShader.Use();
                 m_restirCausticShiftShader.Dispatch(groupsX, groupsY, 1u);
+                rtEnd();
                 GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));
+                rtBegin(5, "restir caustic merge");
                 m_restirCausticMergeShader.Use();
                 m_restirCausticMergeShader.Dispatch(groupsX, groupsY, 1u);
+                rtEnd();
                 GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));
             }
             if (settings.restirSpatial)
             {
+                rtBegin(6, "restir spatial");
                 m_restirSpatialShader.Use();
                 m_restirSpatialShader.Dispatch(groupsX, groupsY, 1u);
+                rtEnd();
                 GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));
             }
 
+            rtBegin(7, "restir resolve");
             m_restirResolveShader.Use();
             m_restirResolveShader.Dispatch(groupsX, groupsY, 1u);
+            rtEnd();
             m_sampleCount++;
         }
 
@@ -448,17 +508,32 @@ namespace RoyalGL
         if (m_timersEnabled)
         {
             // Read the previous frame's queries (results are ready by now).
+            static const char* kPassNames[kTimerSlots] = {
+                "tile/gbuffer", "light", "camera", "temporal",
+                "caustic-shift", "caustic-merge", "spatial", "resolve"};
             if (m_timerFrame > 0)
             {
                 int prev = 1 - q;
-                GLuint64 ns = 0;
-                glGetQueryObjectui64v(m_timerQueries[prev][0], GL_QUERY_RESULT, &ns);
-                m_passMsSum[0] += static_cast<double>(ns) * 1e-6;
+                for (int slot = 0; slot < kTimerSlots; ++slot)
+                {
+                    if ((m_timerMask[prev] & (1u << slot)) == 0) continue;
+                    GLuint64 ns = 0;
+                    glGetQueryObjectui64v(m_timerQueries[prev][slot], GL_QUERY_RESULT, &ns);
+                    m_passMsSum[slot] += static_cast<double>(ns) * 1e-6;
+                }
                 m_passMsCount++;
                 if (m_passMsCount == 128)
                 {
-                    ROYALGL_LOG_INFO("GPU tile time (avg over 128 frames): ", m_passMsSum[0] / 128.0, "ms");
-                    m_passMsSum[0] = m_passMsSum[1] = m_passMsSum[2] = 0.0;
+                    double total = 0.0;
+                    for (int slot = 0; slot < kTimerSlots; ++slot)
+                    {
+                        if (m_passMsSum[slot] <= 0.0) continue;
+                        total += m_passMsSum[slot];
+                        ROYALGL_LOG_INFO("GPU pass ", kPassNames[slot], " (avg over 128 frames): ",
+                                         m_passMsSum[slot] / 128.0, "ms");
+                        m_passMsSum[slot] = 0.0;
+                    }
+                    ROYALGL_LOG_INFO("GPU passes total: ", total / 128.0, "ms");
                     m_passMsCount = 0;
                 }
             }

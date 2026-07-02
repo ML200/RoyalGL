@@ -100,14 +100,18 @@ namespace RoyalGL
 
         void EnsureRestirBuffers();
 
-        // GL_TIME_ELAPSED queries per pass (0=unidir/light, 1=eye,
-        // 2=resolve), double-buffered so reading back the previous frame's
-        // results never stalls. Enabled via ROYALGL_STATS=1; averages are
-        // logged every 128 frames.
+        // GL_TIME_ELAPSED queries per pass, double-buffered so reading back
+        // the previous frame's results never stalls. Enabled via
+        // ROYALGL_STATS=1; averages are logged every 128 frames. Slot 0 is
+        // the tiled classic path's single timer; ReSTIR mode times its full
+        // pass graph (slots = kRestirPassNames order, mask tracks which
+        // slots ran that frame).
+        static constexpr int kTimerSlots = 8;
         bool m_timersEnabled = false;
-        unsigned int m_timerQueries[2][3] = {};
+        unsigned int m_timerQueries[2][kTimerSlots] = {};
+        unsigned int m_timerMask[2] = {};
         int m_timerFrame = 0;
-        double m_passMsSum[3] = {};
+        double m_passMsSum[kTimerSlots] = {};
         int m_passMsCount = 0;
 
         // Tiled dispatch: each Render() call submits only a slice of the

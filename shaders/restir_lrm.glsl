@@ -30,14 +30,14 @@ struct LrmEntry
                  // w = extra payload: unused for light-pass entries, history
                  // confidence (float bits) for caustic re-bin entries
 };
-layout(std430, binding = 13) buffer LrmEntriesSSBO { LrmEntry lrmEntries[]; };
+layout(std430, binding = 13) restrict buffer LrmEntriesSSBO { LrmEntry lrmEntries[]; };
 
 // [0] = entry allocator, [1 + pixelIndex] = list head. Cleared by
 // PathTracer.cpp (allocator to 0, heads to LRM_SENTINEL) before each
 // restir_light dispatch, and again before restir_caustic_shift.comp, which
 // reuses the same structure to re-bin shifted caustic history reservoirs
 // (safe: restir_camera.comp has consumed the light-pass entries by then).
-layout(std430, binding = 14) buffer LrmHeadsSSBO { uint lrmHeads[]; };
+layout(std430, binding = 14) restrict buffer LrmHeadsSSBO { uint lrmHeads[]; };
 
 const uint LRM_SENTINEL = 0xFFFFFFFFu;
 

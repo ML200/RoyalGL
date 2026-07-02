@@ -355,6 +355,14 @@ bool IntersectTriangleAny(Ray ray, Triangle tri, float tMax)
     return t > 1e-4 && t < tMax;
 }
 
+// Traversal stack depth. tinybvh's SAH BVH2 stays well under this for our
+// scene sizes (tens of thousands of triangles => depth ~2*log2(N) < 32);
+// overflowing entries are dropped (missed geometry), so bump it if scenes
+// grow into the millions of triangles. Kept small deliberately: the stack
+// lives in per-thread local memory and its footprint is hot cache traffic
+// in every ray cast.
+#define BVH_STACK_SIZE 32
+
 // Iterative, stack-based traversal of the tinybvh "Wald" BVH2. Root is
 // always node 0 (tinybvh guarantee). Internal nodes store their left child
 // index in `leftFirst`; the right child is always `leftFirst + 1`. Leaf
@@ -365,7 +373,7 @@ bool IntersectScene(Ray ray, out Hit hit)
     hit.t = RAY_TMAX;
     hit.materialIndex = NO_MATERIAL;
 
-    int stack[64];
+    int stack[BVH_STACK_SIZE];
     int stackPtr = 0;
     int nodeIdx = 0;
 
@@ -405,7 +413,7 @@ bool IntersectScene(Ray ray, out Hit hit)
         else
         {
             nodeIdx = left;
-            if (tRight < RAY_TMAX && stackPtr < 64) stack[stackPtr++] = right;
+            if (tRight < RAY_TMAX && stackPtr < BVH_STACK_SIZE) stack[stackPtr++] = right;
         }
     }
 
@@ -417,7 +425,7 @@ bool IntersectScene(Ray ray, out Hit hit)
 // front-to-back child ordering - any intersection ends the query.
 bool IntersectSceneOccluded(Ray ray, float tMax)
 {
-    int stack[64];
+    int stack[BVH_STACK_SIZE];
     int stackPtr = 0;
     int nodeIdx = 0;
 
@@ -444,7 +452,7 @@ bool IntersectSceneOccluded(Ray ray, float tMax)
         }
 
         nodeIdx = int(node.leftFirst);
-        if (stackPtr < 64) stack[stackPtr++] = nodeIdx + 1;
+        if (stackPtr < BVH_STACK_SIZE) stack[stackPtr++] = nodeIdx + 1;
     }
 
     return false;

@@ -37,6 +37,11 @@ namespace RoyalGL
         // buffers whose current/previous roles swap every frame).
         void BindBase(GLuint bindingPoint) const;
 
+        // KHR_debug object label: names this buffer in Nsight/RenderDoc
+        // captures. The GL id is stable for the object's lifetime, so once
+        // is enough.
+        void SetLabel(const char* name) const;
+
         GLuint Id() const { return m_id; }
         size_t SizeBytes() const { return m_sizeBytes; }
         bool IsValid() const { return m_id != 0; }

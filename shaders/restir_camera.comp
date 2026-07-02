@@ -5,21 +5,32 @@
 #include "restir_common.glsl"
 #include "restir_lrm.glsl"
 
-// ReSTIR pass: initial candidate generation + streaming RIS (paper Alg. 2,
-// Phase 2 technique set {s=0, s=1, t=1} - "lightweight BDPT"). One camera
-// subpath per pixel, anchored at the G-buffer primary hit (pixel center, no
-// jitter). At every vertex the camera-side techniques produce candidates:
-//   s=0 - the subpath hits an emitter (or the environment) via BSDF sampling,
-//   s=1 - next event estimation toward the camera-anchored light CDF,
-// each carrying its balance-heuristic MIS weight omega_tau over the full
-// technique set (the t=1 competitor enters through the dT1 accumulator, see
-// below). Candidates are streamed into the pixel's reservoir with
+// ReSTIR pass: initial candidate generation + streaming RIS (paper Alg. 2;
+// with Phase 4 the full BDPT technique set). One camera subpath per pixel,
+// anchored at the G-buffer primary hit (pixel center, no jitter). At every
+// vertex the camera-side techniques produce candidates:
+//   s=0  - the subpath hits an emitter (or the environment) via BSDF sampling,
+//   s=1  - next event estimation toward the camera-anchored light CDF,
+//   s>=2 - one uniform pick from the compacted global LVC (p_L = N_L/|LVC|),
+//          connected to the current vertex (vertex connection),
+// each carrying its balance-heuristic MIS weight omega_tau over the ACTIVE
+// technique set. With vertex connections enabled the weights come from the
+// full classic dVCM/dVC recursion (bdpt_common.glsl, identical to
+// bdpt_eye.comp); with connections off the lightweight dT1 restriction of
+// Phase 2 applies (t=1 only competitor). Candidates are streamed into the
+// pixel's reservoir with
 //   w = m * pHat * (1/p) = omega * lum(f) / p        (m = 1, Eq. 26 t>=2)
 // and the winner keeps the data every shift needs: the replay seed, the
 // reconnection vertex x_r (first vertex whose predecessor pair is
 // connectable), the suffix radiance L_suf leaving x_r (direction-independent
-// for Lambertian/one-sided-emitter x_r), and the replayed-scatter pdf
-// product for Jacobians.
+// for Lambertian/one-sided-emitter x_r - for s>=2 paths it transparently
+// covers the connection edge and light subpath, which the shift never
+// moves), and the replayed-scatter pdf product for Jacobians. s>=2 winners
+// WITHOUT a camera-side reconnection pair instead cache the light subpath
+// end y_{s-1} (lyPosMat/lyNormal/lyTput) and flag RESTIR_FLAG_LIGHTRC: the
+// shift replays the whole camera prefix and re-evaluates the connection
+// edge (pure f change - y's position is parametrized on the light side, so
+// the edge contributes no Jacobian).
 //
 // After the camera subpath, this pixel's LRM entries (t=1 candidates from
 // restir_light.comp, already weighted with m = 1/N_L) are merged: caustic
@@ -42,6 +53,15 @@
 // in every ratio. All measures are solid-angle at each vertex.
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// OCCUPANCY: the RIS-selected candidate lives IN the output buffer slot,
+// written field-wise whenever a candidate wins, instead of a ~40-register
+// whole-struct local that would stay live across the entire path trace.
+// Winners only overwrite the fields their technique reads back (guarded by
+// the tech flags), so unrelated fields may hold stale data from an earlier
+// winner - harmless by construction, but don't "clean up" by zeroing them:
+// that would reintroduce the register/bandwidth cost.
+#define SEL pixelRes[outSlot].path
 
 vec3 SafeDiv(vec3 num, vec3 den)
 {
@@ -78,9 +98,9 @@ void main()
     uint risRng = WangHash(camSeed ^ 0x5f356495u);
     if (risRng == 0u) risRng = 0x9E3779B9u;
 
-    // Streaming RIS state (selected candidate kept in registers).
+    // Streaming RIS state (selected candidate lives in the output slot).
     float wSum = 0.0;
-    PathReservoir sel = RestirEmptyReservoir();
+    SEL = RestirEmptyReservoir();
 
     // ------------------------------------------------------ path state ----
     Ray primary = RestirPrimaryRay(pixel);
@@ -95,24 +115,31 @@ void main()
     uint deltaMask = 0u;
     bool haveLights = uFrame.lightInfo.x > 0u;
     bool lightTracing = RestirLightTracingEnabled() && haveLights;
+    bool connections = RestirConnectionsEnabled() && haveLights;
     uint maxLen = BdptMaxPathLength();
     float numLightPaths = float(BdptNumLightPaths());
+    uint lvcCount = connections
+        ? min(lightVertCount[0], BdptNumLightPaths() * BDPT_MAX_LIGHT_VERTS) : 0u;
 
-    // Eye-side t=1 MIS competitor (see header). Seeded like bdpt_eye.comp's
-    // dVCM_1 from the deterministic pixel-center camera pdf.
-    float dT1 = 0.0;
-    if (lightTracing)
+    // Eye-side MIS accumulators: dVCM/dVC is the full classic recursion
+    // (bdpt_eye.comp), dT1 the lightweight t=1-only restriction (Phase 2).
+    // Their shared seed is the t=1 pdf ratio at x_1 (dVCM_1) from the
+    // deterministic pixel-center camera pdf - zero when light tracing is
+    // off, which removes exactly the t=1 terms from every weight.
+    float dT1 = 0.0, dVCM = 0.0, dVC = 0.0;
+    if (lightTracing || connections)
     {
         vec3 v = x - uFrame.camPos.xyz;
         float d2v = dot(v, v);
         float cosAtCam = dot(v * inversesqrt(max(d2v, 1e-12)), uFrame.camForward.xyz);
         float cosIn1 = abs(dot(n, wi));
-        if (cosAtCam > 1e-3 && cosIn1 > 1e-6)
+        if (cosAtCam > 1e-3 && cosIn1 > 1e-6 && lightTracing)
         {
             float ipd = BdptImagePlaneDist();
             float imagePointToCamDist = ipd / cosAtCam;
             float cameraPdfW = (imagePointToCamDist * imagePointToCamDist) / cosAtCam;
             dT1 = (numLightPaths / cameraPdfW) * (d2v / cosIn1);
+            dVCM = dT1;
         }
     }
 
@@ -121,6 +148,14 @@ void main()
     // "previous vertex was delta or this is the primary hit".
     float lastEdgePdfW = 0.0;
     float lastEdgeDist2 = 0.0;
+
+    // Affine MIS suffix cache (Phase 5, see restir_common.glsl): once the
+    // reconnection vertex is found, dVC at any later vertex decomposes as
+    // dVC_i = misK1 + misK2 * (dVCM_r + pRev_r * dVC_r) - the recursion is
+    // affine and all suffix pdfs are fixed. The lightweight dT1 shares the
+    // multiplicative chain: dT1_i = misK2 * pRev_r * dT1_r (no additions).
+    float misK1 = 0.0;
+    float misK2 = 0.0;
 
     // Reconnection bookkeeping: r = first vertex index >= 2 whose
     // predecessor pair (x_{r-1}, x_r) is both-connectable.
@@ -171,18 +206,20 @@ void main()
             if (cosHit > 1e-6)
             {
                 float omega = 1.0;
-                if (pathLen > 1u && lightIdx != LT_SENTINEL)
+                float directPdfA = 0.0, emissionPdfW = 0.0;
+                bool hasCompetitors = pathLen > 1u && lightIdx != LT_SENTINEL;
+                if (hasCompetitors)
                 {
-                    // Balance heuristic over the technique set: s=1 (eval
-                    // NEE pdf converted to solid angle at x_{k-1}; only
-                    // exists when x_{k-1} is connectable, i.e. lastEdgePdfW
-                    // > 0) and t=1 (emission pdf times the dT1 ratio, which
-                    // survives delta chains just like the classic dVC).
-                    float directPdfA, emissionPdfW;
-                    BdptLightPdfs(lightIdx, cosHit, directPdfA, emissionPdfW);
-                    float ratioSum = 1.0 + emissionPdfW * dT1;
-                    if (lastEdgePdfW > 0.0)
-                        ratioSum += (directPdfA * lastEdgeDist2 / cosHit) / lastEdgePdfW;
+                    // Balance heuristic over the ACTIVE technique set:
+                    // full BDPT (classic dVCM/dVC, as bdpt_eye.comp) with
+                    // connections on; else the Phase 2 restriction - s=1
+                    // (eval NEE pdf in solid angle at x_{k-1}; only exists
+                    // when x_{k-1} is connectable) and t=1 (emission pdf
+                    // times the dT1 ratio, which survives delta chains).
+                    // The s=1 ratio is directPdfA * dVCM in both sets.
+                    RestirLightPdfs(lightIdx, cosHit, directPdfA, emissionPdfW);
+                    float ratioSum = 1.0 + directPdfA * dVCM
+                                   + emissionPdfW * (connections ? dVC : dT1);
                     omega = 1.0 / ratioSum;
                 }
 
@@ -190,31 +227,45 @@ void main()
                 float w = omega * RestirLum(fCand) / pProd;
                 if (w > 0.0 && !isnan(w) && !isinf(w))
                 {
-                    PathReservoir cand = RestirEmptyReservoir();
-                    // A directly visible emitter (pathLen==1) or a delta
-                    // predecessor chain leaves rc invalid (pure replay);
-                    // otherwise the first connectable pair found so far is
-                    // the reconnection vertex (possibly this emitter itself).
-                    uint flags = (rcFound ? RESTIR_FLAG_RCVALID : 0u) | (deltaMask << 8);
-                    if (rcFound) flags |= (rcIdx & 0xFu) << 4;
-                    cand.core.w = uintBitsToFloat(RestirPackTech(0u, pathLen + 1u, flags));
-                    cand.fSeed = vec4(fCand, uintBitsToFloat(camSeed));
-                    cand.core.y = omega * RestirLum(fCand);
-                    if (rcFound)
-                    {
-                        cand.rcInfo = vec4(rcBaseCos, rcBaseDist2, omega, replayPdfBase);
-                        cand.rcPosMat = vec4(rcPos, uintBitsToFloat(rcMat));
-                        cand.rcNormal = vec4(rcNrm, 0.0);
-                        cand.rcLsuf = vec4(SafeDiv(fCand, fArriveRc), 0.0);
-                    }
-                    else
-                    {
-                        // Pure replay: all sampled scatters are replayed.
-                        cand.rcInfo = vec4(0.0, 0.0, omega, pProd);
-                    }
-
                     wSum += w;
-                    if (RestirRand(risRng) * wSum <= w) sel = cand;
+                    if (RestirRand(risRng) * wSum <= w)
+                    {
+                        // A directly visible emitter (pathLen==1) or a delta
+                        // predecessor chain leaves rc invalid (pure replay);
+                        // otherwise the first connectable pair found so far
+                        // is the reconnection vertex (possibly this emitter).
+                        uint flags = (rcFound ? RESTIR_FLAG_RCVALID : 0u) | (deltaMask << 8);
+                        if (rcFound) flags |= (rcIdx & 0xFu) << 4;
+                        SEL.core.w = uintBitsToFloat(RestirPackTech(0u, pathLen + 1u, flags));
+                        SEL.core.y = omega * RestirLum(fCand);
+                        SEL.fSeed = vec4(fCand, uintBitsToFloat(camSeed));
+                        if (rcFound)
+                        {
+                            SEL.rcInfo = vec4(rcBaseCos, rcBaseDist2, omega, replayPdfBase);
+                            SEL.rcPosMat = vec4(rcPos, uintBitsToFloat(rcMat));
+                            SEL.rcNormal = vec4(rcNrm, 0.0);
+                            SEL.rcLsuf = vec4(SafeDiv(fCand, fArriveRc), 0.0);
+                            // MIS cache (restir_common.glsl): no competitors
+                            // -> constant denominator 1; rc at the emitter
+                            // itself -> terminal-special; else fold the
+                            // fixed suffix.
+                            if (!hasCompetitors)
+                                SEL.misCache = vec4(1.0, 0.0, 0.0, 0.0);
+                            else if (rcIdx == pathLen)
+                                SEL.misCache = vec4(1.0, directPdfA, emissionPdfW, 0.0);
+                            else
+                                SEL.misCache = vec4(
+                                    1.0 + directPdfA * dVCM
+                                        + emissionPdfW * (connections ? misK1 : 0.0),
+                                    emissionPdfW * misK2, 0.0, 0.0);
+                        }
+                        else
+                        {
+                            // Pure replay: all sampled scatters are replayed
+                            // (omega recomputed during replay, no cache).
+                            SEL.rcInfo = vec4(0.0, 0.0, omega, pProd);
+                        }
+                    }
                 }
             }
             break; // paths terminate on emitters
@@ -242,7 +293,7 @@ void main()
                 float invArea = 1.0 / max(lt.normalArea.w, 1e-10);
                 float directPdfWTrue = pickPdfTrue * invArea * dist2 / cosAtLight;
                 float directPdfA, emissionPdfW;
-                BdptLightPdfs(lightIdx, cosAtLight, directPdfA, emissionPdfW);
+                RestirLightPdfs(lightIdx, cosAtLight, directPdfA, emissionPdfW);
                 float directPdfW = directPdfA * dist2 / cosAtLight;
 
                 float bsdfDirPdfW, bsdfRevPdfW, cosToLight;
@@ -251,16 +302,19 @@ void main()
                 if (fb != vec3(0.0) && directPdfW > 1e-20 && directPdfWTrue > 1e-20)
                 {
                     // Balance heuristic: s=0 (BSDF-samples the light point)
-                    // and t=1. The t=1 ratio is the classic wCamera term of
-                    // bdpt_eye.comp restricted to the light-tracing split:
-                    // at x_1 the "connection at x_1" ratio IS t=1 (dVCM_1 =
-                    // dT1 seed, no reverse-pdf factor); deeper vertices
-                    // carry it through the scatter's reverse pdf.
-                    float wT1 = 0.0;
-                    if (lightTracing)
-                        wT1 = (emissionPdfW * cosToLight / (directPdfW * cosAtLight))
-                            * (pathLen == 1u ? dT1 : bsdfRevPdfW * dT1);
-                    float omega = directPdfW / (directPdfW + bsdfDirPdfW + directPdfW * wT1);
+                    // plus the strategies closer to the camera - the full
+                    // classic wCamera (bdpt_eye.comp) with connections on,
+                    // else the t=1-only restriction: at x_1 the "connection
+                    // at x_1" ratio IS t=1 (dVCM_1 = dT1 seed, no
+                    // reverse-pdf factor); deeper vertices carry it through
+                    // the scatter's reverse pdf.
+                    float wCam = 0.0;
+                    float prefactor = emissionPdfW * cosToLight / (directPdfW * cosAtLight);
+                    if (connections)
+                        wCam = prefactor * (dVCM + bsdfRevPdfW * dVC);
+                    else if (lightTracing)
+                        wCam = prefactor * (pathLen == 1u ? dT1 : bsdfRevPdfW * dT1);
+                    float omega = directPdfW / (directPdfW + bsdfDirPdfW + directPdfW * wCam);
                     vec3 fCand = fCur * fb * cosToLight * lt.emissionWeight.rgb;
                     float pCand = pProd * directPdfWTrue;
                     float w = omega * RestirLum(fCand) / pCand;
@@ -271,32 +325,157 @@ void main()
                         Ray shadowRay = MakeRay(x + nf * 1e-4, L);
                         if (!IntersectSceneOccluded(shadowRay, dist * 0.999))
                         {
-                            PathReservoir cand = RestirEmptyReservoir();
-                            // Reconnection: existing rc pair if found, else
-                            // the pair (x_j, y0) - x_j is non-delta here and
-                            // the light point is always connectable.
-                            uint flags = RESTIR_FLAG_RCVALID | (deltaMask << 8);
-                            uint r = rcFound ? rcIdx : pathLen + 1u;
-                            flags |= (r & 0xFu) << 4;
-                            cand.fSeed = vec4(fCand, uintBitsToFloat(camSeed));
-                            cand.core.y = omega * RestirLum(fCand);
-                            cand.core.w = uintBitsToFloat(RestirPackTech(1u, pathLen + 1u, flags));
-                            if (rcFound)
-                            {
-                                cand.rcInfo = vec4(rcBaseCos, rcBaseDist2, omega, replayPdfBase);
-                                cand.rcPosMat = vec4(rcPos, uintBitsToFloat(rcMat));
-                                cand.rcNormal = vec4(rcNrm, 0.0);
-                                cand.rcLsuf = vec4(SafeDiv(fCand, fArriveRc), 0.0);
-                            }
-                            else
-                            {
-                                cand.rcInfo = vec4(cosAtLight, dist2, omega, pProd);
-                                cand.rcPosMat = vec4(lightPos, uintBitsToFloat(NO_MATERIAL));
-                                cand.rcNormal = vec4(lt.normalArea.xyz, 0.0); // emitting side
-                                cand.rcLsuf = vec4(lt.emissionWeight.rgb, 0.0);
-                            }
                             wSum += w;
-                            if (RestirRand(risRng) * wSum <= w) sel = cand;
+                            if (RestirRand(risRng) * wSum <= w)
+                            {
+                                // Reconnection: existing rc pair if found,
+                                // else the pair (x_j, y0) - x_j is non-delta
+                                // here and the light point is always
+                                // connectable.
+                                uint flags = RESTIR_FLAG_RCVALID | (deltaMask << 8);
+                                uint r = rcFound ? rcIdx : pathLen + 1u;
+                                flags |= (r & 0xFu) << 4;
+                                SEL.fSeed = vec4(fCand, uintBitsToFloat(camSeed));
+                                SEL.core.y = omega * RestirLum(fCand);
+                                SEL.core.w = uintBitsToFloat(RestirPackTech(1u, pathLen + 1u, flags));
+                                if (rcFound)
+                                {
+                                    SEL.rcInfo = vec4(rcBaseCos, rcBaseDist2, omega, replayPdfBase);
+                                    SEL.rcPosMat = vec4(rcPos, uintBitsToFloat(rcMat));
+                                    SEL.rcNormal = vec4(rcNrm, 0.0);
+                                    SEL.rcLsuf = vec4(SafeDiv(fCand, fArriveRc), 0.0);
+                                    // MIS cache: split at the NEE vertex
+                                    // itself (rc == x_b) or fold the suffix.
+                                    if (rcIdx == pathLen)
+                                        SEL.misCache = vec4(
+                                            1.0 + bsdfDirPdfW / directPdfW, prefactor, 0.0, 0.0);
+                                    else
+                                        SEL.misCache = vec4(
+                                            1.0 + bsdfDirPdfW / directPdfW
+                                                + (connections
+                                                       ? prefactor * (dVCM + bsdfRevPdfW * misK1)
+                                                       : 0.0),
+                                            prefactor * bsdfRevPdfW * misK2, 0.0, 0.0);
+                                }
+                                else
+                                {
+                                    SEL.rcInfo = vec4(cosAtLight, dist2, omega, pProd);
+                                    SEL.rcPosMat = vec4(lightPos, uintBitsToFloat(NO_MATERIAL));
+                                    SEL.rcNormal = vec4(lt.normalArea.xyz, 0.0); // emitting side
+                                    SEL.rcLsuf = vec4(lt.emissionWeight.rgb, 0.0);
+                                    // Light-point rc: the shift recomputes
+                                    // the whole split-vertex weight; cache
+                                    // the fixed eval pdfs of the light point.
+                                    SEL.misCache = vec4(0.0, directPdfA, emissionPdfW, 0.0);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ------------------------------------------------------ s >= 2 ----
+        // One uniform pick from the compacted global LVC (paper Alg. 2):
+        // the candidate's sampling pdf carries p_L = N_L/|LVC| - a single
+        // pick per eye vertex subsamples both the light subpath AND the
+        // technique index s, which is unbiased and leaves the per-technique
+        // MIS weights unchanged (same argument as bdpt_eye.comp's nValid
+        // subsampling). fCand uses the LVC's stored NUMERATOR fLightNum and
+        // its pdf pLight separately, so pHat stays the true target.
+        if (!isDelta && connections && lvcCount > 0u)
+        {
+            RngStream(pathLen, RNG_CONNECT);
+            uint k = min(uint(RandomFloat() * float(lvcCount)), lvcCount - 1u);
+            LightVertex lv = lightVerts[k];
+            uint lvBits = floatBitsToUint(lv.tputMat.w);
+            uint lightLen = lvBits & 0xFFu; // light subpath segments (y_0..y_{s-1})
+            uint lightMat = lvBits >> 8;
+            float pLight = lv.wiLen.w;
+
+            if (pathLen + 1u + lightLen <= maxLen && pLight > 0.0)
+            {
+                vec3 toL = lv.posDvcm.xyz - x;
+                float dist2c = dot(toL, toL);
+                float dist = sqrt(max(dist2c, 1e-12));
+                vec3 dirCtoL = toL / dist;
+
+                float camDirPdfW, camRevPdfW, cosCamera;
+                vec3 fCam = EvalBsdf(mat, n, wi, dirCtoL, camDirPdfW, camRevPdfW, cosCamera);
+                Material lmat = materials[lightMat];
+                float lightDirPdfW, lightRevPdfW, cosLightV;
+                vec3 fLight = EvalBsdf(lmat, lv.normalDvc.xyz, lv.wiLen.xyz, -dirCtoL,
+                                       lightDirPdfW, lightRevPdfW, cosLightV);
+
+                if (dist2c > 1e-12 && fCam != vec3(0.0) && fLight != vec3(0.0))
+                {
+                    float geometryTerm = cosCamera * cosLightV / dist2c;
+                    float camDirPdfA = camDirPdfW * cosLightV / dist2c;
+                    float lightDirPdfA = lightDirPdfW * cosCamera / dist2c;
+                    float wLight = camDirPdfA * (lv.posDvcm.w + lv.normalDvc.w * lightRevPdfW);
+                    float wCamera = lightDirPdfA * (dVCM + dVC * camRevPdfW);
+                    float omega = 1.0 / (wLight + 1.0 + wCamera);
+
+                    vec3 fCand = fCur * fCam * geometryTerm * fLight * lv.tputMat.xyz;
+                    float pCand = pProd * pLight * (numLightPaths / float(lvcCount));
+                    float w = omega * RestirLum(fCand) / pCand;
+
+                    if (w > 0.0 && !isnan(w) && !isinf(w))
+                    {
+                        vec3 nf2 = (dot(n, dirCtoL) >= 0.0) ? n : -n;
+                        Ray shadowRay = MakeRay(x + nf2 * 1e-4, dirCtoL);
+                        if (!IntersectSceneOccluded(shadowRay, dist * 0.999))
+                        {
+                            wSum += w;
+                            if (RestirRand(risRng) * wSum <= w)
+                            {
+                                uint flags = deltaMask << 8;
+                                SEL.fSeed = vec4(fCand, uintBitsToFloat(camSeed));
+                                SEL.core.y = omega * RestirLum(fCand);
+                                if (rcFound)
+                                {
+                                    // Interior camera-side reconnection:
+                                    // L_suf covers everything from x_r on,
+                                    // including the connection edge and
+                                    // light subpath.
+                                    flags |= RESTIR_FLAG_RCVALID | ((rcIdx & 0xFu) << 4);
+                                    SEL.rcInfo = vec4(rcBaseCos, rcBaseDist2, omega, replayPdfBase);
+                                    SEL.rcPosMat = vec4(rcPos, uintBitsToFloat(rcMat));
+                                    SEL.rcNormal = vec4(rcNrm, 0.0);
+                                    SEL.rcLsuf = vec4(SafeDiv(fCand, fArriveRc), 0.0);
+                                    // MIS cache: split at the connection
+                                    // vertex (rc == z_{t-1}) or fold the
+                                    // fixed suffix.
+                                    if (rcIdx == pathLen)
+                                        SEL.misCache = vec4(wLight + 1.0, lightDirPdfA, 0.0, 0.0);
+                                    else
+                                        SEL.misCache = vec4(
+                                            wLight + 1.0
+                                                + lightDirPdfA * (dVCM + camRevPdfW * misK1),
+                                            lightDirPdfA * camRevPdfW * misK2, 0.0, 0.0);
+                                }
+                                else
+                                {
+                                    // No connectable camera pair: the shift
+                                    // replays the whole prefix and
+                                    // re-evaluates the connection edge to
+                                    // the cached y_{s-1}.
+                                    flags |= RESTIR_FLAG_LIGHTRC;
+                                    SEL.rcInfo = vec4(0.0, 0.0, omega, pProd);
+                                    vec3 nly = (dot(lv.normalDvc.xyz, lv.wiLen.xyz) >= 0.0)
+                                                   ? lv.normalDvc.xyz : -lv.normalDvc.xyz;
+                                    SEL.lyPosMat = vec4(lv.posDvcm.xyz, 0.0);
+                                    SEL.lyNormal = vec4(nly, 0.0);
+                                    SEL.lyTput = vec4(fLight * lv.tputMat.xyz, 0.0);
+                                    // MIS cache: the light side's fixed
+                                    // ratio sum (wLight = camDirPdfA'*this).
+                                    SEL.misCache = vec4(
+                                        lv.posDvcm.w + lv.normalDvc.w * lightRevPdfW,
+                                        0.0, 0.0, 0.0);
+                                }
+                                SEL.core.w = uintBitsToFloat(
+                                    RestirPackTech(lightLen + 1u, pathLen + 1u, flags));
+                            }
                         }
                     }
                 }
@@ -315,14 +494,45 @@ void main()
         pProd *= pdfStep;
         prevConnectable = !isDelta;
 
-        // dT1 recursion (see header): a delta x_1 kills the t=1 term, delta
+        // MIS recursions: dVCM/dVC classic (bdpt_eye.comp), dT1 the
+        // t=1-only restriction - a delta x_1 kills its term, delta
         // interiors scale by cosOut (their forward/reverse delta pdfs
         // cancel), and only the first scatter enters without a reverse-pdf
-        // factor (the t=1 connection at x_1 is deterministic).
+        // factor (the t=1 connection at x_1 is deterministic). The affine
+        // suffix cache (misK1/misK2) starts at the scatter FROM x_r - that
+        // scatter's (dVCM_r + pRev_r * dVC_r) is the shift-dependent state
+        // the cache is affine in. Everything consumes the OLD dVCM; dVCM
+        // updates last.
+        if (rcFound)
+        {
+            if (pathLen == rcIdx)
+            {
+                misK1 = 0.0;
+                misK2 = bs.specular ? 0.0 : bs.cosOut / bs.pdfDir; // x_r is never delta
+            }
+            else if (bs.specular)
+            {
+                misK1 *= bs.cosOut;
+                misK2 *= bs.cosOut;
+            }
+            else
+            {
+                misK1 = (bs.cosOut / bs.pdfDir) * (dVCM + bs.pdfRev * misK1);
+                misK2 = (bs.cosOut / bs.pdfDir) * (bs.pdfRev * misK2);
+            }
+        }
         if (bs.specular)
+        {
+            dVC *= bs.cosOut;
             dT1 = (pathLen == 1u) ? 0.0 : dT1 * bs.cosOut;
+            dVCM = 0.0;
+        }
         else
+        {
+            dVC = (bs.cosOut / bs.pdfDir) * (dVCM + bs.pdfRev * dVC);
             dT1 = (bs.cosOut / bs.pdfDir) * (pathLen == 1u ? dT1 : dT1 * bs.pdfRev);
+            dVCM = 1.0 / bs.pdfDir;
+        }
 
         vec3 offN = (dot(bs.dir, n) >= 0.0) ? n : -n;
         Ray ray = MakeRay(x + offN * 1e-4, bs.dir);
@@ -335,26 +545,28 @@ void main()
             float w = RestirLum(fCand) / pProd;
             if (w > 0.0 && !isnan(w) && !isinf(w))
             {
-                PathReservoir cand = RestirEmptyReservoir();
-                uint flags = (rcFound ? RESTIR_FLAG_RCVALID : RESTIR_FLAG_ENVEND) | (deltaMask << 8);
-                if (rcFound) flags |= (rcIdx & 0xFu) << 4;
-                // env pseudo-vertex index = pathLen+1 -> t = pathLen+2.
-                cand.core.w = uintBitsToFloat(RestirPackTech(0u, pathLen + 2u, flags));
-                cand.fSeed = vec4(fCand, uintBitsToFloat(camSeed));
-                cand.core.y = RestirLum(fCand);
-                if (rcFound)
-                {
-                    cand.rcInfo = vec4(rcBaseCos, rcBaseDist2, 1.0, replayPdfBase);
-                    cand.rcPosMat = vec4(rcPos, uintBitsToFloat(rcMat));
-                    cand.rcNormal = vec4(rcNrm, 0.0);
-                    cand.rcLsuf = vec4(SafeDiv(fCand, fArriveRc), 0.0);
-                }
-                else
-                {
-                    cand.rcInfo = vec4(0.0, 0.0, 1.0, pProd);
-                }
                 wSum += w;
-                if (RestirRand(risRng) * wSum <= w) sel = cand;
+                if (RestirRand(risRng) * wSum <= w)
+                {
+                    uint flags = (rcFound ? RESTIR_FLAG_RCVALID : RESTIR_FLAG_ENVEND) | (deltaMask << 8);
+                    if (rcFound) flags |= (rcIdx & 0xFu) << 4;
+                    // env pseudo-vertex index = pathLen+1 -> t = pathLen+2.
+                    SEL.core.w = uintBitsToFloat(RestirPackTech(0u, pathLen + 2u, flags));
+                    SEL.core.y = RestirLum(fCand);
+                    SEL.fSeed = vec4(fCand, uintBitsToFloat(camSeed));
+                    if (rcFound)
+                    {
+                        SEL.rcInfo = vec4(rcBaseCos, rcBaseDist2, 1.0, replayPdfBase);
+                        SEL.rcPosMat = vec4(rcPos, uintBitsToFloat(rcMat));
+                        SEL.rcNormal = vec4(rcNrm, 0.0);
+                        SEL.rcLsuf = vec4(SafeDiv(fCand, fArriveRc), 0.0);
+                        SEL.misCache = vec4(1.0, 0.0, 0.0, 0.0); // env: no competitors
+                    }
+                    else
+                    {
+                        SEL.rcInfo = vec4(0.0, 0.0, 1.0, pProd);
+                    }
+                }
             }
             break;
         }
@@ -367,7 +579,14 @@ void main()
         wi = -bs.dir;
         lastEdgePdfW = bs.specular ? 0.0 : bs.pdfDir;
         lastEdgeDist2 = hit.t * hit.t;
-        dT1 /= max(abs(dot(hit.normal, bs.dir)), 1e-6); // arrival, like dVC
+        // Arrival conversions (classic): dVCM picks up the full area
+        // factor, dVC/dT1 (and the affine cache) the cosine only.
+        float cosArr = max(abs(dot(hit.normal, bs.dir)), 1e-6);
+        dVCM *= hit.t * hit.t / cosArr;
+        dVC /= cosArr;
+        dT1 /= cosArr;
+        misK1 /= cosArr;
+        misK2 /= cosArr;
     }
 
     // ------------------------------------------------------ LRM merge ----
@@ -402,11 +621,12 @@ void main()
                     wSum += w;
                     if (RestirRand(risRng) * wSum <= w)
                     {
-                        sel = RestirEmptyReservoir();
-                        sel.core.w = uintBitsToFloat(e.meta.x);
-                        sel.core.y = e.rcInfo.z * RestirLum(e.fW.xyz);
-                        sel.fSeed = vec4(e.fW.xyz, uintBitsToFloat(e.meta.y));
-                        sel.rcInfo = e.rcInfo;
+                        // t=1 shifts read only tech/seed/rcInfo; stale rc/ly
+                        // fields from earlier winners are never touched.
+                        SEL.core.w = uintBitsToFloat(e.meta.x);
+                        SEL.core.y = e.rcInfo.z * RestirLum(e.fW.xyz);
+                        SEL.fSeed = vec4(e.fW.xyz, uintBitsToFloat(e.meta.y));
+                        SEL.rcInfo = e.rcInfo;
                     }
                 }
             }
@@ -427,12 +647,11 @@ void main()
     }
     pixelRes[causticSlot].caustic = cRes;
 
-    // Finalize: rc index for s=0 candidates was folded into flags at
-    // creation time via rcIdx; W = wSum / pHat(selected).
-    float pHatSel = sel.core.y;
-    sel.core.x = (pHatSel > 0.0 && wSum > 0.0) ? wSum / pHatSel : 0.0;
-    sel.core.z = 1.0; // initial-sampling confidence is always 1 (paper 7.1)
-    if (isnan(sel.core.x) || isinf(sel.core.x)) sel.core.x = 0.0;
-
-    pixelRes[outSlot].path = sel;
+    // Finalize: W = wSum / pHat(selected); the winner's other fields are
+    // already in place in the output slot.
+    float pHatSel = SEL.core.y;
+    float Wsel = (pHatSel > 0.0 && wSum > 0.0) ? wSum / pHatSel : 0.0;
+    if (isnan(Wsel) || isinf(Wsel)) Wsel = 0.0;
+    SEL.core.x = Wsel;
+    SEL.core.z = 1.0; // initial-sampling confidence is always 1 (paper 7.1)
 }

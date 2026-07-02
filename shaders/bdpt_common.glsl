@@ -34,20 +34,20 @@ struct LightVertex
     vec4 tputMat;   // xyz throughput arriving at the vertex, w=materialIndex (floatBitsToUint)
     vec4 wiLen;     // xyz direction toward the previous vertex, w=path length in segments
 };
-layout(std430, binding = 8) buffer LightVerticesSSBO { LightVertex lightVerts[]; };
+layout(std430, binding = 8) restrict buffer LightVerticesSSBO { LightVertex lightVerts[]; };
 
 // t=1 (light tracing) splats: fixed-point RGB accumulator per pixel,
 // written with atomicAdd by bdpt_light.comp, drained into the accumulation
 // image and cleared by bdpt_resolve.comp each frame. Fixed point because
 // core GL has no portable float image atomics.
-layout(std430, binding = 9) buffer SplatSSBO { uint splatBuf[]; };
+layout(std430, binding = 9) restrict buffer SplatSSBO { uint splatBuf[]; };
 
 // Number of stored vertices per light subpath.
-layout(std430, binding = 11) buffer LightVertCountSSBO { uint lightVertCount[]; };
+layout(std430, binding = 11) restrict buffer LightVertCountSSBO { uint lightVertCount[]; };
 
 // Camera-anchored light-selection pdf per light, cached once per frame by
 // bdpt_lightsel.comp (the anchor is fixed, so the value is pixel-independent).
-layout(std430, binding = 12) buffer LightSelPdfSSBO { float lightSelPdf[]; };
+layout(std430, binding = 12) restrict buffer LightSelPdfSSBO { float lightSelPdf[]; };
 
 const float BDPT_SPLAT_SCALE = 4096.0;
 const uint  BDPT_MAX_LIGHT_VERTS = 8u;

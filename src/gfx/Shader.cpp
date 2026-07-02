@@ -106,6 +106,10 @@ namespace RoyalGL
         std::string source = LoadShaderSource(computePath);
         GLuint stage = CompileStage(GL_COMPUTE_SHADER, source, computePath);
         GLuint program = LinkProgram({stage}, computePath);
+        // Name the program after its file so Nsight/RenderDoc captures show
+        // "restir_spatial.comp" instead of "Program 17".
+        std::string label = computePath.filename().string();
+        GL_CALL(glObjectLabel(GL_PROGRAM, program, -1, label.c_str()));
         ROYALGL_LOG_INFO("Compiled compute shader: ", computePath.string());
         return Shader(program);
     }
@@ -117,6 +121,8 @@ namespace RoyalGL
         GLuint vs = CompileStage(GL_VERTEX_SHADER, vertSource, vertPath);
         GLuint fs = CompileStage(GL_FRAGMENT_SHADER, fragSource, fragPath);
         GLuint program = LinkProgram({vs, fs}, vertPath);
+        std::string label = vertPath.filename().string();
+        GL_CALL(glObjectLabel(GL_PROGRAM, program, -1, label.c_str()));
         ROYALGL_LOG_INFO("Compiled graphics shader: ", vertPath.string(), " + ", fragPath.string());
         return Shader(program);
     }

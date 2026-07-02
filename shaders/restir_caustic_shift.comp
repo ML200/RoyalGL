@@ -32,15 +32,17 @@ void main()
     if (uFrame.lightInfo.x == 0u) return;
 
     uint idx = RestirPixelIndex(pixel);
-    CausticReservoir h = pixelRes[RestirRegionOffset(RestirHistoryRegion()) + idx].caustic;
-    if (h.core.x <= 0.0 || h.core.y <= 0.0) return;
+    // OCCUPANCY: field-wise reads by slot - a whole-struct local would stay
+    // live across the replay's BVH traversals.
+    uint hSlot = RestirRegionOffset(RestirHistoryRegion()) + idx;
+    vec4 hCore = pixelRes[hSlot].caustic.core;
+    if (hCore.x <= 0.0 || hCore.y <= 0.0) return;
 
-    uint tech = floatBitsToUint(h.core.w);
-    uint s = RestirTechS(tech);
-    uint deltaMask = RestirFlagsDeltaMask(RestirTechFlags(tech));
+    uint tech = floatBitsToUint(hCore.w);
+    uint seed = floatBitsToUint(pixelRes[hSlot].caustic.fSeed.w);
 
     RestirCausticReplayResult res = RestirCausticReplay(
-        floatBitsToUint(h.fSeed.w), s, deltaMask,
+        seed, RestirTechS(tech), RestirFlagsDeltaMask(RestirTechFlags(tech)),
         uFrame.camPos.xyz, uFrame.camForward.xyz, uFrame.camRight.xyz, uFrame.camUp.xyz,
         uFrame.cameraParams.x, uFrame.cameraParams.y);
     if (!res.ok) return;
@@ -51,12 +53,17 @@ void main()
     if (gbuf[GBufCurOffset() + dstIdx].posDepth.w < 0.0) return;
 
     // Pure-replay Jacobian (Eq. 53): base pdf product over shifted's.
-    float J = h.meta.y / res.replayPdf;
+    float baseReplayPdf = pixelRes[hSlot].caustic.meta.y;
+    float J = baseReplayPdf / res.replayPdf;
     if (isnan(J) || isinf(J) || J <= 0.0) return;
 
+    // omega of the shifted path: recomputed in the current domain (Phase 5)
+    // or copied from the base.
+    float omega = RestirMisRecomputeEnabled() ? res.omega : pixelRes[hSlot].caustic.meta.x;
+
     LrmAppend(dstIdx,
-              vec4(res.f, h.core.x),                       // shifted f, base W
-              vec4(h.core.y, J, h.meta.x, res.replayPdf),  // base pHat, J, omega, new replayPdf
-              tech, floatBitsToUint(h.fSeed.w),
-              floatBitsToUint(min(h.core.z, RESTIR_CONFIDENCE_CAP)));
+              vec4(res.f, hCore.x),                        // shifted f, base W
+              vec4(hCore.y, J, omega, res.replayPdf),      // base pHat, J, omega, new replayPdf
+              tech, seed,
+              floatBitsToUint(min(hCore.z, RESTIR_CONFIDENCE_CAP)));
 }

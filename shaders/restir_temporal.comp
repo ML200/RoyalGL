@@ -28,12 +28,17 @@ void main()
     uint inSlot = RestirRegionOffset(RESTIR_SCRATCH_REGION) + idx;
     uint outSlot = RestirRegionOffset(RestirTemporalOutRegion()) + idx;
 
-    PathReservoir A = pixelRes[inSlot].path; // this frame's initial candidate
+    // OCCUPANCY: reservoirs are addressed by slot and read field-wise (the
+    // shift kernel does the same via RS_BASE) - whole-struct locals would
+    // pin ~40 registers each across the BVH traversals inside the shifts.
+    // When spatial reuse is enabled, outSlot == inSlot (both scratch), so
+    // the pass-through copies are guarded.
+    vec4 aCore = pixelRes[inSlot].path.core; // this frame's initial candidate
     GBufferPixel gCur = gbuf[GBufCurOffset() + idx];
 
     if (gCur.posDepth.w < 0.0)
     {
-        pixelRes[outSlot].path = A;
+        if (outSlot != inSlot) pixelRes[outSlot].path = pixelRes[inSlot].path;
         return;
     }
 
@@ -63,16 +68,17 @@ void main()
     {
         // The previous domain genuinely doesn't exist for this surface
         // (disocclusion / off-screen): the candidate stands alone, m_A = 1.
-        pixelRes[outSlot].path = A;
+        if (outSlot != inSlot) pixelRes[outSlot].path = pixelRes[inSlot].path;
         return;
     }
 
-    PathReservoir B = pixelRes[RestirRegionOffset(RestirHistoryRegion()) + RestirPixelIndex(prevPix)].path;
+    uint bSlot = RestirRegionOffset(RestirHistoryRegion()) + RestirPixelIndex(prevPix);
     // Confidence counts processed samples and is independent of whether a
     // sample survived - a NULL history (W=0) still weights the MIS terms,
     // otherwise paths reachable from the previous frame get double-counted.
-    float cB = min(B.core.z, RESTIR_CONFIDENCE_CAP);
-    float cA = A.core.z;
+    vec4 bCore = pixelRes[bSlot].path.core;
+    float cB = min(bCore.z, RESTIR_CONFIDENCE_CAP);
+    float cA = aCore.z;
 
     // ------------------------------------- forward shift: B -> current ---
     vec3 curWi = -RestirPrimaryRay(pixel).dir;
@@ -80,9 +86,11 @@ void main()
     RestirShiftResult SB;
     SB.ok = false;
     SB.jacobian = 0.0;
-    if (B.core.x > 0.0 && B.core.y > 0.0)
-        SB = RestirShiftPath(B, gCur, curWi, uFrame.camPos.xyz, uFrame.camForward.xyz, curIpd);
-    float omegaB = B.rcInfo.z;
+    if (bCore.x > 0.0 && bCore.y > 0.0)
+        SB = RestirShiftPath(bSlot, gCur, curWi, uFrame.camPos.xyz, uFrame.camForward.xyz, curIpd);
+    // omega of the shifted path: recomputed (Phase 5) or copied - the shift
+    // decides per RestirMisRecomputeEnabled().
+    float omegaB = SB.omega;
     float pHatB_cur = SB.ok ? omegaB * RestirLum(SB.f) : 0.0;
 
     // ------------------------------------ backward shift: A -> previous --
@@ -90,15 +98,15 @@ void main()
     // pixel's domain (previous camera + previous G-buffer surface).
     float pHatA_prev = 0.0;
     float JA_back = 0.0;
-    if (A.core.x > 0.0 && A.core.y > 0.0)
+    if (aCore.x > 0.0 && aCore.y > 0.0)
     {
         vec3 prevWi = -RestirPrevPrimaryRay(prevPix).dir;
         float prevIpd = (float(uFrame.frameInfo.y) * 0.5) / uFrame.prevCameraParams.x;
-        RestirShiftResult SA = RestirShiftPath(A, gPrev, prevWi, uFrame.prevCamPos.xyz,
+        RestirShiftResult SA = RestirShiftPath(inSlot, gPrev, prevWi, uFrame.prevCamPos.xyz,
                                                uFrame.prevCamForward.xyz, prevIpd);
         if (SA.ok)
         {
-            pHatA_prev = A.rcInfo.z * RestirLum(SA.f);
+            pHatA_prev = SA.omega * RestirLum(SA.f);
             JA_back = SA.jacobian;
         }
     }
@@ -109,15 +117,15 @@ void main()
     float w_A = 0.0, w_B = 0.0;
     if (pHatB_cur > 0.0 && SB.jacobian > 0.0)
     {
-        float pHatFromB = B.core.y / SB.jacobian;
+        float pHatFromB = bCore.y / SB.jacobian;
         float mB = cB * pHatFromB / (cB * pHatFromB + cA * pHatB_cur);
-        w_B = mB * pHatB_cur * B.core.x * SB.jacobian;
+        w_B = mB * pHatB_cur * bCore.x * SB.jacobian;
     }
-    if (A.core.y > 0.0)
+    if (aCore.y > 0.0)
     {
         float pHatFromPrevA = pHatA_prev * JA_back; // pHat_prev(T^-1 A) |dT^-1/dA|
-        float mA = cA * A.core.y / (cA * A.core.y + cB * pHatFromPrevA);
-        w_A = mA * A.core.y * A.core.x;
+        float mA = cA * aCore.y / (cA * aCore.y + cB * pHatFromPrevA);
+        w_A = mA * aCore.y * aCore.x;
     }
     if (isnan(w_A) || isinf(w_A)) w_A = 0.0;
     if (isnan(w_B) || isinf(w_B)) w_B = 0.0;
@@ -125,33 +133,27 @@ void main()
     float wSum = w_A + w_B;
     float cOut = min(cA + cB, RESTIR_CONFIDENCE_CAP);
 
-    PathReservoir outRes;
     uint selRng = WangHash(idx * 9781u + uFrame.restirParams.z * 6151u + 0x3779FBB5u);
     if (selRng == 0u) selRng = 0x9E3779B9u;
 
-    if (wSum <= 0.0)
+    // All A-field reads are done, so writing outSlot (which may alias
+    // inSlot when spatial reuse follows) is safe from here on.
+    if (wSum > 0.0 && RestirRand(selRng) * wSum <= w_B)
     {
-        outRes = A;
-        outRes.core.x = 0.0;
-        outRes.core.z = cOut;
-    }
-    else if (RestirRand(selRng) * wSum <= w_B)
-    {
-        // History wins: adopt the shifted path in the current domain.
-        outRes = B;
-        outRes.fSeed.xyz = SB.f;
-        outRes.core.y = pHatB_cur;
-        outRes.core.x = wSum / pHatB_cur;
-        outRes.core.z = cOut;
-        outRes.rcInfo = vec4(SB.rcCos, SB.rcDist2, omegaB, SB.replayPdf);
+        // History wins: adopt the shifted path in the current domain
+        // (bSlot is in the history region, never aliased by outSlot).
+        float Wnew = wSum / pHatB_cur;
+        if (isnan(Wnew) || isinf(Wnew)) Wnew = 0.0;
+        pixelRes[outSlot].path = pixelRes[bSlot].path;
+        pixelRes[outSlot].path.core = vec4(Wnew, pHatB_cur, cOut, bCore.w);
+        pixelRes[outSlot].path.fSeed.xyz = SB.f;
+        pixelRes[outSlot].path.rcInfo = vec4(SB.rcCos, SB.rcDist2, omegaB, SB.replayPdf);
     }
     else
     {
-        outRes = A;
-        outRes.core.x = wSum / A.core.y;
-        outRes.core.z = cOut;
+        float Wnew = (wSum > 0.0) ? wSum / aCore.y : 0.0;
+        if (isnan(Wnew) || isinf(Wnew)) Wnew = 0.0;
+        if (outSlot != inSlot) pixelRes[outSlot].path = pixelRes[inSlot].path;
+        pixelRes[outSlot].path.core = vec4(Wnew, aCore.y, cOut, aCore.w);
     }
-    if (isnan(outRes.core.x) || isinf(outRes.core.x)) outRes.core.x = 0.0;
-
-    pixelRes[outSlot].path = outRes;
 }

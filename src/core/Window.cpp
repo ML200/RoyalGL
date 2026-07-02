@@ -5,6 +5,7 @@
 
 #include "core/Log.h"
 
+#include <cstdlib>
 #include <stdexcept>
 
 namespace RoyalGL
@@ -14,6 +15,20 @@ namespace RoyalGL
         void GlfwErrorCallback(int error, const char* description)
         {
             ROYALGL_LOG_ERROR("GLFW error (", error, "): ", description);
+        }
+
+        // KHR_debug sink (ROYALGL_GL_DEBUG=1): forwards driver messages to
+        // the log. Notifications are dropped; NVIDIA emits one per buffer
+        // placement.
+        void GLAPIENTRY GlDebugCallback(GLenum source, GLenum type, GLuint id, GLenum severity,
+                                        GLsizei, const GLchar* message, const void*)
+        {
+            (void)source;
+            if (severity == GL_DEBUG_SEVERITY_NOTIFICATION) return;
+            if (severity == GL_DEBUG_SEVERITY_HIGH || type == GL_DEBUG_TYPE_ERROR)
+                ROYALGL_LOG_ERROR("GL debug (", id, "): ", message);
+            else
+                ROYALGL_LOG_WARN("GL debug (", id, "): ", message);
         }
 
         void FramebufferSizeCallback(GLFWwindow* handle, int width, int height)
@@ -43,6 +58,14 @@ namespace RoyalGL
         glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
         glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
 
+        // ROYALGL_GL_DEBUG=1: debug context + message callback for
+        // Nsight/RenderDoc sessions and driver diagnostics. Object labels
+        // and per-pass debug groups are always on (they cost nothing
+        // without a tool attached).
+        bool glDebug = (std::getenv("ROYALGL_GL_DEBUG") != nullptr);
+        if (glDebug)
+            glfwWindowHint(GLFW_OPENGL_DEBUG_CONTEXT, GLFW_TRUE);
+
         m_handle = glfwCreateWindow(desc.width, desc.height, desc.title.c_str(), nullptr, nullptr);
         if (!m_handle)
         {
@@ -59,6 +82,15 @@ namespace RoyalGL
 
         ROYALGL_LOG_INFO("GL_VERSION: ", reinterpret_cast<const char*>(glGetString(GL_VERSION)));
         ROYALGL_LOG_INFO("GL_RENDERER: ", reinterpret_cast<const char*>(glGetString(GL_RENDERER)));
+
+        if (glDebug)
+        {
+            glEnable(GL_DEBUG_OUTPUT);
+            glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS); // messages on the offending call's stack
+            glDebugMessageCallback(GlDebugCallback, nullptr);
+            glDebugMessageControl(GL_DONT_CARE, GL_DONT_CARE, GL_DONT_CARE, 0, nullptr, GL_TRUE);
+            ROYALGL_LOG_INFO("GL debug context enabled (ROYALGL_GL_DEBUG)");
+        }
 
         glfwSetWindowUserPointer(m_handle, this);
         glfwSetFramebufferSizeCallback(m_handle, FramebufferSizeCallback);

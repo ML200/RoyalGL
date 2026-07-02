@@ -142,6 +142,8 @@ namespace RoyalGL
             if (settings.cameraMode == CameraMode::Lens)
                 ImGui::TextDisabled("Pinhole only - lens mode falls back to plain BDPT.");
             ImGui::Checkbox("Light tracing (t=1)", &settings.restirLightTracing);
+            ImGui::Checkbox("Vertex connections (s>=2)", &settings.restirConnections);
+            ImGui::Checkbox("Recompute shift MIS (unbiased)", &settings.restirRecomputeMis);
             ImGui::Checkbox("Temporal reuse", &settings.restirTemporal);
             ImGui::Checkbox("Spatial reuse", &settings.restirSpatial);
             if (settings.restirSpatial)

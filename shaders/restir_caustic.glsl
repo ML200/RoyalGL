@@ -18,6 +18,9 @@ struct RestirCausticReplayResult
     vec3 f;          // full path f in pixel-measurement units (incl. imageToSurface)
     float replayPdf; // product of every sampled pdf (pick, area, emission dir, scatters)
     ivec2 pixel;     // landing pixel under the destination camera
+    float omega;     // omega_tau of the replayed path in the destination
+                     // domain (Phase 5 recursive recompute; callers fall
+                     // back to the stored omega when the toggle is off)
 };
 
 // Replays the caustic path (seed, s, deltaMask) under the camera described
@@ -33,6 +36,7 @@ RestirCausticReplayResult RestirCausticReplay(uint seed, uint s, uint deltaMask,
     res.f = vec3(0.0);
     res.replayPdf = 1.0;
     res.pixel = ivec2(-1);
+    res.omega = 0.0;
     if (s < 2u) return res;
 
     // ------------------------------------------------------- emission ----
@@ -55,6 +59,15 @@ RestirCausticReplayResult RestirCausticReplay(uint seed, uint s, uint deltaMask,
     vec3 fNum = lt.emissionWeight.rgb * cosTheta;
     float replayPdf = pickPdf * invArea * cosTheta / PI;
 
+    // Light-side MIS recursions (Phase 5; restir_light.comp conventions),
+    // seeded with the frame-independent eval pdfs.
+    float directPdfA, emissionPdfW;
+    RestirLightPdfs(lightIdx, cosTheta, directPdfA, emissionPdfW);
+    if (emissionPdfW <= 0.0) return res;
+    float mVCM = directPdfA / emissionPdfW;
+    float mVC = cosTheta / emissionPdfW;
+    float mLW = mVC;
+
     Ray ray = MakeRay(origin + lightN * 1e-4, dir);
 
     // -------------------------------------------- walk y_1 .. y_{s-1} ----
@@ -67,6 +80,12 @@ RestirCausticReplayResult RestirCausticReplay(uint seed, uint s, uint deltaMask,
         if (dot(mat.emissive.rgb, mat.emissive.rgb) > 0.0) return res;
         bool isDelta = MatIsDelta(mat);
         if (isDelta != (((deltaMask >> (j - 1u)) & 1u) == 1u)) return res;
+
+        float cosInJ = abs(dot(hit.normal, ray.dir));
+        if (cosInJ <= 1e-6) return res;
+        mVCM *= hit.t * hit.t / cosInJ;
+        mVC /= cosInJ;
+        mLW /= cosInJ;
 
         vec3 hitPos = ray.origin + ray.dir * hit.t;
         vec3 wi = -ray.dir;
@@ -105,9 +124,19 @@ RestirCausticReplayResult RestirCausticReplay(uint seed, uint s, uint deltaMask,
             float imageToSurface = (imagePointToCamDist * imagePointToCamDist) / cosAtCam
                                    * cosToCam / dist2;
 
+            // omega_tau in the destination domain (Phase 5): the same t=1
+            // weight restir_light.comp computes at candidate creation.
+            float wL = (imageToSurface / float(BdptNumLightPaths()))
+                     * (RestirConnectionsEnabled()
+                            ? (mVCM + bsdfRevPdfW * mVC)
+                            : (j == 1u ? (mVCM + bsdfRevPdfW * mLW)
+                                       : (bsdfRevPdfW * mLW)));
+            res.omega = 1.0 / (1.0 + wL);
+
             res.f = fNum * fb * imageToSurface;
             res.replayPdf = replayPdf;
-            res.ok = !(any(isnan(res.f)) || any(isinf(res.f)) || replayPdf <= 0.0);
+            res.ok = !(any(isnan(res.f)) || any(isinf(res.f)) || replayPdf <= 0.0
+                       || isnan(wL) || isinf(wL) || wL < 0.0);
             return res;
         }
 
@@ -119,6 +148,19 @@ RestirCausticReplayResult RestirCausticReplay(uint seed, uint s, uint deltaMask,
         float pdfStep = bs.choicePdf * (bs.specular ? 1.0 : bs.pdfDir);
         fNum *= bs.weight * pdfStep;
         replayPdf *= pdfStep;
+
+        if (bs.specular)
+        {
+            mVC *= bs.cosOut;
+            mLW *= bs.cosOut;
+            mVCM = 0.0;
+        }
+        else
+        {
+            mVC = (bs.cosOut / bs.pdfDir) * (mVCM + bs.pdfRev * mVC);
+            mLW = (bs.cosOut / bs.pdfDir) * ((j == 1u ? mVCM : 0.0) + bs.pdfRev * mLW);
+            mVCM = 1.0 / bs.pdfDir;
+        }
 
         vec3 offN = (dot(bs.dir, hit.normal) >= 0.0) ? hit.normal : -hit.normal;
         ray = MakeRay(hitPos + offN * 1e-4, bs.dir);

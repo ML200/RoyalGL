@@ -29,8 +29,8 @@
 // Each pass writes to region 2 unless it is the last reuse pass, in which
 // case it writes to region parity (see RestirCandidateOutRegion() etc.).
 
-// One per-pixel path reservoir. 13 x vec4 = 208 bytes; must match
-// kPathReservoirBytes in src/pathtracer/PathTracer.cpp.
+// One per-pixel path reservoir. 10 x vec4 = 160 bytes; must match
+// kPixelReservoirsBytes in src/pathtracer/PathTracer.cpp.
 //
 // Convention for f and pdfs: delta (glass) scattering contributes
 // choicePdf (Fresnel F or 1-F) to pdf products and choicePdf*tint to f -
@@ -58,14 +58,33 @@ struct PathReservoir
                   // dot(rcNormal, dirToPrev) > 0, w unused
     vec4 rcLsuf;  // xyz=L_suf: radiance leaving x_r toward x_{r-1} (direction-
                   // independent for Lambertian x_r / one-sided emitters),
-                  // w unused
-    vec4 reservedA; // later phases: light subpath end y_{s-1}
-    vec4 reservedB;
-    vec4 reservedC;
-    vec4 reservedD; // later phases: recursive reconnection MIS cache
-    vec4 reservedE;
-    vec4 reservedF;
-    vec4 reservedG;
+                  // w unused. For s>=2 paths with an interior reconnection
+                  // vertex this transparently covers the connection edge
+                  // and the whole light subpath (the suffix is fixed).
+    vec4 lyPosMat;// s>=2 LIGHTRC paths (camera prefix has no connectable
+                  // pair): xyz = light subpath end y_{s-1} position, w unused
+    vec4 lyNormal;// xyz = shading normal at y_{s-1}, oriented toward the
+                  // camera-side vertex (valid observers), w unused
+    vec4 lyTput;  // xyz = rho_y * fLightNum: every light-side factor of f
+                  // except the connection geometry term, w unused
+    vec4 misCache;// Recursive reconnection MIS cache (Phase 5): the shifted
+                  // path's technique-MIS denominator is affine in the prefix
+                  // state at the reconnection vertex (the dVCM/dVC recursion
+                  // is affine and every suffix pdf is fixed - Lambertian
+                  // forward pdfs depend only on the outgoing direction).
+                  //   surface rc (generic): (C0, C1, -, -):
+                  //     denom' = C0 + C1 * (dVCM'_r + p_rev'_r * dVC'_r)
+                  //     (lightweight set: C0 + C1 * p_rev'_r * dT1'_r)
+                  //   rc = terminal emitter (s=0, r=t-1): (1, directPdfA,
+                  //     emissionPdfW, -): denom' = x + y*dVCM'_r + z*dVC'_r
+                  //   rc = NEE light point (rcPosMat.w==NO_MATERIAL):
+                  //     (-, directPdfA, emissionPdfW, -): full split-vertex
+                  //     recompute at x'_{t-1}
+                  //   LIGHTRC: (dVCM_y + dVC_y*lightRevPdfW, -, -, -)
+                  // Pure-replay paths recompute omega during replay and
+                  // cache nothing. Eval pdfs come from RestirLightPdfs (the
+                  // frame-independent power CDF), so omega is a
+                  // reproducible function of the path in every frame.
 };
 
 // One per-pixel caustic reservoir. 4 x vec4 = 64 bytes. Phase 2 populates
@@ -82,14 +101,14 @@ struct CausticReservoir
     vec4 spare;
 };
 
-// Both reservoirs of one pixel in one buffer entry (272 bytes; must match
+// Both reservoirs of one pixel in one buffer entry (224 bytes; must match
 // kPixelReservoirsBytes in PathTracer.cpp). Buffer length: 3 x pixelCount.
 struct PixelReservoirs
 {
     PathReservoir path;
     CausticReservoir caustic;
 };
-layout(std430, binding = 15) buffer ReservoirsSSBO { PixelReservoirs pixelRes[]; };
+layout(std430, binding = 15) restrict buffer ReservoirsSSBO { PixelReservoirs pixelRes[]; };
 
 // Deterministic per-pixel primary hit (V-buffer): traced through the pixel
 // CENTER, no jitter, so shifts have a stable anchor. posDepth.w < 0 marks a
@@ -100,7 +119,7 @@ struct GBufferPixel
     vec4 normalMat; // xyz shading normal, w=uint bits: materialIndex<<24 | triIndex
                     // (assumes <256 materials and <16M triangles)
 };
-layout(std430, binding = 0) buffer GBufferSSBO { GBufferPixel gbuf[]; };
+layout(std430, binding = 0) restrict buffer GBufferSSBO { GBufferPixel gbuf[]; };
 
 uint GBufMaterial(GBufferPixel g) { return floatBitsToUint(g.normalMat.w) >> 24; }
 uint GBufTriangle(GBufferPixel g) { return floatBitsToUint(g.normalMat.w) & 0x00FFFFFFu; }
@@ -116,10 +135,37 @@ const uint RESTIR_MAX_VERTS = 8u;
 // --------------------------------------------------- regions & G-buffer ---
 // restirParams: x=debug view, y=flags (bit0 active, bit1 temporal reuse,
 // bit2 spatial reuse, bit3 accumulate frames - see AccumulateFrames() in
-// common.glsl, bit4 light tracing), z=frame counter, w=parity.
+// common.glsl, bit4 light tracing, bit5 s>=2 vertex connections),
+// z=frame counter, w=parity.
 bool RestirTemporalEnabled()  { return (uFrame.restirParams.y & 2u) != 0u; }
 bool RestirSpatialEnabled()   { return (uFrame.restirParams.y & 4u) != 0u; }
 bool RestirLightTracingEnabled() { return (uFrame.restirParams.y & 16u) != 0u; }
+bool RestirConnectionsEnabled()  { return (uFrame.restirParams.y & 32u) != 0u; }
+// Phase 5: recompute omega_tau for shifted paths (unbiased) instead of
+// copying it from the base path (paper Sec. 6.4's bounded darkening).
+bool RestirMisRecomputeEnabled() { return (uFrame.restirParams.y & 64u) != 0u; }
+
+// ---------------------------------------------- MIS eval light pdfs ------
+// EVAL pick pdf for every ReSTIR MIS quantity: the power-proportional CDF
+// (binding 10) - camera- and frame-INDEPENDENT, unlike the camera-anchored
+// tree pdf classic BDPT evals with (bdpt_common.glsl). Frame independence
+// makes the recomputed omega_tau (and hence the target pHat) a reproducible
+// function of the path, which the temporal MIS partition needs; the
+// sampled-vs-eval discrepancy costs only weight optimality, never bias.
+// True SAMPLED pick pdfs (BdptSampleLightIndex) still divide contributions
+// and drive replay Jacobians.
+float RestirLightPickPdf(uint lightIdx)
+{
+    float lo = (lightIdx > 0u) ? lightCdf[lightIdx - 1u] : 0.0;
+    return max(lightCdf[lightIdx] - lo, 1e-12);
+}
+
+void RestirLightPdfs(uint lightIdx, float cosTheta, out float directPdfA, out float emissionPdfW)
+{
+    float invArea = 1.0 / max(lightTris[lightIdx].normalArea.w, 1e-10);
+    directPdfA = RestirLightPickPdf(lightIdx) * invArea;
+    emissionPdfW = directPdfA * max(cosTheta, 0.0) / PI;
+}
 
 uint RestirRegionOffset(uint region) { return region * RestirPixelCount(); }
 uint RestirFinalRegion() { return uFrame.restirParams.w; }        // parity
@@ -152,6 +198,10 @@ uint GBufPrevOffset() { return (1u - uFrame.restirParams.w) * RestirPixelCount()
 const uint RESTIR_FLAG_RCVALID = 1u;
 const uint RESTIR_FLAG_ENVEND  = 2u;
 const uint RESTIR_FLAG_CAUSTIC = 4u;
+// s>=2 path whose camera prefix has no connectable pair: the shift replays
+// the prefix to x'_{t-1} and re-evaluates the connection edge to the cached
+// light subpath end (lyPosMat/lyNormal/lyTput).
+const uint RESTIR_FLAG_LIGHTRC = 8u;
 
 uint RestirPackTech(uint s, uint t, uint flags) { return (s & 0xFFu) | ((t & 0xFFu) << 8) | (flags << 16); }
 uint RestirTechS(uint tech) { return tech & 0xFFu; }
@@ -169,13 +219,10 @@ PathReservoir RestirEmptyReservoir()
     r.rcPosMat = vec4(0.0);
     r.rcNormal = vec4(0.0);
     r.rcLsuf = vec4(0.0);
-    r.reservedA = vec4(0.0);
-    r.reservedB = vec4(0.0);
-    r.reservedC = vec4(0.0);
-    r.reservedD = vec4(0.0);
-    r.reservedE = vec4(0.0);
-    r.reservedF = vec4(0.0);
-    r.reservedG = vec4(0.0);
+    r.lyPosMat = vec4(0.0);
+    r.lyNormal = vec4(0.0);
+    r.lyTput = vec4(0.0);
+    r.misCache = vec4(0.0);
     return r;
 }
 
