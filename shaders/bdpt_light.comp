@@ -1,0 +1,240 @@
+#version 460 core
+#include "common.glsl"
+#include "light_tree.glsl"
+#include "lens_common.glsl"
+#include "bdpt_common.glsl"
+
+// BDPT pass 1: trace one light subpath per invocation. Every non-delta
+// vertex is (a) stored to the light-vertex SSBO for the eye pass's s>=2
+// connections and (b) connected directly to the camera (the t=1 "light
+// tracing" strategy), splatting its MIS-weighted contribution to whatever
+// pixel it lands on. Delta (glass) vertices are traversed but neither
+// stored nor connected - which is exactly how caustics form: the paths
+// light -> glass -> ... -> diffuse -> camera exist ONLY in this pass.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void ConnectToCamera(vec3 pos, vec3 n, vec3 wi, Material mat, vec3 throughput,
+                     float dVCM, float dVC)
+{
+    vec3 toCam = uFrame.camPos.xyz - pos;
+    float dist2 = dot(toCam, toCam);
+    if (dist2 <= 1e-12) return;
+    float dist = sqrt(dist2);
+    vec3 dirToCam = toCam / dist;
+    float numLightPaths = float(BdptNumLightPaths());
+
+    if (uFrame.lensParams2.x < 0.5)
+    {
+        // ------------------------------------------------- pinhole -------
+        ivec2 pixel;
+        float cosAtCam;
+        if (!BdptDirToPixel(-dirToCam, pixel, cosAtCam)) return;
+
+        float bsdfDirPdfW, bsdfRevPdfW, cosToCam;
+        vec3 f = EvalBsdf(mat, n, wi, dirToCam, bsdfDirPdfW, bsdfRevPdfW, cosToCam);
+        if (f == vec3(0.0)) return;
+
+        // Pdf of the eye pass generating this vertex by tracing through
+        // that pixel, per unit surface area (SmallVCM imageToSurfaceFactor).
+        float ipd = BdptImagePlaneDist();
+        float imagePointToCamDist = ipd / cosAtCam;
+        float imageToSolidAngle = (imagePointToCamDist * imagePointToCamDist) / cosAtCam;
+        float imageToSurface = imageToSolidAngle * cosToCam / dist2;
+
+        float wLight = (imageToSurface / numLightPaths) * (dVCM + dVC * bsdfRevPdfW);
+        float misWeight = 1.0 / (wLight + 1.0);
+
+        vec3 nf = (dot(n, dirToCam) >= 0.0) ? n : -n;
+        Ray shadowRay = MakeRay(pos + nf * 1e-4, dirToCam);
+        if (IntersectSceneOccluded(shadowRay, dist * 0.999)) return;
+
+        vec3 contrib = misWeight * throughput * f * imageToSurface / numLightPaths;
+        if (any(isnan(contrib)) || any(isinf(contrib))) return;
+        BdptSplat(pixel, contrib);
+        return;
+    }
+
+    // -------------------------------------- lens camera (paper 4.3) ------
+    // Deterministic connection to the lens: sample a point on the front
+    // element's vertex-plane disc, trace the reverse walk scene -> sensor
+    // and splat wherever it lands. The carried quantity is FLUX - invariant
+    // through the deterministic walk - so no analytic lens pdf or Jacobian
+    // is needed; the sensor-side normalization mirrors the eye estimator's
+    // irradiance measurement exactly. This is the strategy that renders
+    // lens-mode caustics (and ghosts of out-of-frame sources) efficiently.
+    float frontSemi = uFrame.lensParams2.w;
+    vec2 r = RandomFloat2();
+    float rad = frontSemi * sqrt(r.x);
+    float phi = 2.0 * PI * r.y;
+    vec3 qLocal = vec3(rad * cos(phi), rad * sin(phi), uFrame.lensParams.z);
+    vec3 qWorld = LensToWorld(qLocal);
+
+    vec3 toQ = qWorld - pos;
+    float dQ2 = dot(toQ, toQ);
+    if (dQ2 <= 1e-12) return;
+    float dQ = sqrt(dQ2);
+    vec3 dirToQ = toQ / dQ;
+
+    float bsdfDirPdfW, bsdfRevPdfW, cosToCam;
+    vec3 f = EvalBsdf(mat, n, wi, dirToQ, bsdfDirPdfW, bsdfRevPdfW, cosToCam);
+    if (f == vec3(0.0)) return;
+
+    vec3 dLocal = LensWorldDirToLocal(dirToQ);
+    if (dLocal.z >= -1e-4) return; // not heading into the lens
+    float cosQ = -dLocal.z;
+
+    // MIS weight from the same effective-pinhole pdf the eye pass uses,
+    // evaluated from this path vertex (path-deterministic on both sides).
+    float cosAtCam = dot(uFrame.camForward.xyz, -dirToCam);
+    float wLight = 0.0;
+    if (cosAtCam > 1e-3)
+    {
+        float ipd = BdptImagePlaneDist();
+        float imagePointToCamDist = ipd / cosAtCam;
+        float imageToSurface = (imagePointToCamDist * imagePointToCamDist) / cosAtCam * cosToCam / dist2;
+        wLight = (imageToSurface / numLightPaths) * (dVCM + dVC * bsdfRevPdfW);
+    }
+    float misWeight = 1.0 / (wLight + 1.0);
+
+    vec3 nf = (dot(n, dirToQ) >= 0.0) ? n : -n;
+    Ray shadowRay = MakeRay(pos + nf * 1e-4, dirToQ);
+    if (IntersectSceneOccluded(shadowRay, dQ * 0.999)) return;
+
+    float lambdaPdf;
+    float lambda = SampleLambda(lambdaPdf);
+    float transmission;
+    vec2 sensorMm;
+    // Start the walk 2mm before the vertex plane so the front cap is ahead.
+    if (!TraceLensToSensor(qLocal - dLocal * 2.0, dLocal, lambda, false, sensorMm, transmission)) return;
+
+    ivec2 pixel;
+    if (!SensorPosToPixel(sensorMm, pixel)) return;
+
+    // Flux through the sampled front-element area, normalized to the eye
+    // estimator's per-pixel irradiance measurement: pixel = K * flux /
+    // (A_pixel * numLightPaths) with K = zPupil^2 / A_rear (the constant
+    // folded into the eye side's pupil-area fraction).
+    float aFront = PI * (frontSemi * 1e-3) * (frontSemi * 1e-3);
+    float zP = uFrame.lensParams.w * 1e-3;
+    float aRear = PI * (uFrame.lensParams2.z * 1e-3) * (uFrame.lensParams2.z * 1e-3);
+    float pixH = 2.0 * uFrame.lensParams.y * 1e-3 / float(uFrame.frameInfo.y);
+    float aPixel = pixH * pixH;
+    float K = (zP * zP) / aRear;
+
+    vec3 contrib = misWeight * throughput * f * (cosToCam * cosQ / dQ2)
+                   * aFront * transmission * K / (aPixel * numLightPaths)
+                   * SpectralWeightRGB(lambda, lambdaPdf);
+    if (any(isnan(contrib)) || any(isinf(contrib))) return;
+    contrib = max(contrib, vec3(0.0)); // spectral RGB weights can dip negative
+    BdptSplat(pixel, contrib);
+}
+
+void main()
+{
+    uint pathIdx = gl_GlobalInvocationID.x;
+    uint numPaths = BdptNumLightPaths();
+    if (pathIdx >= numPaths) return;
+
+    lightVertCount[pathIdx] = 0u;
+    if (uFrame.lightInfo.x == 0u) return;
+
+    g_rngState = WangHash(pathIdx * 7877u + uFrame.frameInfo.z * 15859u + 0x9e3779bu);
+    RandomFloat();
+
+    // ------------------------------------------------------- emission ----
+    float pickPdfTrue;
+    uint lightIdx = BdptSampleLightIndex(pickPdfTrue);
+    if (pickPdfTrue <= 0.0) return;
+    LightTri lt = lightTris[lightIdx];
+    vec3 lightNormal = lt.normalArea.xyz;
+
+    vec3 origin = BdptSampleLightPoint(lightIdx, RandomFloat2());
+    vec3 dir = CosineSampleHemisphere(lightNormal);
+    float cosTheta = dot(lightNormal, dir);
+    if (cosTheta <= 1e-6) return;
+
+    // True sampled pdf divides the throughput; eval pdf feeds the MIS
+    // quantities (see bdpt_common.glsl).
+    float invArea = 1.0 / max(lt.normalArea.w, 1e-10);
+    float emissionPdfTrue = pickPdfTrue * invArea * cosTheta / PI;
+    float directPdfA, emissionPdfW;
+    BdptLightPdfs(lightIdx, cosTheta, directPdfA, emissionPdfW);
+    if (emissionPdfW <= 0.0 || emissionPdfTrue <= 0.0) return;
+
+    vec3 throughput = lt.emissionWeight.rgb * cosTheta / emissionPdfTrue;
+    float dVCM = directPdfA / emissionPdfW; // = PI / cosTheta
+    float dVC = cosTheta / emissionPdfW;
+
+    Ray ray = MakeRay(origin + lightNormal * 1e-4, dir);
+
+    uint maxLen = BdptMaxPathLength();
+    uint stored = 0u;
+    uint pathLength = 1u; // segments from the light after the next hit
+
+    for (uint iter = 0u; iter < BDPT_MAX_LIGHT_VERTS; ++iter)
+    {
+        Hit hit;
+        if (!IntersectScene(ray, hit)) break;
+
+        vec3 hitPos = ray.origin + ray.dir * hit.t;
+        float cosIn = abs(dot(hit.normal, ray.dir));
+        if (cosIn <= 1e-6) break;
+
+        // Fold the solid-angle -> area conversion of this edge into the
+        // recursive quantities (they are defined in area measure).
+        dVCM *= hit.t * hit.t;
+        dVCM /= cosIn;
+        dVC /= cosIn;
+
+        Material mat = materials[hit.materialIndex];
+        vec3 wi = -ray.dir;
+
+        // Light subpaths terminate on emitters too - interior emissive
+        // vertices must not exist in ANY strategy or the MIS strategy sets
+        // diverge between the samplers.
+        if (dot(mat.emissive.rgb, mat.emissive.rgb) > 0.0) break;
+
+        if (!MatIsDelta(mat))
+        {
+            if (stored < BDPT_MAX_LIGHT_VERTS)
+            {
+                LightVertex v;
+                v.posDvcm = vec4(hitPos, dVCM);
+                v.normalDvc = vec4(hit.normal, dVC);
+                v.tputMat = vec4(throughput, uintBitsToFloat(hit.materialIndex));
+                v.wiLen = vec4(wi, float(pathLength));
+                lightVerts[pathIdx * BDPT_MAX_LIGHT_VERTS + stored] = v;
+                stored++;
+            }
+
+            if (pathLength + 1u <= maxLen)
+                ConnectToCamera(hitPos, hit.normal, wi, mat, throughput, dVCM, dVC);
+        }
+
+        if (pathLength + 2u > maxLen) break;
+
+        BsdfSample bs = SampleBsdf(mat, hit.normal, wi, true);
+        if (bs.weight == vec3(0.0)) break;
+        if (!bs.specular && bs.pdfDir <= 0.0) break;
+
+        if (bs.specular)
+        {
+            dVCM = 0.0;
+            dVC *= bs.cosOut;
+        }
+        else
+        {
+            dVC = (bs.cosOut / bs.pdfDir) * (dVC * bs.pdfRev + dVCM);
+            dVCM = 1.0 / bs.pdfDir;
+        }
+
+        throughput *= bs.weight;
+        pathLength++;
+
+        vec3 offN = (dot(bs.dir, hit.normal) >= 0.0) ? hit.normal : -hit.normal;
+        ray = MakeRay(hitPos + offN * 1e-4, bs.dir);
+    }
+
+    lightVertCount[pathIdx] = stored;
+}

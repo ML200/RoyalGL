@@ -6,15 +6,28 @@ Cornell-box scene), and it accumulates path-traced samples into the viewport
 every frame - like the renderer preview in a modern DCC tool - with an ImGui
 control panel, optional Intel Open Image Denoise integration, and PNG export.
 
-The camera can switch from an idealized pinhole to a **physically-based lens
-system**: real Snell's-law ray tracing through an editable lens prescription
-(radius/thickness/glass per surface), producing real depth of field, bokeh
-shaped by an adjustable-blade-count aperture diaphragm, chromatic aberration,
-distortion/fisheye, vignetting, lens flares/ghosts from internal Fresnel
-reflections, and aperture diffraction glare streaks - implementing Steinert,
-Dammertz, Hanika & Lensch's *"General Spectral Camera Lens Simulation"*
-(CGF 2011), minus its full continuous-spectrum rendering (approximated here
-with 3 representative wavelengths). See
+Direct lighting uses next-event estimation through a **light tree** (a 4-wide
+BVH over emissive triangles with SAOH splits and normal cones, ported from
+[RoyalTracer-DX](https://github.com/ML200/RoyalTracer-DX), after Conty
+Estevez & Kulla's *"Importance Sampling of Many Lights with Adaptive Tree
+Splitting"*), MIS-combined with BSDF sampling via the balance heuristic - see
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#direct-lighting-light-tree-nee--mis).
+
+A toggleable **bidirectional path tracer** (Veach ch. 10) runs as three
+compute passes - light subpaths with t=1 camera splats, eye subpaths with
+vertex connections, splat resolve - using the O(1) recursive MIS weight
+formulation (SmallVCM-style dVCM/dVC). The material model includes a delta
+dielectric (Fresnel glass), and the fallback Cornell box ships a small glass
+duck whose caustics only the bidirectional strategies capture efficiently -
+see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#bidirectional-path-tracing-veach-ch-10-recursive-mis).
+
+The camera can switch from a pinhole to a **physical lens** - a
+reimplementation of Steinert et al., *"General Spectral Camera Lens
+Simulation"* (CGF 2011): prescription tables (the paper's Tessar ships in
+`assets/lenses/`), Sellmeier glass dispersion, exact per-wavelength Snell
+tracing (all Seidel + chromatic aberrations), N-gon aperture bokeh,
+continuous spectral sampling, GPU-precomputed per-pixel pupil sampling
+(sec. 4.2) and stochastic Fresnel ghosts - see
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#physical-lens-camera-steinert-et-al-2011).
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how it's built and where
@@ -61,12 +74,11 @@ OIDN being present. Set `-DROYALGL_ENABLE_OIDN=OFF` to skip it entirely.
 - **Right/middle-drag**: pan camera
 - **Scroll**: dolly (zoom)
 - The ImGui panel exposes bounce count, exposure, background color/
-  intensity, a sample cap, denoise, and PNG export, plus a "Camera Model"
-  section to switch to the physical lens system, pick/edit a prescription,
-  and tune aperture/focus/flare/diffraction.
+  intensity, a sample cap, a bidirectional/unidirectional toggle, an NEE
+  on/off toggle (unidirectional only), denoise, and PNG export.
 - A separate "Material Editor" window lists every material in the current
-  scene and lets you edit base color, emissive (HDR) color, metallic, and
-  roughness live.
+  scene and lets you edit base color, emissive (HDR) color, type
+  (diffuse/glass), IOR, metallic, and roughness live.
 
 Moving the camera or changing a render setting resets progressive
 accumulation; otherwise every frame adds one more path-traced sample.

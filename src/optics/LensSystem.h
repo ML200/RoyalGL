@@ -1,74 +1,88 @@
 #pragma once
 
-#include <vector>
+#include <cstdint>
+#include <filesystem>
 #include <string>
-#include "optics/LensSurface.h"
+#include <vector>
 #include "gfx/Buffer.h"
-#include "gfx/GPUTypes.h"
 
 namespace RoyalGL
 {
-    // Owns one lens prescription plus the shooting parameters layered on top
-    // (aperture blade count/f-stop, focus, sensor size, overall scale). This
-    // is the optics analog of BVHBuilder: builds CPU-derived GPU data once
-    // per change and uploads it to a fixed SSBO binding point.
-    //
-    // `surfaces` is ordered object-side (front element, first surface light
-    // hits) -> image-side (last surface, closest to the sensor); this
-    // matches the paper's own table order and requires no reversal on
-    // upload. The primary (eye) ray tracer walks this array back-to-front
-    // (sensor -> front element); the flare/ghost light tracer walks it
-    // front-to-back (front element -> sensor) - see shaders/lens_common.glsl
-    // and shaders/lens_flare.comp.
+    // One row of a lens prescription table, exactly as printed in Steinert
+    // et al. 2011 Fig. 4: signed radius (positive = center of curvature on
+    // the image side), axial thickness to the next surface, the medium
+    // filling that gap, and the element's semi-diameter. The aperture stop
+    // is a flat row flagged isAperture.
+    struct LensRow
+    {
+        float radiusMm = 0.0f;
+        float thicknessMm = 0.0f;
+        std::string material = "air";
+        float semiDiameterMm = 0.0f;
+        bool isAperture = false;
+    };
+
+    // User-tunable lens state, kept in RenderSettings so the existing
+    // dirty-check drives re-derivation.
+    struct LensSettings
+    {
+        float fNumber = 2.8f;
+        float focusShiftMm = 0.0f;   // extra sensor-to-rear-vertex distance
+        float scale = 0.4f;          // uniform prescription scale (scales EFL)
+        int apertureBlades = 6;      // 0 = circular
+        float bladeRotationDeg = 0.0f;
+        float sensorHeightMm = 24.0f;
+        // Stochastic Fresnel reflection ghosts in the eye-side lens walk.
+        // Off by default: eye-side ghost branches are rare high-variance
+        // events (fireflies); the BDPT t=1 lens connection samples flare
+        // paths far more effectively.
+        bool enableFlare = false;
+
+        bool operator==(const LensSettings& o) const
+        {
+            return fNumber == o.fNumber && focusShiftMm == o.focusShiftMm && scale == o.scale &&
+                   apertureBlades == o.apertureBlades && bladeRotationDeg == o.bladeRotationDeg &&
+                   sensorHeightMm == o.sensorHeightMm && enableFlare == o.enableFlare;
+        }
+        bool operator!=(const LensSettings& o) const { return !(*this == o); }
+    };
+
+    // Full lens system per Steinert et al. 2011: prescription + derived GPU
+    // data. Derive() bakes the walk-ordered (rear -> front) surface records
+    // with per-medium Sellmeier/Cauchy coefficients; the shader does exact
+    // per-wavelength Snell refraction through them (shaders/lens_common.glsl).
     class LensSystem
     {
     public:
-        LensSystem() = default;
+        // The paper's Fig. 4 prescription: Tessar by Brendel (USP 2854889),
+        // f/2.8, 100mm EFL.
+        void LoadBuiltinTessar();
+        bool LoadLensFile(const std::filesystem::path& path);
 
-        // GL buffers are not copyable/shareable; copies of LensSystem are
-        // only ever used as value snapshots for change-detection
-        // (Application::m_lastLensSystem, UILayer's before/after diff), so
-        // these copy only the data fields and leave the copy's GL buffer
-        // freshly (and independently) default-constructed - see LensSystem.cpp.
-        LensSystem(const LensSystem& other);
-        LensSystem& operator=(const LensSystem& other);
+        // Re-derives GPU records from the prescription and settings and
+        // uploads them (SSBO binding 13).
+        void Derive(const LensSettings& settings);
+        void Bind() const { m_surfaceBuffer.BindBase(); }
 
-        std::vector<LensSurface> surfaces;
-        std::string name = "Untitled";
-        double effectiveFocalLengthMm = 50.0;
-
-        int apertureBlades = 6; // N-sided polygon; 0/1/2 = circular aperture
-        double apertureBladeRotationDeg = 0.0;
-        double fStop = 5.6; // photographic f-number N = f / entrance-pupil-diameter
-
-        // v1 focus model: uniformly rescale every surface's thicknessMm gap
-        // by a factor derived from the desired object distance (a simple,
-        // widely-used "move the whole rear group" approximation). Exposed
-        // to the UI as a physical object distance rather than the internal
-        // scale factor.
-        double focusDistanceMm = 1.0e6; // ~infinity by default
-
-        double sensorWidthMm = 360.0;  // 10x a real 36mm sensor - deliberately oversized default (see docs/ARCHITECTURE.md)
-        double sensorHeightMm = 240.0; // kept at the same 3:2 ratio as the 36x24mm default; unused by the renderer itself (aspect comes from the viewport - see ARCHITECTURE.md), only shown in the UI
-
-        double scale = 1.5; // "zoom" - scales the whole lens (and therefore its EFL) uniformly; >1 = more telephoto
-
-        // Recomputes cached per-surface RGB IOR (via Glass::IOR at the 3
-        // representative wavelengths), cumulative axial positions, and the
-        // aperture's physical radius (from fStop + EFL), then uploads a
-        // GPULensSurface[] to SSBO binding 5. Call whenever any field above
-        // changes.
-        void Upload();
-        void BindAll() const;
-
-        int SurfaceCount() const { return static_cast<int>(surfaces.size()); }
-
-        bool operator==(const LensSystem& other) const;
-        bool operator!=(const LensSystem& other) const { return !(*this == other); }
+        float FrontVertexZMm() const { return m_frontVertexZMm; }
+        float RearVertexZMm() const { return m_rearVertexZMm; }
+        float RearSemiDiameterMm() const { return m_rearSemiDiameterMm; }
+        float FrontSemiDiameterMm() const { return m_frontSemiDiameterMm; }
+        // Paraxial effective focal length at the d line, after scaling -
+        // drives the effective-pinhole camera pdf the BDPT MIS weights use.
+        float EffectiveFocalLengthMm() const { return m_eflMm; }
+        uint32_t SurfaceCount() const { return static_cast<uint32_t>(m_rows.size()); }
+        const std::string& Name() const { return m_name; }
 
     private:
-        std::vector<GPULensSurface> BuildGPUSurfaces() const;
-
-        Buffer m_surfaceBuffer{BufferType::ShaderStorage, 5};
+        std::vector<LensRow> m_rows; // file order: front element first
+        std::string m_name = "none";
+        float m_baseFNumber = 2.8f;  // f-number the prescription's stop radius corresponds to
+        float m_frontVertexZMm = 0.0f;
+        float m_rearVertexZMm = 0.0f;
+        float m_rearSemiDiameterMm = 0.0f;
+        float m_frontSemiDiameterMm = 0.0f;
+        float m_eflMm = 50.0f;
+        Buffer m_surfaceBuffer{BufferType::ShaderStorage, 13};
     };
 }

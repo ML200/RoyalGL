@@ -26,9 +26,9 @@ namespace RoyalGL
 
     struct GPUMaterial
     {
-        glm::vec4 baseColor; // .rgb albedo, .a unused
+        glm::vec4 baseColor; // .rgb albedo (Diffuse) / tint (Glass), .a unused
         glm::vec4 emissive;  // .rgb emissive radiance, .a unused
-        glm::vec4 params;    // x=metallic, y=roughness, z/w reserved
+        glm::vec4 params;    // x=metallic, y=roughness, z=ior, w=type (0=diffuse, 1=glass)
     };
 
     // Uniform buffer uploaded once per PathTracer::Render() call (binding 0).
@@ -38,39 +38,52 @@ namespace RoyalGL
         glm::vec4 camForward;  // xyz, w unused
         glm::vec4 camRight;    // xyz, w unused
         glm::vec4 camUp;       // xyz, w unused
-        glm::vec4 lensParams;  // x=tanHalfFovY, y=aspect (pinhole mode);
-                                // x=tanHalfFovY, y=aspect, z=sensorWidthMm, w=lensModeFlag (0/1) (lens mode)
+        glm::vec4 cameraParams;// x=tanHalfFovY, y=aspect, z/w unused
         glm::vec4 background;  // .rgb sky color, .a intensity multiplier
         glm::uvec4 frameInfo;  // x=width, y=height, z=sampleIndex, w=maxBounces
-        glm::vec4 renderParams;// x=exposure, y/z/w reserved
+        glm::vec4 renderParams;// x=exposure, y=total light power, z/w reserved
+        glm::uvec4 lightInfo;  // x=light triangle count, y=NEE enabled (0/1), z=BDPT light path count, w unused
+        glm::vec4 lensParams;  // x=sensor half width mm, y=sensor half height mm,
+                               // z=front vertex z mm, w=pupil plane z mm (lens camera mode)
+        glm::vec4 lensParams2; // x=camera mode (0=pinhole, 1=lens), y=flare enabled (0/1),
+                               // z=rear element semi-diameter mm, w unused
     };
 
-    // One lens surface, uploaded to SSBO binding 5 by LensSystem::Upload().
-    // See docs/ARCHITECTURE.md for the full lens-camera data flow.
+    // One lens surface in walk order (rear -> front), uploaded to SSBO
+    // binding 13 by LensSystem::Derive(). Media carry Sellmeier (mode 1:
+    // B1..3 / C1..3) or Cauchy (mode 0: coef.x=B, coef2.w=A) dispersion,
+    // evaluated per wavelength in shaders/lens_common.glsl.
     struct GPULensSurface
     {
-        glm::vec4 geometry;     // x=signed radius mm, y=thickness-to-next mm, z=semiDiameter mm, w=isAperture (0/1)
-        glm::vec4 iorRGB_z;     // xyz=IOR(R,G,B) of the medium AFTER this surface (air=1,1,1); w=cumulative
-                                 //   axial position (mm) from the sensor, precomputed once per lens change
-        glm::vec4 coatingRGB;   // xyz=per-channel Fresnel-reflectance multiplier from AR coating (1,1,1=none), w unused
-        glm::vec4 apertureData; // x=bladeCount (0=circular), y=bladeRotationRad, z=apertureRadiusMm, w unused
-                                 //   (only meaningful on the isAperture row)
+        glm::vec4 geo;      // x=vertex z mm, y=signed radius mm (paper convention), z=semi-diameter mm, w=isAperture
+        glm::vec4 mediumA;  // image-side medium coefficients, w=mode
+        glm::vec4 mediumA2;
+        glm::vec4 mediumB;  // object-side medium coefficients, w=mode
+        glm::vec4 mediumB2;
+        glm::vec4 aperture; // x=blade count (0=circular), y=blade rotation rad, z=stop radius mm (aperture row)
     };
 
-    // One emissive triangle, uploaded to SSBO binding 6 by LightList::Build(),
-    // used only by the flare/ghost light-tracing pass.
+    // One 4-wide light tree node, uploaded to SSBO binding 5 by
+    // LightTree::Build(). Interior nodes reference a contiguous block of
+    // children; leaves reference a contiguous run of GPULightTriangle
+    // entries. Interior nodes also carry their subtree's triangle range so
+    // the pdf evaluation can re-descend deterministically (see
+    // shaders/light_tree.glsl).
+    struct GPULightTreeNode
+    {
+        glm::vec4 bminPower; // xyz=aabb min, w=total emitted power of the subtree
+        glm::vec4 bmaxCosO;  // xyz=aabb max, w=cos(theta_o) of the merged normal cone
+        glm::vec4 axisCosE;  // xyz=normal cone axis, w=cos(theta_e) emission falloff angle
+        glm::uvec4 meta;     // x=firstChild, y=childCount (0=leaf), z=triFirst, w=triCount
+    };
+
+    // One emissive triangle, uploaded to SSBO binding 6 by LightTree::Build()
+    // in leaf-list order (so a leaf's triFirst/triCount index this array
+    // directly, and an interior node's range test is a simple interval check).
     struct GPULightTriangle
     {
-        glm::vec4 p0, p1, p2;  // world-space position, .w unused
-        glm::vec4 normal_area; // xyz geometric normal, w = triangle area
-        glm::vec4 emissive;    // .rgb radiance, .a unused
-    };
-
-    // One flare/ghost splat record, written by shaders/lens_flare.comp
-    // (SSBO binding 8) and read by shaders/lens_flare_splat.vert.
-    struct GPUSplat
-    {
-        glm::vec4 pixelRadianceRG; // x=pixelX, y=pixelY, z=radiance.r, w=radiance.g
-        glm::vec4 radianceBValid;  // x=radiance.b, y=validFlag (0/1), z/w unused
+        glm::vec4 p0, p1, p2;       // world-space position, .w unused
+        glm::vec4 normalArea;       // xyz=geometric normal, w=triangle area
+        glm::vec4 emissionWeight;   // rgb=emitted radiance, w=selection weight (area * luminance)
     };
 }

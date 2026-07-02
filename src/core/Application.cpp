@@ -1,15 +1,20 @@
 #include "core/Application.h"
 #include "core/Log.h"
 #include "scene/GLTFLoader.h"
-#include "optics/LensPrescription.h"
 #include "io/ImageExport.h"
-#include "gfx/Framebuffer.h"
 
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
 #include <imgui.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
+#include <filesystem>
+
+#ifndef ROYALGL_ASSET_DIR
+#define ROYALGL_ASSET_DIR "assets/"
+#endif
 
 namespace RoyalGL
 {
@@ -45,26 +50,31 @@ namespace RoyalGL
         m_bvh->Build(*m_scene);
         m_lastMaterials = m_scene->materials;
 
-        m_lightList = std::make_unique<LightList>();
-        m_lightList->Build(*m_scene);
+        m_lightTree = std::make_unique<LightTree>();
+        m_lightTree->Build(*m_scene);
 
         m_lensSystem = std::make_unique<LensSystem>();
-        *m_lensSystem = LensPrescription::BuiltinTessar(); // always start with a working built-in
-        m_lensSystem->Upload();
+        if (!m_lensSystem->LoadLensFile(std::filesystem::path(ROYALGL_ASSET_DIR) / "lenses/tessar.lens"))
+            m_lensSystem->LoadBuiltinTessar();
+        m_lensSystem->Derive(m_settings.lens);
 
         m_pathTracer = std::make_unique<PathTracer>();
         glm::ivec2 fbSize = m_window->GetFramebufferSize();
         m_pathTracer->Resize(fbSize.x, fbSize.y);
 
-        m_lensFlare = std::make_unique<LensFlare>();
         m_fullscreenPass = std::make_unique<FullscreenPass>();
         m_denoiser = std::make_unique<Denoiser>();
         m_ui = std::make_unique<UILayer>(m_window->Handle());
 
+        // Env-var overrides for scripted A/B experiments (no rebuild):
+        // ROYALGL_BIDIR=0/1, ROYALGL_NEE=0/1, ROYALGL_STATS=1.
+        if (const char* v = std::getenv("ROYALGL_BIDIR")) m_settings.enableBidir = (v[0] != '0');
+        if (const char* v = std::getenv("ROYALGL_NEE")) m_settings.enableNEE = (v[0] != '0');
+        if (const char* v = std::getenv("ROYALGL_LENS")) m_settings.cameraMode = (v[0] != '0') ? CameraMode::Lens : CameraMode::Pinhole;
+        m_statsEnabled = (std::getenv("ROYALGL_STATS") != nullptr);
+
         m_lastCamera = m_scene->camera;
         m_lastSettings = m_settings;
-        m_lastCameraSettings = m_cameraSettings;
-        m_lastLensSystem = std::make_unique<LensSystem>(*m_lensSystem);
         m_dirty = true;
 
         m_window->OnResize = [this](int w, int h) { OnFramebufferResize(w, h); };
@@ -94,7 +104,27 @@ namespace RoyalGL
             }
         }
         if (!loaded)
+        {
             m_scene->LoadFallbackScene();
+
+            // A small glass duck in the middle of the Cornell box - a delta
+            // dielectric that only bidirectional strategies can render
+            // efficiently (caustics via light tracing, the duck itself via
+            // eye paths).
+            Scene duck;
+            if (GLTFLoader::Load(std::filesystem::path(ROYALGL_ASSET_DIR) / "scenes/Duck.glb", duck))
+            {
+                Material glass;
+                glass.baseColor = glm::vec3(0.98f, 0.98f, 0.98f);
+                glass.type = MaterialType::Glass;
+                glass.ior = 1.5f;
+                m_scene->MergeInstance(duck, glm::vec3(0.4f, 0.0f, 0.2f), 1.0f, glass);
+            }
+            else
+            {
+                ROYALGL_LOG_WARN("Application: Duck.glb not found, fallback scene has no glass object.");
+            }
+        }
     }
 
     void Application::OnFramebufferResize(int width, int height)
@@ -153,6 +183,48 @@ namespace RoyalGL
         }
     }
 
+    void Application::LogAccumulationStats()
+    {
+        uint32_t n = m_pathTracer->SampleCount();
+        std::vector<float> raw = m_pathTracer->AccumulationImage().ReadPixelsFloat();
+        std::vector<float> lum;
+        lum.reserve(raw.size() / 4);
+        float inv = 1.0f / static_cast<float>(n);
+        for (size_t i = 0; i + 3 < raw.size(); i += 4)
+            lum.push_back((raw[i] + raw[i + 1] + raw[i + 2]) * (inv / 3.0f));
+
+        // High-frequency noise: mean |pixel - 4-neighbor average| over
+        // non-emitter pixels, relative to the image mean. Pure variance
+        // measure - a converged image scores ~0 regardless of content.
+        int w = m_pathTracer->Width();
+        int h = m_pathTracer->Height();
+        double noiseSum = 0.0;
+        size_t noiseCount = 0;
+        for (int y = 1; y < h - 1; ++y)
+        {
+            for (int x = 1; x < w - 1; ++x)
+            {
+                float c = lum[static_cast<size_t>(y) * w + x];
+                if (c > 5.0f) continue; // skip directly-visible emitters
+                float nb = 0.25f * (lum[static_cast<size_t>(y) * w + x - 1] + lum[static_cast<size_t>(y) * w + x + 1] +
+                                     lum[(static_cast<size_t>(y) - 1) * w + x] + lum[(static_cast<size_t>(y) + 1) * w + x]);
+                noiseSum += std::abs(c - nb);
+                noiseCount++;
+            }
+        }
+
+        std::sort(lum.begin(), lum.end());
+        auto pct = [&](double p) { return lum[static_cast<size_t>(p * (lum.size() - 1))]; };
+        double mean = 0.0;
+        for (float v : lum) mean += v;
+        mean /= static_cast<double>(lum.size());
+        double relNoise = (noiseCount && mean > 0.0) ? (noiseSum / noiseCount) / mean : 0.0;
+
+        ROYALGL_LOG_INFO("Stats @", n, " samples: mean=", mean, " relNoise=", relNoise,
+                         " p50=", pct(0.5), " p99=", pct(0.99), " p99.9=", pct(0.999),
+                         " p99.99=", pct(0.9999), " max=", lum.back());
+    }
+
     void Application::RunDenoiser()
     {
         uint32_t sampleCount = m_pathTracer->SampleCount();
@@ -204,54 +276,41 @@ namespace RoyalGL
             m_window->PollEvents();
             HandleCameraInput(dt);
 
-            bool lensDirty = (m_cameraSettings != m_lastCameraSettings) || (*m_lensSystem != *m_lastLensSystem);
             bool materialsDirty = (m_scene->materials != m_lastMaterials);
-            if (m_scene->camera != m_lastCamera || m_settings != m_lastSettings || lensDirty || materialsDirty)
+            if (m_scene->camera != m_lastCamera || m_settings != m_lastSettings || materialsDirty)
             {
-                if (lensDirty) m_lensSystem->Upload(); // re-derive+reupload GPU data only when something changed
                 if (materialsDirty)
                 {
                     m_bvh->UpdateMaterials(*m_scene);
-                    // Editing a material's emissive value can add/remove/reweight
-                    // flare-pass light sources, so the light list + sampling CDF
-                    // (built once from the ORIGINAL emissive values at startup)
-                    // must be rebuilt too, not just the main materials SSBO.
-                    m_lightList->Build(*m_scene);
+                    // Emissive edits re-weight (or add/remove) light tree
+                    // leaves, so the tree built at startup goes stale too.
+                    m_lightTree->Build(*m_scene);
+                }
+                if (m_settings.lens != m_lastSettings.lens || m_settings.cameraMode != m_lastSettings.cameraMode)
+                {
+                    m_lensSystem->Derive(m_settings.lens);
+                    m_pathTracer->MarkPupilsDirty();
                 }
                 m_pathTracer->Reset();
                 m_lastCamera = m_scene->camera;
                 m_lastSettings = m_settings;
-                m_lastCameraSettings = m_cameraSettings;
-                *m_lastLensSystem = *m_lensSystem;
                 m_lastMaterials = m_scene->materials;
                 m_dirty = false;
             }
 
-            m_pathTracer->Render(m_scene->camera, *m_bvh, m_settings, m_cameraSettings,
-                                  m_cameraSettings.mode == CameraMode::LensSystem ? m_lensSystem.get() : nullptr);
+            m_pathTracer->Render(m_scene->camera, *m_bvh, *m_lightTree, *m_lensSystem, m_settings);
 
-            bool flareActive = m_settings.enableFlare && m_cameraSettings.mode == CameraMode::LensSystem &&
-                                m_lightList->LightCount() > 0;
-            if (flareActive)
+            if (m_statsEnabled)
             {
-                m_lensFlare->ResetSplatBuffer();
-                m_lensFlare->TraceLightPaths(*m_lightList, m_settings);
-                // Compute wrote the splat SSBOs (binding 8/9) - make them
-                // visible to the splat pass's vertex shader SSBO reads, and
-                // make PathTracer's prior compute image-store into m_accum
-                // visible to the upcoming FBO-attached raster write of the
-                // same texture (see docs/ARCHITECTURE.md for the full
-                // barrier reasoning).
-                glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-                glMemoryBarrier(GL_FRAMEBUFFER_BARRIER_BIT);
-                m_lensFlare->SplatToAccumulation(m_pathTracer->AccumulationImage(),
-                                                  glm::ivec2(m_pathTracer->Width(), m_pathTracer->Height()));
-                // Make this raster write visible to next frame's compute
-                // imageLoad/imageStore on the same texture.
-                glMemoryBarrier(GL_FRAMEBUFFER_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+                uint32_t n = m_pathTracer->SampleCount();
+                if (n > 0 && n % 256 == 0 && n != m_lastStatsSample)
+                {
+                    m_lastStatsSample = n;
+                    LogAccumulationStats();
+                }
             }
 
-            Framebuffer::BindDefault();
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
             glm::ivec2 fbSize = m_window->GetFramebufferSize();
             glViewport(0, 0, fbSize.x, fbSize.y);
             glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
@@ -259,12 +318,8 @@ namespace RoyalGL
             m_fullscreenPass->Draw(m_pathTracer->AccumulationImage(), m_settings.exposure, m_pathTracer->SampleCount());
 
             m_ui->BeginFrame();
-            UIFrameResult result = m_ui->Draw(m_settings, m_cameraSettings, *m_lensSystem, *m_scene,
-                                               m_pathTracer->SampleCount(), dt * 1000.0f, Denoiser::IsAvailable());
-            if (result.lensPresetLoadRequested)
-            {
-                *m_lensSystem = LensPrescription::LoadBuiltinPreset(result.lensPresetToLoad);
-            }
+            UIFrameResult result = m_ui->Draw(m_settings, *m_scene, m_pathTracer->SampleCount(),
+                                               dt * 1000.0f, Denoiser::IsAvailable());
             if (result.denoiseRequested) RunDenoiser();
             if (result.exportRequested) ExportPNG(result.exportPath);
             m_ui->EndFrame();

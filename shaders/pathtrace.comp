@@ -1,13 +1,15 @@
 #version 460 core
 #include "common.glsl"
+#include "light_tree.glsl"
 #include "lens_common.glsl"
 
 // Megakernel path tracer: one invocation traces one full path (primary ray
 // through up to uFrame.frameInfo.w diffuse bounces) for one pixel and adds
-// the result into the accumulation image. See docs/ARCHITECTURE.md for the
-// overall data flow and shading-model extension points. RNG, Ray/Hit,
-// and BVH traversal (IntersectScene) are shared via common.glsl since the
-// flare/ghost pass (shaders/lens_flare.comp) needs them too.
+// the result into the accumulation image. Direct lighting at every vertex
+// combines two strategies via MIS (balance heuristic, solid-angle measure):
+// next-event estimation through the light tree (light_tree.glsl) and
+// cosine-weighted BSDF sampling. See docs/ARCHITECTURE.md for the overall
+// data flow. RNG, Ray/Hit, and BVH traversal live in common.glsl.
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -19,6 +21,13 @@ vec3 TracePath(Ray ray)
     vec3 radiance = vec3(0.0);
     vec3 throughput = vec3(1.0);
     uint maxBounces = uFrame.frameInfo.w;
+    bool neeOn = (uFrame.lightInfo.x > 0u) && (uFrame.lightInfo.y != 0u);
+
+    // BSDF pdf of the ray that produced the current hit, and the shading
+    // normal at its origin. prevBsdfPdf == 0 marks "no NEE competed at the
+    // previous vertex" (camera ray), giving emitter hits MIS weight 1.
+    float prevBsdfPdf = 0.0;
+    vec3 prevNormal = vec3(0.0);
 
     for (uint bounce = 0u; bounce <= maxBounces; bounce++)
     {
@@ -30,19 +39,86 @@ vec3 TracePath(Ray ray)
         }
 
         Material mat = materials[hit.materialIndex];
-        radiance += throughput * mat.emissive.rgb;
+
+        if (dot(mat.emissive.rgb, mat.emissive.rgb) > 0.0)
+        {
+            // Emitters are one-sided (the light tree's normal cones assume
+            // it) and terminate the path: without termination, paths bounce
+            // between the light panels and the ceiling 2 cm above them,
+            // stacking repeated weight-1 emission adds into fireflies.
+            if (dot(hit.normal, ray.dir) < 0.0)
+            {
+                // MIS against the NEE strategy of the previous vertex.
+                // prevBsdfPdf == 0 covers camera rays and delta chains: NEE
+                // never competed there, so the BSDF strategy stands alone.
+                float misWeight = 1.0;
+                if (neeOn && prevBsdfPdf > 0.0)
+                {
+                    uint lightIdx = triToLight[hit.triIndex];
+                    if (lightIdx != LT_SENTINEL)
+                    {
+                        float lightPdfSA = LT_PdfSolidAngle(ray.origin, prevNormal, lightIdx, ray.dir, hit.t);
+                        misWeight = prevBsdfPdf / max(prevBsdfPdf + lightPdfSA, 1e-20);
+                    }
+                }
+                radiance += throughput * mat.emissive.rgb * misWeight;
+            }
+            break;
+        }
 
         if (bounce == maxBounces) break;
 
         vec3 hitPos = ray.origin + ray.dir * hit.t;
+        vec3 wi = -ray.dir;
         // Shade the side of the triangle the ray actually hit.
         vec3 normal = (dot(hit.normal, ray.dir) < 0.0) ? hit.normal : -hit.normal;
 
-        vec3 newDir = CosineSampleHemisphere(normal);
-        // Lambertian BRDF (albedo / PI) times cos(theta), divided by the
-        // cosine-weighted-hemisphere pdf (cos(theta) / PI): the cosine and PI
-        // terms cancel, leaving just the albedo.
-        throughput *= mat.baseColor.rgb;
+        // ------------------------------------------------------- NEE -----
+        if (neeOn && !MatIsDelta(mat))
+        {
+            LTLightSample ls = LT_SamplePointOnLight(hitPos, normal);
+            if (ls.pdfSolidAngle > 1e-20)
+            {
+                vec3 toLight = ls.position - hitPos;
+                float dist = length(toLight);
+                vec3 L = toLight / dist;
+                float cosSurf = dot(normal, L);
+                if (cosSurf > 1e-6)
+                {
+                    Ray shadowRay = MakeRay(hitPos + normal * 1e-4, L);
+                    if (!IntersectSceneOccluded(shadowRay, dist * 0.999))
+                    {
+                        // Balance heuristic against the BSDF strategy, both
+                        // pdfs in solid-angle measure at this vertex. The
+                        // weight deliberately uses the deterministic pdf
+                        // re-descent (LT_PdfSolidAngle) - the same function
+                        // the emitter-hit weight uses - rather than the
+                        // stochastic descent's own pdf: MIS weights only
+                        // need to form a consistent partition of unity, and
+                        // one shared function guarantees that even where it
+                        // deviates from the true sampling density. The
+                        // contribution itself still divides by the true pdf.
+                        float bsdfPdf = cosSurf / PI;
+                        float lightPdfEvalSA = LT_PdfSolidAngle(hitPos, normal, ls.triIdx, L, dist);
+                        float misWeight = lightPdfEvalSA / max(lightPdfEvalSA + bsdfPdf, 1e-20);
+                        vec3 brdf = mat.baseColor.rgb / PI;
+                        radiance += throughput * ls.emission * brdf * cosSurf
+                                    * misWeight / ls.pdfSolidAngle;
+                    }
+                }
+            }
+        }
+
+        // ----------------------------------------------- BSDF bounce -----
+        BsdfSample bs = SampleBsdf(mat, hit.normal, wi, false);
+        if (bs.weight == vec3(0.0)) break;
+        if (!bs.specular && bs.pdfDir <= 0.0) break;
+
+        // Delta events have no competing NEE strategy for the next emitter
+        // hit; pdf 0 signals MIS weight 1 above.
+        prevBsdfPdf = bs.specular ? 0.0 : bs.pdfDir;
+        prevNormal = normal;
+        throughput *= bs.weight;
 
         if (bounce > 3u)
         {
@@ -51,82 +127,11 @@ vec3 TracePath(Ray ray)
             throughput /= p;
         }
 
-        ray = MakeRay(hitPos + normal * 1e-4, newDir);
+        vec3 offN = (dot(bs.dir, hit.normal) >= 0.0) ? hit.normal : -hit.normal;
+        ray = MakeRay(hitPos + offN * 1e-4, bs.dir);
     }
 
     return radiance;
-}
-
-// ---------------------------------------------------------- Lens tracing --
-// Real Snell's-law ray tracing through a physical lens prescription
-// (Steinert et al. 2011), replacing the pinhole ray-gen formula below when
-// uFrame.lensParams.w > 0.5. See shaders/lens_common.glsl for the shared
-// per-surface geometry primitives and docs/ARCHITECTURE.md for the overall
-// design (coordinate conventions, dispersion approximation, etc).
-struct LensTraceResult { vec3 origin; vec3 dir; bool valid; };
-
-// Traces a ray from a point on the physical sensor, back-to-front through
-// `lensSurfaces` (index N-1 -> 0: the array is stored front-to-back, but
-// the primary ray travels sensor -> scene), into world space. `channel` in
-// {0,1,2} selects which representative wavelength's IOR to refract with
-// (R/G/B dispersion). Returns valid=false on vignetting (missed an
-// element's clear aperture), blocked-by-aperture-blades, or total internal
-// reflection - the caller treats that exactly like a missed scene ray
-// (contributes zero radiance for this channel/sample).
-LensTraceResult TraceThroughLens(vec2 sensorPosMM, vec2 apertureSampleMM, int channel)
-{
-    LensTraceResult result;
-    result.valid = false;
-
-    int surfaceCount = lensSurfaces.length();
-    if (surfaceCount == 0) return result;
-
-    vec3 O = vec3(sensorPosMM, 0.0);
-    float rearZ = lensSurfaces[surfaceCount - 1].iorRGB_z.w;
-    vec3 D = normalize(vec3(apertureSampleMM, rearZ) - O);
-
-    float etaPrev = 1.0; // sensor-side medium is air
-
-    for (int i = surfaceCount - 1; i >= 0; i--)
-    {
-        LensSurface surf = lensSurfaces[i];
-        float radius = surf.geometry.x;
-        float semiDiam = surf.geometry.z;
-        float isAperture = surf.geometry.w;
-        float zVertex = surf.iorRGB_z.w;
-
-        vec3 hitPos, normal;
-        if (!IntersectLensSurface(O, D, zVertex, radius, semiDiam, hitPos, normal))
-            return result; // missed the element / outside its clear aperture
-
-        if (isAperture > 0.5)
-        {
-            if (!PointInsideApertureBlades(hitPos.xy, surf.apertureData.z, surf.apertureData.x, surf.apertureData.y))
-                return result; // blocked by the diaphragm blades
-            O = hitPos;
-            continue; // aperture stop is flat and air-to-air: no refraction
-        }
-
-        // surf.iorRGB_z is "the medium AFTER surface i" in front-to-back
-        // (array) order. Walking back-to-front, arriving at surface i means
-        // we are currently IN that medium (etaPrev already reflects it) and
-        // about to cross INTO the medium on the other side, i.e. "after
-        // surface i-1" - or air if i==0 (crossing the front surface into
-        // object/world space).
-        float etaTo = (i == 0) ? 1.0 : lensSurfaces[i - 1].iorRGB_z[channel];
-        vec3 refracted;
-        if (!RefractSnell(D, normal, etaPrev / etaTo, refracted))
-            return result; // total internal reflection
-
-        O = hitPos;
-        D = normalize(refracted);
-        etaPrev = etaTo;
-    }
-
-    result.origin = WorldFromLensMM(O);
-    result.dir = WorldDirFromLens(D);
-    result.valid = true;
-    return result;
 }
 
 void main()
@@ -147,13 +152,12 @@ void main()
     // window-space origin when displaying it.
     vec2 ndc = (vec2(pixel) + jitter) / vec2(size) * 2.0 - 1.0;
 
-    bool lensMode = uFrame.lensParams.w > 0.5;
     vec3 sampleRadiance = vec3(0.0);
-
-    if (!lensMode)
+    if (uFrame.lensParams2.x < 0.5)
     {
-        float tanFovY = uFrame.lensParams.x;
-        float aspect = uFrame.lensParams.y;
+        // ------------------------------------------------- pinhole -------
+        float tanFovY = uFrame.cameraParams.x;
+        float aspect = uFrame.cameraParams.y;
         vec3 rayDir = normalize(uFrame.camForward.xyz
             + uFrame.camRight.xyz * (ndc.x * tanFovY * aspect)
             - uFrame.camUp.xyz * (ndc.y * tanFovY));
@@ -163,35 +167,11 @@ void main()
     }
     else
     {
-        float sensorWidthMM = uFrame.lensParams.z;
-        float aspect = uFrame.lensParams.y;
-        float sensorHeightMM = sensorWidthMM / aspect;
-        // A real lens forms an inverted image (unlike the pinhole formula's
-        // direct un-inverted projection), so the pixel->sensor-position
-        // mapping is pre-inverted here (negated on both axes relative to
-        // the pinhole convention) to compensate - the lens re-inverts it a
-        // second time on the way through, landing right-side-up. Verified
-        // by tracing a known off-center scene feature through TraceThroughLens
-        // and confirming it lands on the correct (not point-reflected) side.
-        vec2 sensorPosMM = vec2(-ndc.x * 0.5 * sensorWidthMM, ndc.y * 0.5 * sensorHeightMM);
-
-        int surfaceCount = lensSurfaces.length();
-        float rearSemiDiam = (surfaceCount > 0) ? lensSurfaces[surfaceCount - 1].geometry.z : 0.0;
-        vec2 apertureSampleMM = SampleApertureDiskMM(rearSemiDiam, RandomFloat2());
-
-        // R/G/B dispersion: each representative wavelength refracts to a
-        // physically distinct ray, so the scene is traced up to 3 times per
-        // sample; each channel keeps only its own color component (see
-        // docs/ARCHITECTURE.md).
-        for (int ch = 0; ch < 3; ch++)
-        {
-            LensTraceResult lt = TraceThroughLens(sensorPosMM, apertureSampleMM, ch);
-            if (!lt.valid) continue; // vignetted/blocked/TIR - skip the (expensive) scene trace entirely
-
-            Ray primaryRay = MakeRay(lt.origin, lt.dir);
-            vec3 channelRadiance = TracePath(primaryRay);
-            sampleRadiance[ch] = channelRadiance[ch];
-        }
+        // ---------------------------------------- lens camera (paper) ----
+        Ray primaryRay;
+        vec3 sensorFactor;
+        if (LensGenerateEyeRay(pixel, ndc, primaryRay, sensorFactor))
+            sampleRadiance = TracePath(primaryRay) * sensorFactor;
     }
 
     if (any(isnan(sampleRadiance)) || any(isinf(sampleRadiance))) sampleRadiance = vec3(0.0);

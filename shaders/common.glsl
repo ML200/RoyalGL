@@ -27,9 +27,9 @@ struct Triangle
 
 struct Material
 {
-    vec4 baseColor; // .rgb albedo
+    vec4 baseColor; // .rgb albedo (diffuse) / tint (glass)
     vec4 emissive;  // .rgb emissive radiance
-    vec4 params;    // x=metallic, y=roughness
+    vec4 params;    // x=metallic, y=roughness, z=ior, w=type (0=diffuse, 1=glass)
 };
 
 layout(std140, binding = 0) uniform FrameUBO
@@ -38,11 +38,13 @@ layout(std140, binding = 0) uniform FrameUBO
     vec4 camForward;   // xyz
     vec4 camRight;     // xyz
     vec4 camUp;        // xyz
-    vec4 lensParams;   // pinhole mode: x=tanHalfFovY, y=aspect
-                        // lens mode:    x=tanHalfFovY, y=aspect, z=sensorWidthMm, w=lensModeFlag(0/1)
+    vec4 cameraParams; // x=tanHalfFovY, y=aspect
     vec4 background;   // .rgb sky color, .a intensity
     uvec4 frameInfo;   // x=width, y=height, z=sampleIndex, w=maxBounces
-    vec4 renderParams; // x=exposure
+    vec4 renderParams; // x=exposure, y=total light power
+    uvec4 lightInfo;   // x=light triangle count, y=NEE enabled (0/1), z=BDPT light path count
+    vec4 lensParams;   // x=sensor half width mm, y=sensor half height mm, z=front vertex z mm, w=pupil plane z mm
+    vec4 lensParams2;  // x=camera mode (0=pinhole 1=lens), y=flare enabled, z=rear semi-diameter mm
 } uFrame;
 
 layout(std430, binding = 1) readonly buffer BVHNodesSSBO   { BVHNode bvhNodes[]; };
@@ -50,46 +52,30 @@ layout(std430, binding = 2) readonly buffer TriIndicesSSBO { uint triIndices[]; 
 layout(std430, binding = 3) readonly buffer TrianglesSSBO  { Triangle triangles[]; };
 layout(std430, binding = 4) readonly buffer MaterialsSSBO  { Material materials[]; };
 
-// One lens surface (see src/optics/LensSystem.h / src/gfx/GPUTypes.h
-// GPULensSurface for the authoritative field-by-field description).
-// `surfaces` is ordered front element (index 0) -> sensor-side (index
-// N-1); the primary (eye) ray tracer walks it back-to-front, the flare/
-// ghost light tracer walks it front-to-back.
-struct LensSurface
+// Emissive triangles in light-tree leaf-list order (see
+// src/pathtracer/LightTree.cpp), shared by the unidirectional NEE path
+// (light-tree descent, shaders/light_tree.glsl) and the bidirectional
+// kernels (power-CDF sampling, shaders/bdpt_common.glsl).
+struct LightTri
 {
-    vec4 geometry;     // x=signed radius mm, y=thickness-to-next mm, z=semiDiameter mm, w=isAperture(0/1)
-    vec4 iorRGB_z;      // xyz=IOR(R,G,B) of the medium after this surface; w=cumulative axial position (mm) from the sensor
-    vec4 coatingRGB;    // xyz=per-channel Fresnel-reflectance multiplier from AR coating (1,1,1=none)
-    vec4 apertureData;  // x=bladeCount(0=circular), y=bladeRotationRad, z=apertureRadiusMm (aperture row only)
+    vec4 p0, p1, p2;     // world-space position, .w unused
+    vec4 normalArea;     // xyz=geometric normal, w=area
+    vec4 emissionWeight; // rgb=emitted radiance, w=selection weight (area * luminance)
 };
-layout(std430, binding = 5) readonly buffer LensSurfacesSSBO { LensSurface lensSurfaces[]; };
+layout(std430, binding = 6) readonly buffer LightTrianglesSSBO { LightTri lightTris[]; };
 
-// One emissive triangle, used only by the flare/ghost light-tracing pass
-// (shaders/lens_flare.comp).
-struct LightTriangle
-{
-    vec4 p0, p1, p2;    // world-space position, .w unused
-    vec4 normal_area;   // xyz geometric normal, w=triangle area
-    vec4 emissive;      // .rgb radiance
-};
-layout(std430, binding = 6) readonly buffer LightsSSBO   { LightTriangle lights[]; };
-layout(std430, binding = 7) readonly buffer LightCDFSSBO { float lightCDF[]; }; // power-proportional CDF, normalized to [0,1]
+// Scene-triangle index -> lightTris index (LT_SENTINEL if not emissive).
+layout(std430, binding = 7) readonly buffer TriToLightSSBO { uint triToLight[]; };
 
-// One flare/ghost splat record: written by lens_flare.comp, read by
-// lens_flare_splat.vert.
-struct Splat
-{
-    vec4 pixelRadianceRG; // x=pixelX, y=pixelY, z=radiance.r, w=radiance.g
-    vec4 radianceBValid;  // x=radiance.b, y=validFlag(0/1)
-};
-layout(std430, binding = 8) buffer SplatBufferSSBO  { Splat splats[]; };
-layout(std430, binding = 9) buffer SplatCounterSSBO { uint splatCount; };
+// Normalized power-proportional CDF over lightTris (last entry 1.0).
+layout(std430, binding = 10) readonly buffer LightCdfSSBO { float lightCdf[]; };
+
+const uint  LT_SENTINEL = 0xFFFFFFFFu;
+const float LT_ONE_MINUS_EPSILON = 0.99999994;
 
 // ---------------------------------------------------------------- RNG ----
 // xorshift32, seeded per-invocation with a Wang hash. Not cryptographically
-// anything - just decorrelated enough for path tracing. Shared by every
-// compute shader in this project (each has its own g_rngState instance,
-// since GLSL globals are per-invocation, not actually shared state).
+// anything - just decorrelated enough for path tracing.
 uint g_rngState;
 
 uint WangHash(uint seed)
@@ -127,6 +113,120 @@ vec3 CosineSampleHemisphere(vec3 normal)
     return normalize(tangent * x + bitangent * y + normal * z);
 }
 
+// -------------------------------------------------------------- BSDF -----
+// Shared by the unidirectional kernel and both bidirectional subpath
+// kernels. Two material models: two-sided Lambertian diffuse, and a delta
+// dielectric ("glass") with exact Fresnel reflection/refraction.
+//
+// Direction convention: `wi` points from the surface toward the previous
+// path vertex, `wo` toward the next one; `n` is the interpolated shading
+// normal with its true geometric orientation (NOT pre-flipped - glass needs
+// the sign to tell entering from exiting).
+
+bool MatIsDelta(Material m) { return m.params.w > 0.5; }
+
+// Exact unpolarized dielectric Fresnel reflectance; returns 1 on total
+// internal reflection.
+float FresnelDielectric(float cosI, float etaI, float etaT)
+{
+    float r = etaI / etaT;
+    float sinT2 = r * r * max(0.0, 1.0 - cosI * cosI);
+    if (sinT2 >= 1.0) return 1.0;
+    float cosT = sqrt(1.0 - sinT2);
+    float rs = (etaI * cosI - etaT * cosT) / (etaI * cosI + etaT * cosT);
+    float rp = (etaT * cosI - etaI * cosT) / (etaT * cosI + etaI * cosT);
+    return 0.5 * (rs * rs + rp * rp);
+}
+
+// f(wi,wo) for connections and NEE, plus both direction pdfs (pdfDir =
+// pdf of sampling wo given wi, pdfRev = the reverse) - the reverse pdf
+// feeds the recursive MIS quantities. Delta materials return black: a
+// delta lobe can never be hit by a connection.
+vec3 EvalBsdf(Material mat, vec3 n, vec3 wi, vec3 wo, out float pdfDir, out float pdfRev, out float cosOut)
+{
+    pdfDir = 0.0;
+    pdfRev = 0.0;
+    cosOut = 0.0;
+    if (MatIsDelta(mat)) return vec3(0.0);
+
+    vec3 nf = (dot(n, wi) >= 0.0) ? n : -n;
+    float cosI = dot(nf, wi);
+    float cosO = dot(nf, wo);
+    if (cosI <= 1e-6 || cosO <= 1e-6) return vec3(0.0); // reflection side only
+    cosOut = cosO;
+    pdfDir = cosO / PI;
+    pdfRev = cosI / PI;
+    return mat.baseColor.rgb / PI;
+}
+
+struct BsdfSample
+{
+    vec3 dir;     // sampled wo
+    vec3 weight;  // f * cosOut / pdf - the throughput multiplier (tint for delta)
+    float pdfDir; // solid-angle pdf of dir (0 marks a delta event)
+    float pdfRev; // pdf of sampling wi from dir (0 for delta)
+    float cosOut; // |cos| between the oriented normal and dir
+    bool specular;
+};
+
+// `isLightPath` selects the transport mode: refraction compresses solid
+// angle, which scales *radiance* (eye paths) by (etaI/etaT)^2 but leaves
+// *importance* (light paths) untouched - the classic non-symmetric
+// scattering adjoint fix (Veach 5.3.2). Getting this wrong shows up as
+// glass that brightens or darkens depending on which subpath crossed it.
+BsdfSample SampleBsdf(Material mat, vec3 n, vec3 wi, bool isLightPath)
+{
+    BsdfSample bs;
+    bs.dir = vec3(0.0, 0.0, 1.0);
+    bs.weight = vec3(0.0);
+    bs.pdfDir = 0.0;
+    bs.pdfRev = 0.0;
+    bs.cosOut = 0.0;
+    bs.specular = false;
+
+    if (MatIsDelta(mat))
+    {
+        bs.specular = true;
+        float eta = max(mat.params.z, 1.0001);
+        bool entering = dot(n, wi) > 0.0;
+        vec3 nf = entering ? n : -n;
+        float etaI = entering ? 1.0 : eta;
+        float etaT = entering ? eta : 1.0;
+        float cosI = dot(nf, wi);
+        if (cosI <= 1e-6) return bs;
+
+        // Choose reflect/refract by the Fresnel reflectance itself: the
+        // F (or 1-F) in the BSDF cancels against the choice probability,
+        // leaving just the tint.
+        float F = FresnelDielectric(cosI, etaI, etaT);
+        if (RandomFloat() < F)
+        {
+            bs.dir = normalize(2.0 * cosI * nf - wi);
+            bs.weight = mat.baseColor.rgb;
+            bs.cosOut = cosI;
+        }
+        else
+        {
+            float etaRel = etaI / etaT;
+            bs.dir = normalize(refract(-wi, nf, etaRel));
+            bs.weight = mat.baseColor.rgb * (isLightPath ? 1.0 : etaRel * etaRel);
+            bs.cosOut = abs(dot(nf, bs.dir));
+        }
+        return bs;
+    }
+
+    vec3 nf = (dot(n, wi) >= 0.0) ? n : -n;
+    vec3 dir = CosineSampleHemisphere(nf);
+    float cosO = dot(nf, dir);
+    if (cosO <= 1e-6) return bs;
+    bs.dir = dir;
+    bs.cosOut = cosO;
+    bs.pdfDir = cosO / PI;
+    bs.pdfRev = max(dot(nf, wi), 0.0) / PI;
+    bs.weight = mat.baseColor.rgb; // (albedo/PI) * cos / (cos/PI)
+    return bs;
+}
+
 // --------------------------------------------------------------- Ray -----
 struct Ray { vec3 origin; vec3 dir; vec3 invDir; };
 
@@ -145,6 +245,7 @@ struct Hit
     vec3 normal;
     vec2 uv;
     uint materialIndex;
+    uint triIndex; // original scene-triangle index (pre-BVH-permutation)
 };
 
 const float RAY_TMAX = 1.0e30;
@@ -185,6 +286,27 @@ void IntersectTriangle(Ray ray, Triangle tri, uint triIdx, inout Hit hit)
     hit.normal = normalize(tri.n0.xyz * w + tri.n1.xyz * u + tri.n2.xyz * v);
     hit.uv = tri.uv0_uv1.xy * w + tri.uv0_uv1.zw * u + tri.uv2_material.xy * v;
     hit.materialIndex = uint(tri.uv2_material.z + 0.5);
+    hit.triIndex = triIdx;
+}
+
+// Boolean Moller-Trumbore: does the ray hit `tri` with t in (1e-4, tMax)?
+bool IntersectTriangleAny(Ray ray, Triangle tri, float tMax)
+{
+    vec3 v0 = tri.p0.xyz;
+    vec3 e1 = tri.p1.xyz - v0;
+    vec3 e2 = tri.p2.xyz - v0;
+    vec3 pvec = cross(ray.dir, e2);
+    float det = dot(e1, pvec);
+    if (abs(det) < 1e-9) return false;
+    float invDet = 1.0 / det;
+    vec3 tvec = ray.origin - v0;
+    float u = dot(tvec, pvec) * invDet;
+    if (u < 0.0 || u > 1.0) return false;
+    vec3 qvec = cross(tvec, e1);
+    float v = dot(ray.dir, qvec) * invDet;
+    if (v < 0.0 || u + v > 1.0) return false;
+    float t = dot(e2, qvec) * invDet;
+    return t > 1e-4 && t < tMax;
 }
 
 // Iterative, stack-based traversal of the tinybvh "Wald" BVH2. Root is
@@ -242,4 +364,42 @@ bool IntersectScene(Ray ray, out Hit hit)
     }
 
     return hit.materialIndex != NO_MATERIAL;
+}
+
+// Any-hit (shadow ray) variant of IntersectScene: returns true as soon as
+// anything blocks the ray before tMax. No closest-hit bookkeeping, no
+// front-to-back child ordering - any intersection ends the query.
+bool IntersectSceneOccluded(Ray ray, float tMax)
+{
+    int stack[64];
+    int stackPtr = 0;
+    int nodeIdx = 0;
+
+    while (true)
+    {
+        BVHNode node = bvhNodes[nodeIdx];
+        if (IntersectAABB(ray, node.aabbMin, node.aabbMax, tMax) == RAY_TMAX)
+        {
+            if (stackPtr == 0) break;
+            nodeIdx = stack[--stackPtr];
+            continue;
+        }
+
+        if (node.triCount > 0u)
+        {
+            for (uint i = 0u; i < node.triCount; i++)
+            {
+                uint triIdx = triIndices[node.leftFirst + i];
+                if (IntersectTriangleAny(ray, triangles[triIdx], tMax)) return true;
+            }
+            if (stackPtr == 0) break;
+            nodeIdx = stack[--stackPtr];
+            continue;
+        }
+
+        nodeIdx = int(node.leftFirst);
+        if (stackPtr < 64) stack[stackPtr++] = nodeIdx + 1;
+    }
+
+    return false;
 }

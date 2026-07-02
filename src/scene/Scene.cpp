@@ -42,7 +42,7 @@ namespace RoyalGL
         materials.push_back(Material{glm::vec3(0.65f, 0.05f, 0.05f), glm::vec3(0.0f), 0.0f, 1.0f}); // 1: left wall (red)
         materials.push_back(Material{glm::vec3(0.12f, 0.45f, 0.15f), glm::vec3(0.0f), 0.0f, 1.0f}); // 2: right wall (green)
         materials.push_back(Material{glm::vec3(0.73f, 0.73f, 0.73f), glm::vec3(0.0f), 0.0f, 1.0f}); // 3: back wall + ceiling
-        materials.push_back(Material{glm::vec3(1.0f, 1.0f, 1.0f), glm::vec3(80.0f, 80.0f, 80.0f), 0.0f, 1.0f}); // 4: light
+        materials.push_back(Material{glm::vec3(1.0f, 1.0f, 1.0f), glm::vec3(25.0f, 25.0f, 25.0f), 0.0f, 1.0f}); // 4: light
         materials.push_back(Material{glm::vec3(0.4f, 0.5f, 0.75f), glm::vec3(0.0f), 0.0f, 1.0f}); // 5: center box
 
         const float ext = 2.0f;    // room half-extent in X/Z
@@ -81,14 +81,12 @@ namespace RoyalGL
                 glm::vec3(ext, top, ext), glm::vec3(-ext, top, ext),
                 glm::vec3(0.0f, -1.0f, 0.0f), 3);
 
-        // A 5x5 grid of small, very bright emissive panels recessed just
-        // below the ceiling (many small point-like sources, ideal for
-        // exercising the flare/ghost + aperture-diffraction passes, unlike
-        // one large soft-shadowed area light).
+        // A 3x3 grid of small emissive panels recessed just below the
+        // ceiling.
         const float lightY = top - 0.02f;
         const float lightHalfSize = 0.12f;
-        const int lightGridN = 5;
-        const float lightSpacing = 0.75f;
+        const int lightGridN = 3;
+        const float lightSpacing = 1.1f;
         for (int gz = 0; gz < lightGridN; ++gz)
         {
             for (int gx = 0; gx < lightGridN; ++gx)
@@ -183,6 +181,42 @@ namespace RoyalGL
         return gpuTriangles;
     }
 
+    void Scene::MergeInstance(const Scene& other, const glm::vec3& floorCenter, float targetHeight,
+                               const Material& material)
+    {
+        if (other.triangles.empty()) return;
+
+        glm::vec3 mn = other.BoundsMin();
+        glm::vec3 mx = other.BoundsMax();
+        glm::vec3 size = mx - mn;
+        float scale = (size.y > 1e-6f) ? targetHeight / size.y : 1.0f;
+        glm::vec3 bottomCenter = glm::vec3((mn.x + mx.x) * 0.5f, mn.y, (mn.z + mx.z) * 0.5f);
+
+        uint32_t materialIndex = static_cast<uint32_t>(materials.size());
+        materials.push_back(material);
+
+        triangles.reserve(triangles.size() + other.triangles.size());
+        auto xform = [&](const Vertex& v)
+        {
+            Vertex out = v;
+            out.position = (v.position - bottomCenter) * scale + floorCenter;
+            // Uniform scale + translation: normals are unchanged.
+            return out;
+        };
+        for (const Triangle& t : other.triangles)
+        {
+            Triangle nt;
+            nt.v0 = xform(t.v0);
+            nt.v1 = xform(t.v1);
+            nt.v2 = xform(t.v2);
+            nt.materialIndex = materialIndex;
+            triangles.push_back(nt);
+        }
+
+        ROYALGL_LOG_INFO("Scene: merged instance with ", other.triangles.size(),
+                         " triangles at scale ", scale, ".");
+    }
+
     std::vector<GPUMaterial> Scene::BuildGPUMaterials() const
     {
         if (materials.empty())
@@ -202,7 +236,7 @@ namespace RoyalGL
             GPUMaterial gpuMat;
             gpuMat.baseColor = glm::vec4(mat.baseColor, 0.0f);
             gpuMat.emissive = glm::vec4(mat.emissive, 0.0f);
-            gpuMat.params = glm::vec4(mat.metallic, mat.roughness, 0.0f, 0.0f);
+            gpuMat.params = glm::vec4(mat.metallic, mat.roughness, mat.ior, static_cast<float>(mat.type));
             gpuMaterials.push_back(gpuMat);
         }
 

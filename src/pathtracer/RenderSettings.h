@@ -1,9 +1,16 @@
 #pragma once
 
 #include <glm/glm.hpp>
+#include "optics/LensSystem.h"
 
 namespace RoyalGL
 {
+    enum class CameraMode : int
+    {
+        Pinhole = 0,
+        Lens = 1 // physical lens per Steinert et al. 2011
+    };
+
     // User-tunable render settings, surfaced in the UI. Changing any of
     // these (compared via operator==) resets progressive accumulation.
     struct RenderSettings
@@ -14,26 +21,24 @@ namespace RoyalGL
         float backgroundIntensity = 1.0f;
         int maxSamples = 0; // 0 = unlimited
 
-        // Lens flare / ghost (bidirectional light-tracing) pass - see
-        // pathtracer/LensFlare.h and docs/ARCHITECTURE.md.
-        bool enableFlare = true;
-        int flareSamplesPerFrame = 65536;
-        // Artist-facing calibration multiplier, same rationale as
-        // diffractionIntensity below: the physically-derived connection
-        // throughput (flux through light-to-aperture, converted to a
-        // per-pixel-area value) is dimensionally correct but its absolute
-        // scale depends on scene-specific factors (light brightness/size,
-        // distance, lens aperture) that make photographically-plausible
-        // ghosts easy to under- or over-shoot; this compensates rather than
-        // asking every scene to hand-tune emissive intensities instead.
-        float flareIntensity = 60.0f;
+        // Next-event estimation via the light tree, MIS-combined with BSDF
+        // sampling (balance heuristic). Only affects the unidirectional
+        // pipeline (bidir has its own s=1 strategy). Off = pure BSDF
+        // sampling; both converge to the same image, which makes this a
+        // useful A/B check.
+        bool enableNEE = true;
 
-        // Aperture diffraction (Keller cone glare streaks), a stochastic
-        // branch inside the flare pass's aperture-stop handling.
-        bool enableDiffraction = true;
-        float diffractionEdgeEpsilonMM = 0.05f;
-        float diffractionBranchProbability = 0.5f;
-        float diffractionIntensity = 1.0f;
+        // Bidirectional path tracing (three compute passes, recursive MIS
+        // weights - see docs/ARCHITECTURE.md). Converges to the same image
+        // as the unidirectional pipeline; caustics through delta glass are
+        // only reachable efficiently here (t=1 light tracing).
+        bool enableBidir = true;
+
+        // Physical lens camera (Steinert et al. 2011). Lens mode renders
+        // through the unidirectional pipeline regardless of enableBidir -
+        // exact BDPT MIS through a lens is future work.
+        CameraMode cameraMode = CameraMode::Pinhole;
+        LensSettings lens;
 
         bool operator==(const RenderSettings& other) const
         {
@@ -42,13 +47,10 @@ namespace RoyalGL
                    backgroundColor == other.backgroundColor &&
                    backgroundIntensity == other.backgroundIntensity &&
                    maxSamples == other.maxSamples &&
-                   enableFlare == other.enableFlare &&
-                   flareSamplesPerFrame == other.flareSamplesPerFrame &&
-                   flareIntensity == other.flareIntensity &&
-                   enableDiffraction == other.enableDiffraction &&
-                   diffractionEdgeEpsilonMM == other.diffractionEdgeEpsilonMM &&
-                   diffractionBranchProbability == other.diffractionBranchProbability &&
-                   diffractionIntensity == other.diffractionIntensity;
+                   enableNEE == other.enableNEE &&
+                   enableBidir == other.enableBidir &&
+                   cameraMode == other.cameraMode &&
+                   lens == other.lens;
         }
         bool operator!=(const RenderSettings& other) const { return !(*this == other); }
     };

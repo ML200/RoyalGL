@@ -1,0 +1,77 @@
+#version 460 core
+#include "common.glsl"
+#include "lens_common.glsl"
+
+// Pixel pupil precomputation (Steinert et al. 2011 sec. 4.2, run on the
+// GPU as the paper suggests): for every pixel, trace trial paths from its
+// sensor point toward the global pupil (the rear element disc) and record
+// which ones make it through the whole system. The transmitted hits'
+// mean and maximum spread on the pupil plane define a per-pixel disc that
+// path generation then samples instead of the full rear element - raising
+// the ray passage rate from ~10% to ~80% in the paper's measurements.
+// Pixels whose pupil stays empty are fully vignetted (fisheye borders)
+// and get radius 0. Re-run whenever the lens or sensor geometry changes.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+const uint PUPIL_TRIALS = 64u;
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = ivec2(uFrame.frameInfo.xy);
+    if (pixel.x >= size.x || pixel.y >= size.y) return;
+
+    g_rngState = WangHash(uint(pixel.x) * 26927u + uint(pixel.y) * 48271u + 977u);
+    RandomFloat();
+
+    // Sensor point at the pixel center (jitter is below the pupil disc's
+    // margin anyway).
+    vec2 ndc = (vec2(pixel) + 0.5) / vec2(size) * 2.0 - 1.0;
+    vec3 sensorPos = vec3(SensorPosMm(ndc), 0.0);
+
+    float pupilZ = uFrame.lensParams.w;
+    float rearSemi = uFrame.lensParams2.z;
+
+    vec2 mean = vec2(0.0);
+    uint hits = 0u;
+    vec2 samplesXY[PUPIL_TRIALS];
+
+    for (uint i = 0u; i < PUPIL_TRIALS; ++i)
+    {
+        // Uniform disc sample over the global pupil.
+        vec2 r = RandomFloat2();
+        float rad = rearSemi * sqrt(r.x);
+        float phi = 2.0 * PI * r.y;
+        vec2 p = vec2(rad * cos(phi), rad * sin(phi));
+
+        vec3 dir = normalize(vec3(p, pupilZ) - sensorPos);
+        float transmission;
+        LensTraceResult lt = TraceLensFromSensor(sensorPos, dir, 550.0, false, transmission);
+        if (!lt.valid) { samplesXY[i] = vec2(1e9); continue; }
+
+        samplesXY[i] = p;
+        mean += p;
+        hits++;
+    }
+
+    vec4 pupil = vec4(0.0);
+    if (hits > 0u)
+    {
+        mean /= float(hits);
+        float maxR = 0.0;
+        for (uint i = 0u; i < PUPIL_TRIALS; ++i)
+        {
+            if (samplesXY[i].x > 1e8) continue;
+            maxR = max(maxR, length(samplesXY[i] - mean));
+        }
+        // The paper: radius covering all transmitted samples plus a small
+        // offset (the circle is a coarse approximation of the distorted
+        // pupil; the margin trades a few zero-contribution rays for
+        // unbiased coverage).
+        float radius = maxR * 1.15 + 0.02 * rearSemi;
+        pupil = vec4(mean, min(radius, rearSemi * 1.5), 1.0);
+    }
+
+    pixelPupils[uint(pixel.y) * uFrame.frameInfo.x + uint(pixel.x)] = pupil;
+}

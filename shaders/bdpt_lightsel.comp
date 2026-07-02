@@ -1,0 +1,19 @@
+#version 460 core
+#include "common.glsl"
+#include "light_tree.glsl"
+#include "bdpt_common.glsl"
+
+// BDPT pass 0: cache the camera-anchored light-selection pdf per light.
+// The anchor is fixed for the whole frame, so the deterministic tree
+// re-descent gives the same value for every pixel - computing it once per
+// light here turns every MIS-side pdf query in the other passes into a
+// single buffer read.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uFrame.lightInfo.x) return;
+    lightSelPdf[i] = LT_PdfSelectTriangle(uFrame.camPos.xyz, uFrame.camForward.xyz, i);
+}

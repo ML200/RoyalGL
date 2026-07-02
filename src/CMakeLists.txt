@@ -8,7 +8,6 @@ set(ROYALGL_SOURCES
     gfx/Buffer.cpp
     gfx/Texture.cpp
     gfx/FullscreenPass.cpp
-    gfx/Framebuffer.cpp
 
     scene/Camera.cpp
     scene/Scene.cpp
@@ -16,13 +15,10 @@ set(ROYALGL_SOURCES
 
     bvh/BVHBuilder.cpp
 
-    optics/Glass.cpp
     optics/LensSystem.cpp
-    optics/LensPrescription.cpp
 
     pathtracer/PathTracer.cpp
-    pathtracer/LightList.cpp
-    pathtracer/LensFlare.cpp
+    pathtracer/LightTree.cpp
 
     denoise/Denoiser.cpp
 
@@ -43,10 +39,8 @@ set(ROYALGL_HEADERS
     gfx/Buffer.h
     gfx/Texture.h
     gfx/FullscreenPass.h
-    gfx/Framebuffer.h
 
     scene/Camera.h
-    scene/CameraSettings.h
     scene/Material.h
     scene/Mesh.h
     scene/Scene.h
@@ -55,14 +49,11 @@ set(ROYALGL_HEADERS
     bvh/BVHBuilder.h
 
     optics/Glass.h
-    optics/LensSurface.h
     optics/LensSystem.h
-    optics/LensPrescription.h
 
     pathtracer/RenderSettings.h
     pathtracer/PathTracer.h
-    pathtracer/LightList.h
-    pathtracer/LensFlare.h
+    pathtracer/LightTree.h
 
     denoise/Denoiser.h
 

@@ -1,5 +1,4 @@
 #include "ui/UILayer.h"
-#include "optics/LensPrescription.h"
 
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
@@ -9,8 +8,6 @@
 #include <backends/imgui_impl_opengl3.h>
 
 #include <algorithm>
-#include <cstring>
-#include <cfloat>
 #include <vector>
 #include <string>
 
@@ -50,8 +47,8 @@ namespace RoyalGL
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
     }
 
-    UIFrameResult UILayer::Draw(RenderSettings& settings, CameraSettings& cameraSettings, LensSystem& lensSystem,
-                                 Scene& scene, uint32_t sampleCount, float frameTimeMs, bool oidnAvailable)
+    UIFrameResult UILayer::Draw(RenderSettings& settings, Scene& scene, uint32_t sampleCount, float frameTimeMs,
+                                 bool oidnAvailable)
     {
         UIFrameResult result;
 
@@ -71,110 +68,6 @@ namespace RoyalGL
 
         ImGui::Separator();
 
-        // Camera model / physical lens system
-        ImGui::Text("Camera Model");
-        CameraSettings beforeCameraSettings = cameraSettings;
-        LensSystem beforeLensSystem = lensSystem;
-
-        int modeIdx = static_cast<int>(cameraSettings.mode);
-        const char* modeNames[] = {"Pinhole", "Physical Lens"};
-        if (ImGui::Combo("Mode", &modeIdx, modeNames, 2))
-            cameraSettings.mode = static_cast<CameraMode>(modeIdx);
-
-        if (cameraSettings.mode == CameraMode::LensSystem)
-        {
-            static std::vector<std::string> presetNames = LensPrescription::BuiltinPresetNames();
-            if (ImGui::BeginCombo("Preset", cameraSettings.activeLensPreset.c_str()))
-            {
-                for (const std::string& p : presetNames)
-                {
-                    bool selected = (p == cameraSettings.activeLensPreset);
-                    if (ImGui::Selectable(p.c_str(), selected))
-                    {
-                        cameraSettings.activeLensPreset = p;
-                        result.lensPresetLoadRequested = true;
-                        result.lensPresetToLoad = p;
-                    }
-                }
-                ImGui::EndCombo();
-            }
-
-            float fStop = static_cast<float>(lensSystem.fStop);
-            if (ImGui::SliderFloat("F-stop", &fStop, 0.9f, 32.0f, "f/%.1f", ImGuiSliderFlags_Logarithmic))
-                lensSystem.fStop = fStop;
-            ImGui::SliderInt("Aperture blades", &lensSystem.apertureBlades, 3, 12);
-            float bladeRot = static_cast<float>(lensSystem.apertureBladeRotationDeg);
-            if (ImGui::SliderFloat("Blade rotation", &bladeRot, 0.0f, 60.0f, "%.1f deg"))
-                lensSystem.apertureBladeRotationDeg = bladeRot;
-            float focusDist = static_cast<float>(lensSystem.focusDistanceMm);
-            if (ImGui::SliderFloat("Focus distance (mm)", &focusDist, 200.0f, 100000.0f, "%.0f",
-                                    ImGuiSliderFlags_Logarithmic))
-                lensSystem.focusDistanceMm = focusDist;
-            float sensorSize[2] = {static_cast<float>(lensSystem.sensorWidthMm), static_cast<float>(lensSystem.sensorHeightMm)};
-            if (ImGui::InputFloat2("Sensor size (mm)", sensorSize))
-            {
-                lensSystem.sensorWidthMm = sensorSize[0];
-                lensSystem.sensorHeightMm = sensorSize[1];
-            }
-            float scale = static_cast<float>(lensSystem.scale);
-            if (ImGui::SliderFloat("Scale factor", &scale, 0.1f, 10.0f))
-                lensSystem.scale = scale;
-
-            if (ImGui::TreeNode("Surfaces"))
-            {
-                if (ImGui::BeginTable("LensSurfaces", 5, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg))
-                {
-                    ImGui::TableSetupColumn("Radius (mm)");
-                    ImGui::TableSetupColumn("Thickness (mm)");
-                    ImGui::TableSetupColumn("Material");
-                    ImGui::TableSetupColumn("Semi-diam (mm)");
-                    ImGui::TableSetupColumn("Aperture?");
-                    ImGui::TableHeadersRow();
-
-                    for (size_t i = 0; i < lensSystem.surfaces.size(); ++i)
-                    {
-                        LensSurface& s = lensSystem.surfaces[i];
-                        ImGui::TableNextRow();
-                        ImGui::PushID(static_cast<int>(i));
-
-                        float radius = static_cast<float>(s.radiusMm);
-                        ImGui::TableSetColumnIndex(0);
-                        ImGui::SetNextItemWidth(-FLT_MIN);
-                        if (ImGui::InputFloat("##radius", &radius, 0.0f, 0.0f, "%.3f")) s.radiusMm = radius;
-
-                        float thickness = static_cast<float>(s.thicknessMm);
-                        ImGui::TableSetColumnIndex(1);
-                        ImGui::SetNextItemWidth(-FLT_MIN);
-                        if (ImGui::InputFloat("##thickness", &thickness, 0.0f, 0.0f, "%.3f")) s.thicknessMm = thickness;
-
-                        char materialBuf[32];
-                        std::strncpy(materialBuf, s.material.c_str(), sizeof(materialBuf) - 1);
-                        materialBuf[sizeof(materialBuf) - 1] = '\0';
-                        ImGui::TableSetColumnIndex(2);
-                        ImGui::SetNextItemWidth(-FLT_MIN);
-                        if (ImGui::InputText("##material", materialBuf, sizeof(materialBuf))) s.material = materialBuf;
-
-                        float semiDiam = static_cast<float>(s.semiDiameterMm);
-                        ImGui::TableSetColumnIndex(3);
-                        ImGui::SetNextItemWidth(-FLT_MIN);
-                        if (ImGui::InputFloat("##semidiam", &semiDiam, 0.0f, 0.0f, "%.2f")) s.semiDiameterMm = semiDiam;
-
-                        ImGui::TableSetColumnIndex(4);
-                        ImGui::Checkbox("##isAperture", &s.isAperture);
-
-                        ImGui::PopID();
-                    }
-                    ImGui::EndTable();
-                }
-                if (ImGui::Button("Add surface"))
-                    lensSystem.surfaces.push_back(LensSurface{});
-                ImGui::TreePop();
-            }
-        }
-        result.lensChanged = (cameraSettings != beforeCameraSettings) || (lensSystem != beforeLensSystem);
-
-        ImGui::Separator();
-
         // Render settings
         RenderSettings before = settings;
         ImGui::SliderInt("Max bounces", &settings.maxBounces, 1, 32);
@@ -184,15 +77,30 @@ namespace RoyalGL
         ImGui::SliderInt("Max samples (0=inf)", &settings.maxSamples, 0, 20000);
 
         ImGui::Separator();
-        ImGui::Text("Lens Flare / Diffraction");
-        ImGui::Checkbox("Enable flare/ghosts", &settings.enableFlare);
-        ImGui::SliderInt("Flare samples/frame", &settings.flareSamplesPerFrame, 1024, 262144);
-        ImGui::SliderFloat("Flare intensity", &settings.flareIntensity, 0.0f, 500.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
-        ImGui::Checkbox("Enable aperture diffraction", &settings.enableDiffraction);
-        ImGui::SliderFloat("Diffraction edge epsilon (mm)", &settings.diffractionEdgeEpsilonMM, 0.005f, 0.5f, "%.3f",
-                            ImGuiSliderFlags_Logarithmic);
-        ImGui::SliderFloat("Diffraction branch prob.", &settings.diffractionBranchProbability, 0.05f, 0.95f);
-        ImGui::SliderFloat("Diffraction intensity", &settings.diffractionIntensity, 0.0f, 10.0f);
+        ImGui::Text("Camera Model");
+        int camIdx = static_cast<int>(settings.cameraMode);
+        const char* camNames[] = {"Pinhole", "Physical Lens (Steinert 2011)"};
+        if (ImGui::Combo("Camera", &camIdx, camNames, 2))
+            settings.cameraMode = static_cast<CameraMode>(camIdx);
+        if (settings.cameraMode == CameraMode::Lens)
+        {
+            ImGui::SliderFloat("F-number", &settings.lens.fNumber, 1.0f, 22.0f, "f/%.1f",
+                                ImGuiSliderFlags_Logarithmic);
+            ImGui::SliderFloat("Focus shift (mm)", &settings.lens.focusShiftMm, -5.0f, 20.0f);
+            ImGui::SliderFloat("Prescription scale", &settings.lens.scale, 0.1f, 2.0f);
+            ImGui::SliderInt("Aperture blades", &settings.lens.apertureBlades, 0, 12);
+            ImGui::SliderFloat("Blade rotation", &settings.lens.bladeRotationDeg, 0.0f, 60.0f, "%.1f deg");
+            ImGui::SliderFloat("Sensor height (mm)", &settings.lens.sensorHeightMm, 8.0f, 60.0f);
+            ImGui::Checkbox("Eye-side Fresnel ghosts", &settings.lens.enableFlare);
+        }
+
+        ImGui::Separator();
+        ImGui::Checkbox("Bidirectional (BDPT)", &settings.enableBidir);
+        ImGui::BeginDisabled(settings.enableBidir);
+        ImGui::Checkbox("NEE (light tree) + MIS", &settings.enableNEE);
+        ImGui::EndDisabled();
+        if (settings.enableBidir && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("Unidirectional-only: BDPT has its own light sampling strategy.");
 
         result.settingsChanged = (settings != before);
 
@@ -239,8 +147,19 @@ namespace RoyalGL
             {
                 ImGui::ColorEdit3("Base color", &mat.baseColor.x);
                 ImGui::ColorEdit3("Emissive", &mat.emissive.x, ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR);
-                ImGui::SliderFloat("Metallic", &mat.metallic, 0.0f, 1.0f);
-                ImGui::SliderFloat("Roughness", &mat.roughness, 0.0f, 1.0f);
+                int typeIdx = static_cast<int>(mat.type);
+                const char* typeNames[] = {"Diffuse", "Glass"};
+                if (ImGui::Combo("Type", &typeIdx, typeNames, 2))
+                    mat.type = static_cast<MaterialType>(typeIdx);
+                if (mat.type == MaterialType::Glass)
+                {
+                    ImGui::SliderFloat("IOR", &mat.ior, 1.01f, 2.5f);
+                }
+                else
+                {
+                    ImGui::SliderFloat("Metallic", &mat.metallic, 0.0f, 1.0f);
+                    ImGui::SliderFloat("Roughness", &mat.roughness, 0.0f, 1.0f);
+                }
             }
             ImGui::PopID();
         }

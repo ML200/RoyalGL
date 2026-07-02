@@ -27,6 +27,14 @@ namespace RoyalGL
         // fails, so the app always has something interesting to path trace.
         void LoadFallbackScene();
 
+        // Appends another scene's triangles as one "instance": uniformly
+        // scaled so its height becomes `targetHeight`, translated so its
+        // bounds' bottom center lands on `floorCenter`, and with every
+        // triangle's material replaced by `material` (appended to this
+        // scene's material list).
+        void MergeInstance(const Scene& other, const glm::vec3& floorCenter, float targetHeight,
+                           const Material& material);
+
         glm::vec3 BoundsMin() const;
         glm::vec3 BoundsMax() const;
 
