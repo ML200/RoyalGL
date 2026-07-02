@@ -50,6 +50,10 @@ namespace RoyalGL
         bool restirSpatial = true;
         int restirSpatialNeighbors = 3;
         float restirSpatialRadius = 30.0f; // pixels
+        // Phase 2 "lightweight BDPT": t=1 light tracing candidates binned
+        // into per-pixel reservoirs through the LRM, with caustic paths in
+        // a second reservoir. Off = Phase 1 camera-side techniques only.
+        bool restirLightTracing = true;
 
         // Global: off = every pipeline overwrites the image with its latest
         // sample instead of averaging, so naive PT / NEE / BDPT / ReSTIR
@@ -77,6 +81,7 @@ namespace RoyalGL
                    restirSpatial == other.restirSpatial &&
                    restirSpatialNeighbors == other.restirSpatialNeighbors &&
                    restirSpatialRadius == other.restirSpatialRadius &&
+                   restirLightTracing == other.restirLightTracing &&
                    accumulate == other.accumulate &&
                    cameraMode == other.cameraMode &&
                    lens == other.lens;

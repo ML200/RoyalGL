@@ -1,13 +1,17 @@
-// The bidirectional hybrid shift mapping (Phase 1: camera-side techniques
-// s<=1 only - paper Sec. 5 "t>=2" case restricted to our two-material
-// world). Requires common.glsl + restir_common.glsl included first.
+// The bidirectional hybrid shift mapping (paper Sec. 5, Phase 2 technique
+// set). Requires common.glsl + light_tree.glsl + bdpt_common.glsl +
+// restir_common.glsl included first.
 //
-// RestirShiftPath maps a base reservoir's path onto a new primary hit:
-// random-replay the scatters at vertices 1..r-2 from the stored seed, then
-// reconnect to the stored reconnection vertex x_r and reuse the cached
-// suffix radiance L_suf. Paths without a reconnection vertex (specular
-// chains ending on an emitter, environment paths, directly visible
-// emitters) are re-traced entirely by random replay.
+// RestirShiftPath maps a base reservoir's path onto a new primary hit.
+// Camera-side techniques (t>=2): random-replay the scatters at vertices
+// 1..r-2 from the stored seed, then reconnect to the stored reconnection
+// vertex x_r and reuse the cached suffix radiance L_suf. Paths without a
+// reconnection vertex (specular chains ending on an emitter, environment
+// paths, directly visible emitters) are re-traced entirely by random
+// replay. Light tracing (t=1, non-caustic): the REVERSE hybrid shift -
+// replay the light subpath from the stored seed up to y_{s-2}, reconnect
+// y_{s-2} to the destination pixel's primary hit (which becomes the new
+// y_{s-1} = x_1), and re-evaluate the deterministic camera connection.
 //
 // Everything is measured in solid angle (paper Sec. 7 / Appendix B):
 //   replayed scatter Jacobian  = pdf_base / pdf_shifted      (Eq. 53)
@@ -30,9 +34,194 @@ struct RestirShiftResult
     float replayPdf; // updated rcInfo.w
 };
 
+RestirShiftResult RestirShiftFail()
+{
+    RestirShiftResult res;
+    res.ok = false;
+    res.f = vec3(0.0);
+    res.jacobian = 0.0;
+    res.rcCos = 0.0;
+    res.rcDist2 = 0.0;
+    res.replayPdf = 1.0;
+    return res;
+}
+
+// Reverse hybrid shift for non-caustic t=1 paths (paper Sec. 5 "t<=1,
+// non-caustic"). The light subpath is replayed under the DESTINATION
+// domain's sampler: the light-tree descent is anchored at the destination
+// camera, so temporal shifts across a camera move may replay onto a
+// different emitter - that is ordinary random replay, priced by the pdf
+// ratio (Eq. 53); with a static camera the base subpath is reproduced
+// exactly. The reconnection Jacobian is the endpoint geometry ratio in
+// solid angle at y_{s-2} (Eq. 56, i=2), the same form as the camera-side
+// Eq. 55 with the moving endpoint on the x_1 side. The deterministic camera
+// connection (imageToSurface) changes f only - nothing samples it, so it
+// contributes no Jacobian. omega_tau is copied (Sec. 6.4 biased variant,
+// like the camera-side shift; Phase 5 recomputes it).
+RestirShiftResult RestirShiftLightPath(PathReservoir base, GBufferPixel dstG, vec3 dstWi,
+                                       vec3 dstCamPos, vec3 dstCamForward, float dstIpd)
+{
+    RestirShiftResult res = RestirShiftFail();
+    if (dstG.posDepth.w < 0.0) return res;
+
+    uint tech = floatBitsToUint(base.core.w);
+    uint s = RestirTechS(tech);
+    uint flags = RestirTechFlags(tech);
+    if ((flags & RESTIR_FLAG_CAUSTIC) != 0u) return res; // caustics: Phase 3, never shifted here
+    if (s < 2u) return res;
+    uint deltaMask = RestirFlagsDeltaMask(flags);
+
+    // The destination anchor x_1' must be connectable and non-emissive
+    // (light subpaths terminate on emitters, so no base path has an
+    // emissive x_1 - classification must match).
+    Material mX1 = materials[GBufMaterial(dstG)];
+    if (MatIsDelta(mX1)) return res;
+    if (dot(mX1.emissive.rgb, mX1.emissive.rgb) > 0.0) return res;
+
+    // ---------------------------------------------------- light replay ---
+    g_rngSeed = floatBitsToUint(base.fSeed.w);
+    RngStream(0u, RNG_EMIT);
+    float pdfDescent, pdfLeaf;
+    uint leaf = LT_Descend(dstCamPos, dstCamForward, pdfDescent);
+    if (pdfDescent <= 0.0) return res;
+    uint lightIdx = LT_SampleLeafTriangle(leaf, pdfLeaf);
+    float pickPdf = pdfDescent * pdfLeaf;
+    if (pickPdf <= 0.0) return res;
+    LightTri lt = lightTris[lightIdx];
+    vec3 lightN = lt.normalArea.xyz;
+    vec3 origin = BdptSampleLightPoint(lightIdx, RandomFloat2());
+    float invArea = 1.0 / max(lt.normalArea.w, 1e-10);
+
+    vec3 f;
+    float replayPdf;
+    vec3 prevPos, prevN;
+    vec3 prevWi = vec3(0.0);
+    Material prevMat = mX1; // overwritten before use; keeps GLSL happy
+    bool prevIsLight = (s == 2u);
+
+    if (s == 2u)
+    {
+        // y_{s-2} is the emission point itself; only the pick and the area
+        // sample are replayed (the emission direction is what the
+        // reconnection replaces).
+        prevPos = origin;
+        prevN = lightN;
+        f = lt.emissionWeight.rgb;
+        replayPdf = pickPdf * invArea;
+    }
+    else
+    {
+        vec3 dir = CosineSampleHemisphere(lightN);
+        float cosTheta = dot(lightN, dir);
+        if (cosTheta <= 1e-6) return res;
+        f = lt.emissionWeight.rgb * cosTheta;
+        replayPdf = pickPdf * invArea * cosTheta / PI;
+
+        Ray ray = MakeRay(origin + lightN * 1e-4, dir);
+        bool reached = false;
+        for (uint j = 1u; j + 1u < s; ++j) // vertices y_1 .. y_{s-2}
+        {
+            Hit hit;
+            if (!IntersectScene(ray, hit)) return res;
+            Material mat = materials[hit.materialIndex];
+            // Base subpaths have no interior emitters (bijectivity).
+            if (dot(mat.emissive.rgb, mat.emissive.rgb) > 0.0) return res;
+            bool isDelta = MatIsDelta(mat);
+            if (isDelta != (((deltaMask >> (j - 1u)) & 1u) == 1u)) return res;
+
+            vec3 hitPos = ray.origin + ray.dir * hit.t;
+            vec3 wi = -ray.dir;
+            if (j + 2u == s)
+            {
+                prevPos = hitPos;
+                prevN = hit.normal;
+                prevWi = wi;
+                prevMat = mat;
+                reached = true;
+                break;
+            }
+
+            RngStream(j, RNG_BSDF);
+            BsdfSample bs = SampleBsdf(mat, hit.normal, wi, true);
+            if (bs.weight == vec3(0.0)) return res;
+            if (!bs.specular && bs.pdfDir <= 0.0) return res;
+            float pdfStep = bs.choicePdf * (bs.specular ? 1.0 : bs.pdfDir);
+            f *= bs.weight * pdfStep;
+            replayPdf *= pdfStep;
+
+            vec3 offN = (dot(bs.dir, hit.normal) >= 0.0) ? hit.normal : -hit.normal;
+            ray = MakeRay(hitPos + offN * 1e-4, bs.dir);
+        }
+        if (!reached) return res;
+    }
+
+    // ----------------------------------- reconnection y_{s-2} -> x_1' ----
+    vec3 x1 = dstG.posDepth.xyz;
+    vec3 toX1 = x1 - prevPos;
+    float d2 = dot(toX1, toX1);
+    if (d2 <= 1e-12) return res;
+    float dist = sqrt(d2);
+    vec3 dirTo = toX1 / dist;
+
+    if (prevIsLight)
+    {
+        float cosL = dot(prevN, dirTo);
+        if (cosL <= 1e-6) return res; // one-sided emitter
+        f *= cosL;
+    }
+    else
+    {
+        float pd, pr, cosOut;
+        vec3 fb = EvalBsdf(prevMat, prevN, prevWi, dirTo, pd, pr, cosOut);
+        if (fb == vec3(0.0)) return res;
+        f *= fb * cosOut;
+    }
+
+    vec3 nf = (dot(prevN, dirTo) >= 0.0) ? prevN : -prevN;
+    Ray shadowRay = MakeRay(prevPos + nf * 1e-4, dirTo);
+    if (IntersectSceneOccluded(shadowRay, dist * 0.999)) return res;
+
+    // x_1' factors: BSDF toward the destination camera plus the
+    // deterministic t=1 camera factor, mirroring candidate creation in
+    // restir_light.comp. cosRc (cos at x_1' toward y_{s-2}) is the moving
+    // endpoint's cosine in the reconnection Jacobian.
+    float pdX, prX, cosRc;
+    vec3 fbX = EvalBsdf(mX1, dstG.normalMat.xyz, dstWi, -dirTo, pdX, prX, cosRc);
+    if (fbX == vec3(0.0)) return res;
+    vec3 nfX = (dot(dstG.normalMat.xyz, dstWi) >= 0.0) ? dstG.normalMat.xyz : -dstG.normalMat.xyz;
+    float cosToCam = dot(nfX, dstWi);
+    float cosAtCam = dot(dstCamForward, -dstWi);
+    if (cosAtCam <= 1e-3 || cosToCam <= 1e-6) return res;
+    float d2cam = dstG.posDepth.w * dstG.posDepth.w;
+    float imagePointToCamDist = dstIpd / cosAtCam;
+    float imageToSurface = (imagePointToCamDist * imagePointToCamDist) / cosAtCam
+                           * cosToCam / max(d2cam, 1e-12);
+    f *= fbX * imageToSurface;
+
+    // Jacobians: reverse reconnection (Eq. 56, i=2) + random replay (Eq. 53).
+    if (base.rcInfo.x <= 0.0 || base.rcInfo.y <= 0.0 || replayPdf <= 0.0) return res;
+    float J = (cosRc / base.rcInfo.x) * (base.rcInfo.y / d2);
+    J *= base.rcInfo.w / replayPdf;
+
+    res.f = f;
+    res.jacobian = J;
+    res.rcCos = cosRc;
+    res.rcDist2 = d2;
+    res.replayPdf = replayPdf;
+    res.ok = true;
+    if (any(isnan(res.f)) || any(isinf(res.f)) || isnan(J) || isinf(J) || J <= 0.0)
+        res = RestirShiftFail();
+    return res;
+}
+
 // dstG: primary hit of the target pixel; dstWi: unit vector from that hit
-// toward the camera that generated it (current or previous frame's).
-RestirShiftResult RestirShiftPath(PathReservoir base, GBufferPixel dstG, vec3 dstWi)
+// toward the camera that generated it; dstCamPos/dstCamForward/dstIpd: that
+// camera's position, forward axis and image-plane distance in pixel units
+// (current or previous frame's) - used only by t=1 shifts, which must
+// re-evaluate the camera connection and replay the light-tree descent in
+// the destination domain.
+RestirShiftResult RestirShiftPath(PathReservoir base, GBufferPixel dstG, vec3 dstWi,
+                                  vec3 dstCamPos, vec3 dstCamForward, float dstIpd)
 {
     RestirShiftResult res;
     res.ok = false;
@@ -47,6 +236,8 @@ RestirShiftResult RestirShiftPath(PathReservoir base, GBufferPixel dstG, vec3 ds
     uint tech = floatBitsToUint(base.core.w);
     uint s = RestirTechS(tech);
     uint t = RestirTechT(tech);
+    if (t == 1u)
+        return RestirShiftLightPath(base, dstG, dstWi, dstCamPos, dstCamForward, dstIpd);
     uint flags = RestirTechFlags(tech);
     bool rcValid = (flags & RESTIR_FLAG_RCVALID) != 0u;
     bool envEnd = (flags & RESTIR_FLAG_ENVEND) != 0u;

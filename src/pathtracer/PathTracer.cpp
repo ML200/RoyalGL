@@ -30,6 +30,11 @@ namespace RoyalGL
         // shaders/restir_common.glsl.
         constexpr size_t kPixelReservoirsBytes = 272;
         constexpr size_t kGBufferPixelBytes = 32;
+        // sizeof(LrmEntry) in shaders/restir_lrm.glsl, and the worst-case
+        // t=1 candidates per light subpath (must match LrmCapacity() there;
+        // a subpath makes at most maxLen-1 <= 7 camera connections).
+        constexpr size_t kLrmEntryBytes = 64;
+        constexpr uint32_t kMaxLrmEntriesPerPath = 8;
     }
 
     PathTracer::PathTracer()
@@ -40,8 +45,11 @@ namespace RoyalGL
           m_bdptResolveShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "bdpt_resolve.comp")),
           m_lensPupilShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "lens_pupil.comp")),
           m_restirGbufferShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_gbuffer.comp")),
+          m_restirLightShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_light.comp")),
           m_restirCameraShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_camera.comp")),
           m_restirTemporalShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_temporal.comp")),
+          m_restirCausticShiftShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_caustic_shift.comp")),
+          m_restirCausticMergeShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_caustic_merge.comp")),
           m_restirSpatialShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_spatial.comp")),
           m_restirResolveShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_resolve.comp")),
           m_restirDebugShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_debug.comp"))
@@ -102,6 +110,11 @@ namespace RoyalGL
         size_t pixelCount = size_t(m_width) * size_t(m_height);
         m_reservoirBuffer.Upload(nullptr, 3 * pixelCount * kPixelReservoirsBytes, GL_DYNAMIC_COPY);
         m_gbufferBuffer.Upload(nullptr, 2 * pixelCount * kGBufferPixelBytes, GL_DYNAMIC_COPY);
+        // LRM (Phase 2): entry pool sized for the worst case (7 connections
+        // per light subpath), heads = allocator slot + one per pixel.
+        m_lrmEntryBuffer.Upload(nullptr, size_t(m_numLightPaths) * kMaxLrmEntriesPerPath * kLrmEntryBytes,
+                                GL_DYNAMIC_COPY);
+        m_lrmHeadBuffer.Upload(nullptr, (pixelCount + 1) * sizeof(uint32_t), GL_DYNAMIC_COPY);
         // Zero-filled: a zeroed reservoir is a valid empty reservoir
         // (W=0, confidence=0).
         GL_CALL(glClearNamedBufferData(m_reservoirBuffer.Id(), GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr));
@@ -168,7 +181,8 @@ namespace RoyalGL
         uint32_t restirFlags = (restirActive ? 1u : 0u)
                              | (settings.restirTemporal ? 2u : 0u)
                              | (settings.restirSpatial ? 4u : 0u)
-                             | (settings.accumulate ? 8u : 0u);
+                             | (settings.accumulate ? 8u : 0u)
+                             | (settings.restirLightTracing ? 16u : 0u);
         frame.restirParams = glm::uvec4(static_cast<uint32_t>(settings.restirDebugView),
                                         restirFlags, m_frameCounter, m_restirParity);
 
@@ -202,14 +216,19 @@ namespace RoyalGL
         if (restirActive)
         {
             // ------------------------- ReSTIR frame path (per-frame) -----
-            // G-buffer -> initial candidates (Alg. 2, s<=1) -> temporal ->
-            // spatial -> resolve. Regions/halves are selected inside the
-            // shaders via restirParams - see restir_common.glsl.
+            // G-buffer -> light subpaths + LRM (Alg. 1) -> initial
+            // candidates + LRM merge (Alg. 2) -> temporal -> spatial ->
+            // resolve. Regions/halves are selected inside the shaders via
+            // restirParams - see restir_common.glsl.
             m_reservoirBuffer.BindBase();
             m_gbufferBuffer.BindBase();
             m_lightVertexBuffer.BindBase();
             m_splatBuffer.BindBase();
             m_lightVertCountBuffer.BindBase();
+            // Rebind the lens-only bindings 13/14 to the LRM (safe: ReSTIR
+            // is pinhole-only, no lens shader runs this frame).
+            m_lrmEntryBuffer.BindBase();
+            m_lrmHeadBuffer.BindBase();
             if (m_lightSelPdfCount != std::max(lightTree.LightCount(), 1u))
             {
                 m_lightSelPdfCount = std::max(lightTree.LightCount(), 1u);
@@ -226,10 +245,34 @@ namespace RoyalGL
                 GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));
             }
 
-            // Deterministic V-buffer for this frame's camera.
+            // Deterministic V-buffer for this frame's camera (before the
+            // light pass - it anchors the t<=1 V-buffer rejection test).
             m_restirGbufferShader.Use();
             m_restirGbufferShader.Dispatch(groupsX, groupsY, 1u);
             GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));
+
+            bool lightTracing = settings.restirLightTracing && lightTree.LightCount() > 0;
+            auto clearLrmHeads = [&]()
+            {
+                // Reset the LRM: allocator = 0, per-pixel heads = empty.
+                const uint32_t zero = 0u;
+                const uint32_t sentinel = 0xFFFFFFFFu;
+                uint32_t pixelCount = static_cast<uint32_t>(m_width) * static_cast<uint32_t>(m_height);
+                GL_CALL(glClearNamedBufferSubData(m_lrmHeadBuffer.Id(), GL_R32UI, 0, sizeof(uint32_t),
+                                                  GL_RED_INTEGER, GL_UNSIGNED_INT, &zero));
+                GL_CALL(glClearNamedBufferSubData(m_lrmHeadBuffer.Id(), GL_R32UI, sizeof(uint32_t),
+                                                  size_t(pixelCount) * sizeof(uint32_t),
+                                                  GL_RED_INTEGER, GL_UNSIGNED_INT, &sentinel));
+            };
+
+            if (lightTracing)
+            {
+                // Trace N_L light subpaths binning t=1 candidates per pixel.
+                clearLrmHeads();
+                m_restirLightShader.Use();
+                m_restirLightShader.Dispatch((m_numLightPaths + 63u) / 64u, 1u, 1u);
+                GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));
+            }
 
             m_restirCameraShader.Use();
             m_restirCameraShader.Dispatch(groupsX, groupsY, 1u);
@@ -239,6 +282,21 @@ namespace RoyalGL
             {
                 m_restirTemporalShader.Use();
                 m_restirTemporalShader.Dispatch(groupsX, groupsY, 1u);
+                GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));
+            }
+            if (settings.restirTemporal && lightTracing)
+            {
+                // Caustic temporal reuse (Phase 3, frame-graph pass 7):
+                // re-bin the previous frame's caustic reservoirs into the
+                // pixels their replayed paths land in (reusing the LRM -
+                // the camera pass has consumed the light entries), then
+                // merge per pixel with proxy confidence.
+                clearLrmHeads();
+                m_restirCausticShiftShader.Use();
+                m_restirCausticShiftShader.Dispatch(groupsX, groupsY, 1u);
+                GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));
+                m_restirCausticMergeShader.Use();
+                m_restirCausticMergeShader.Dispatch(groupsX, groupsY, 1u);
                 GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));
             }
             if (settings.restirSpatial)

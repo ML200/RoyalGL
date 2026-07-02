@@ -3,21 +3,39 @@
 #include "light_tree.glsl"
 #include "bdpt_common.glsl"
 #include "restir_common.glsl"
+#include "restir_lrm.glsl"
 
 // ReSTIR pass: initial candidate generation + streaming RIS (paper Alg. 2,
-// restricted to Phase 1's camera-side techniques). One camera subpath per
-// pixel, anchored at the G-buffer primary hit (pixel center, no jitter).
-// At every vertex the two available techniques produce candidates:
+// Phase 2 technique set {s=0, s=1, t=1} - "lightweight BDPT"). One camera
+// subpath per pixel, anchored at the G-buffer primary hit (pixel center, no
+// jitter). At every vertex the camera-side techniques produce candidates:
 //   s=0 - the subpath hits an emitter (or the environment) via BSDF sampling,
 //   s=1 - next event estimation toward the camera-anchored light CDF,
-// each carrying its 2-technique balance-heuristic MIS weight omega_tau.
-// Candidates are streamed into the pixel's reservoir with resampling weight
+// each carrying its balance-heuristic MIS weight omega_tau over the full
+// technique set (the t=1 competitor enters through the dT1 accumulator, see
+// below). Candidates are streamed into the pixel's reservoir with
 //   w = m * pHat * (1/p) = omega * lum(f) / p        (m = 1, Eq. 26 t>=2)
 // and the winner keeps the data every shift needs: the replay seed, the
 // reconnection vertex x_r (first vertex whose predecessor pair is
 // connectable), the suffix radiance L_suf leaving x_r (direction-independent
 // for Lambertian/one-sided-emitter x_r), and the replayed-scatter pdf
 // product for Jacobians.
+//
+// After the camera subpath, this pixel's LRM entries (t=1 candidates from
+// restir_light.comp, already weighted with m = 1/N_L) are merged: caustic
+// entries stream into the pixel's CAUSTIC reservoir (written straight to
+// the final region - never reused in Phase 2), the rest join the regular
+// RIS stream. Initial-sampling confidence stays 1 regardless of candidate
+// count (paper 7.1).
+//
+// dT1 - the eye-side t=1 MIS competitor: the single term of the classic
+// dVC recursion (bdpt_common.glsl) seeded by dVCM_1 = N_L/cameraPdf, i.e.
+// the pdf ratio of "the light subpath reaches x_1 and connects to the
+// camera". Interior dVCM additions (s>=2 vertex connections, Phase 4) are
+// dropped; delta vertices scale by cosOut exactly like the full recursion,
+// and a delta x_1 kills the term (no t=1 connection at a delta vertex).
+// restir_light.comp applies the mirrored restriction on the light side, so
+// the three techniques' weights sum to 1 on every path.
 //
 // f / pdf convention (see restir_common.glsl): delta scatters contribute
 // choicePdf to pdfs and choicePdf*tint to f; the delta distributions cancel
@@ -41,11 +59,14 @@ void main()
     uint idx = RestirPixelIndex(pixel);
     uint outSlot = RestirRegionOffset(RestirCandidateOutRegion()) + idx;
 
+    uint causticSlot = RestirRegionOffset(RestirFinalRegion()) + idx;
+
     GBufferPixel g = gbuf[GBufCurOffset() + idx];
     if (g.posDepth.w < 0.0)
     {
         // Primary miss: the resolve pass adds the background directly.
         pixelRes[outSlot].path = RestirEmptyReservoir();
+        pixelRes[causticSlot].caustic = RestirEmptyCaustic();
         return;
     }
 
@@ -73,7 +94,27 @@ void main()
     float pProd = 1.0;       // product of all sampled pdfs so far (solid angle)
     uint deltaMask = 0u;
     bool haveLights = uFrame.lightInfo.x > 0u;
+    bool lightTracing = RestirLightTracingEnabled() && haveLights;
     uint maxLen = BdptMaxPathLength();
+    float numLightPaths = float(BdptNumLightPaths());
+
+    // Eye-side t=1 MIS competitor (see header). Seeded like bdpt_eye.comp's
+    // dVCM_1 from the deterministic pixel-center camera pdf.
+    float dT1 = 0.0;
+    if (lightTracing)
+    {
+        vec3 v = x - uFrame.camPos.xyz;
+        float d2v = dot(v, v);
+        float cosAtCam = dot(v * inversesqrt(max(d2v, 1e-12)), uFrame.camForward.xyz);
+        float cosIn1 = abs(dot(n, wi));
+        if (cosAtCam > 1e-3 && cosIn1 > 1e-6)
+        {
+            float ipd = BdptImagePlaneDist();
+            float imagePointToCamDist = ipd / cosAtCam;
+            float cameraPdfW = (imagePointToCamDist * imagePointToCamDist) / cosAtCam;
+            dT1 = (numLightPaths / cameraPdfW) * (d2v / cosIn1);
+        }
+    }
 
     // Last sampled edge (arriving at the current vertex): continuous solid-
     // angle pdf and squared length - feed the s=0 MIS weight. Zero pdf marks
@@ -130,14 +171,19 @@ void main()
             if (cosHit > 1e-6)
             {
                 float omega = 1.0;
-                if (pathLen > 1u && lastEdgePdfW > 0.0 && lightIdx != LT_SENTINEL)
+                if (pathLen > 1u && lightIdx != LT_SENTINEL)
                 {
-                    // Balance heuristic vs the eval NEE pdf of this point,
-                    // converted to solid angle at x_{k-1}.
+                    // Balance heuristic over the technique set: s=1 (eval
+                    // NEE pdf converted to solid angle at x_{k-1}; only
+                    // exists when x_{k-1} is connectable, i.e. lastEdgePdfW
+                    // > 0) and t=1 (emission pdf times the dT1 ratio, which
+                    // survives delta chains just like the classic dVC).
                     float directPdfA, emissionPdfW;
                     BdptLightPdfs(lightIdx, cosHit, directPdfA, emissionPdfW);
-                    float neePdfW = directPdfA * lastEdgeDist2 / cosHit;
-                    omega = lastEdgePdfW / (lastEdgePdfW + neePdfW);
+                    float ratioSum = 1.0 + emissionPdfW * dT1;
+                    if (lastEdgePdfW > 0.0)
+                        ratioSum += (directPdfA * lastEdgeDist2 / cosHit) / lastEdgePdfW;
+                    omega = 1.0 / ratioSum;
                 }
 
                 vec3 fCand = fCur * mat.emissive.rgb;
@@ -204,7 +250,17 @@ void main()
 
                 if (fb != vec3(0.0) && directPdfW > 1e-20 && directPdfWTrue > 1e-20)
                 {
-                    float omega = directPdfW / (directPdfW + bsdfDirPdfW);
+                    // Balance heuristic: s=0 (BSDF-samples the light point)
+                    // and t=1. The t=1 ratio is the classic wCamera term of
+                    // bdpt_eye.comp restricted to the light-tracing split:
+                    // at x_1 the "connection at x_1" ratio IS t=1 (dVCM_1 =
+                    // dT1 seed, no reverse-pdf factor); deeper vertices
+                    // carry it through the scatter's reverse pdf.
+                    float wT1 = 0.0;
+                    if (lightTracing)
+                        wT1 = (emissionPdfW * cosToLight / (directPdfW * cosAtLight))
+                            * (pathLen == 1u ? dT1 : bsdfRevPdfW * dT1);
+                    float omega = directPdfW / (directPdfW + bsdfDirPdfW + directPdfW * wT1);
                     vec3 fCand = fCur * fb * cosToLight * lt.emissionWeight.rgb;
                     float pCand = pProd * directPdfWTrue;
                     float w = omega * RestirLum(fCand) / pCand;
@@ -259,6 +315,15 @@ void main()
         pProd *= pdfStep;
         prevConnectable = !isDelta;
 
+        // dT1 recursion (see header): a delta x_1 kills the t=1 term, delta
+        // interiors scale by cosOut (their forward/reverse delta pdfs
+        // cancel), and only the first scatter enters without a reverse-pdf
+        // factor (the t=1 connection at x_1 is deterministic).
+        if (bs.specular)
+            dT1 = (pathLen == 1u) ? 0.0 : dT1 * bs.cosOut;
+        else
+            dT1 = (bs.cosOut / bs.pdfDir) * (pathLen == 1u ? dT1 : dT1 * bs.pdfRev);
+
         vec3 offN = (dot(bs.dir, n) >= 0.0) ? n : -n;
         Ray ray = MakeRay(x + offN * 1e-4, bs.dir);
         Hit hit;
@@ -302,7 +367,65 @@ void main()
         wi = -bs.dir;
         lastEdgePdfW = bs.specular ? 0.0 : bs.pdfDir;
         lastEdgeDist2 = hit.t * hit.t;
+        dT1 /= max(abs(dot(hit.normal, bs.dir)), 1e-6); // arrival, like dVC
     }
+
+    // ------------------------------------------------------ LRM merge ----
+    // t=1 candidates binned to this pixel by restir_light.comp; their RIS
+    // weights already carry m = 1/N_L and omega_tau. Caustic entries feed a
+    // separate one-frame reservoir (never reused in Phase 2), the rest join
+    // the regular stream.
+    CausticReservoir cRes = RestirEmptyCaustic();
+    if (lightTracing)
+    {
+        float cWSum = 0.0;
+        LrmEntry cSel;
+        cSel.fW = vec4(0.0);
+        cSel.rcInfo = vec4(0.0);
+        cSel.meta = uvec4(0u);
+        bool haveCaustic = false;
+
+        uint eIdx = lrmHeads[1u + idx];
+        while (eIdx != LRM_SENTINEL)
+        {
+            LrmEntry e = lrmEntries[eIdx];
+            float w = e.fW.w;
+            if (w > 0.0 && !isnan(w) && !isinf(w))
+            {
+                if ((RestirTechFlags(e.meta.x) & RESTIR_FLAG_CAUSTIC) != 0u)
+                {
+                    cWSum += w;
+                    if (RestirRand(risRng) * cWSum <= w) { cSel = e; haveCaustic = true; }
+                }
+                else
+                {
+                    wSum += w;
+                    if (RestirRand(risRng) * wSum <= w)
+                    {
+                        sel = RestirEmptyReservoir();
+                        sel.core.w = uintBitsToFloat(e.meta.x);
+                        sel.core.y = e.rcInfo.z * RestirLum(e.fW.xyz);
+                        sel.fSeed = vec4(e.fW.xyz, uintBitsToFloat(e.meta.y));
+                        sel.rcInfo = e.rcInfo;
+                    }
+                }
+            }
+            eIdx = e.meta.z;
+        }
+
+        if (haveCaustic)
+        {
+            float cPHat = cSel.rcInfo.z * RestirLum(cSel.fW.xyz);
+            if (cPHat > 0.0)
+            {
+                cRes.core = vec4(cWSum / cPHat, cPHat, 1.0, uintBitsToFloat(cSel.meta.x));
+                cRes.fSeed = vec4(cSel.fW.xyz, uintBitsToFloat(cSel.meta.y));
+                cRes.meta = vec4(cSel.rcInfo.z, cSel.rcInfo.w, 0.0, 0.0);
+                if (isnan(cRes.core.x) || isinf(cRes.core.x)) cRes.core.x = 0.0;
+            }
+        }
+    }
+    pixelRes[causticSlot].caustic = cRes;
 
     // Finalize: rc index for s=0 candidates was folded into flags at
     // creation time via rcIdx; W = wSum / pHat(selected).

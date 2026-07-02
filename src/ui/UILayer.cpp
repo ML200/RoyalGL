@@ -141,6 +141,7 @@ namespace RoyalGL
         {
             if (settings.cameraMode == CameraMode::Lens)
                 ImGui::TextDisabled("Pinhole only - lens mode falls back to plain BDPT.");
+            ImGui::Checkbox("Light tracing (t=1)", &settings.restirLightTracing);
             ImGui::Checkbox("Temporal reuse", &settings.restirTemporal);
             ImGui::Checkbox("Spatial reuse", &settings.restirSpatial);
             if (settings.restirSpatial)
@@ -149,8 +150,9 @@ namespace RoyalGL
                 ImGui::SliderFloat("Spatial radius (px)", &settings.restirSpatialRadius, 4.0f, 100.0f);
             }
             const char* dbgNames[] = {"Off", "G-buffer normals", "G-buffer depth", "Motion vectors",
-                                      "Reservoir W", "Confidence", "Technique (s,t)"};
-            ImGui::Combo("ReSTIR debug view", &settings.restirDebugView, dbgNames, 7);
+                                      "Reservoir W", "Confidence", "Technique (s,t)",
+                                      "Caustic W", "LRM entries", "Caustic confidence"};
+            ImGui::Combo("ReSTIR debug view", &settings.restirDebugView, dbgNames, 10);
         }
 
         result.settingsChanged = (settings != before);

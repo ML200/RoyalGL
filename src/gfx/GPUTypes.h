@@ -59,7 +59,8 @@ namespace RoyalGL
         glm::vec4 prevCamRight;    // xyz, w unused
         glm::vec4 prevCamUp;       // xyz, w unused
         glm::vec4 prevCameraParams;// x=tanHalfFovY, y=aspect, z/w unused
-        glm::uvec4 restirParams;   // x=debug view index, y=ReSTIR active (0/1),
+        glm::uvec4 restirParams;   // x=debug view index, y=flags (bit0 active, bit1 temporal,
+                                   // bit2 spatial, bit3 accumulate, bit4 light tracing),
                                    // z=frame counter (never reset), w=ping-pong parity
     };
 

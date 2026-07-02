@@ -1,0 +1,62 @@
+#version 460 core
+#include "common.glsl"
+#include "light_tree.glsl"
+#include "bdpt_common.glsl"
+#include "restir_common.glsl"
+#include "restir_lrm.glsl"
+#include "restir_caustic.glsl"
+
+// ReSTIR pass: caustic temporal reuse, stage 1 of 2 (paper Sec. 5.1;
+// docs/RESTIR_BDPT_PLAN.md Phase 3, frame-graph pass 7). One invocation per
+// PREVIOUS-frame pixel: its caustic history reservoir is shifted into the
+// current frame by pure random replay (restir_caustic.glsl) and RE-BINNED
+// into whatever pixel the shifted path lands in, via the LRM linked list
+// (cleared again by PathTracer.cpp after restir_camera.comp consumed the
+// light-pass entries). restir_caustic_merge.comp then merges each pixel's
+// landed entries with its canonical (this-frame) caustic reservoir.
+//
+// Entry payload (see restir_lrm.glsl): the shifted f and the base W, the
+// base pHat + forward Jacobian (for the merge's balance heuristic), the
+// copied omega_tau, the shifted replay pdf (becomes the winner's new
+// rcInfo), and the history confidence.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+const float RESTIR_CONFIDENCE_CAP = 20.0;
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = ivec2(uFrame.frameInfo.xy);
+    if (pixel.x >= size.x || pixel.y >= size.y) return;
+    if (uFrame.lightInfo.x == 0u) return;
+
+    uint idx = RestirPixelIndex(pixel);
+    CausticReservoir h = pixelRes[RestirRegionOffset(RestirHistoryRegion()) + idx].caustic;
+    if (h.core.x <= 0.0 || h.core.y <= 0.0) return;
+
+    uint tech = floatBitsToUint(h.core.w);
+    uint s = RestirTechS(tech);
+    uint deltaMask = RestirFlagsDeltaMask(RestirTechFlags(tech));
+
+    RestirCausticReplayResult res = RestirCausticReplay(
+        floatBitsToUint(h.fSeed.w), s, deltaMask,
+        uFrame.camPos.xyz, uFrame.camForward.xyz, uFrame.camRight.xyz, uFrame.camUp.xyz,
+        uFrame.cameraParams.x, uFrame.cameraParams.y);
+    if (!res.ok) return;
+
+    // Same support convention as candidate creation: paths landing on
+    // primary-miss pixels are dropped (the resolve shows the background).
+    uint dstIdx = RestirPixelIndex(res.pixel);
+    if (gbuf[GBufCurOffset() + dstIdx].posDepth.w < 0.0) return;
+
+    // Pure-replay Jacobian (Eq. 53): base pdf product over shifted's.
+    float J = h.meta.y / res.replayPdf;
+    if (isnan(J) || isinf(J) || J <= 0.0) return;
+
+    LrmAppend(dstIdx,
+              vec4(res.f, h.core.x),                       // shifted f, base W
+              vec4(h.core.y, J, h.meta.x, res.replayPdf),  // base pHat, J, omega, new replayPdf
+              tech, floatBitsToUint(h.fSeed.w),
+              floatBitsToUint(min(h.core.z, RESTIR_CONFIDENCE_CAP)));
+}

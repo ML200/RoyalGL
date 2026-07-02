@@ -51,8 +51,11 @@ namespace RoyalGL
         Shader m_bdptResolveShader;
         Shader m_lensPupilShader;
         Shader m_restirGbufferShader;
+        Shader m_restirLightShader;
         Shader m_restirCameraShader;
         Shader m_restirTemporalShader;
+        Shader m_restirCausticShiftShader;
+        Shader m_restirCausticMergeShader;
         Shader m_restirSpatialShader;
         Shader m_restirResolveShader;
         Shader m_restirDebugShader;
@@ -78,6 +81,12 @@ namespace RoyalGL
         // together ~600 B/pixel.
         Buffer m_reservoirBuffer{BufferType::ShaderStorage, 15};
         Buffer m_gbufferBuffer{BufferType::ShaderStorage, 0};
+        // Light Reservoir Map (Phase 2, shaders/restir_lrm.glsl): staged t=1
+        // candidate entries + per-pixel linked-list heads (slot 0 is the
+        // entry allocator). Reclaims the lens-only bindings 13/14 - ReSTIR
+        // is pinhole-only, so the lens shaders never run in the same frame.
+        Buffer m_lrmEntryBuffer{BufferType::ShaderStorage, 13};
+        Buffer m_lrmHeadBuffer{BufferType::ShaderStorage, 14};
         uint32_t m_restirParity = 0;
         int m_restirWidth = 0;  // resolution the ReSTIR buffers were sized for
         int m_restirHeight = 0;

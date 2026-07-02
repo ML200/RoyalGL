@@ -7,9 +7,14 @@
 // identified by its BDPT technique (s,t) plus the replay seed and cached
 // reconnection data needed to shift it into another pixel's domain. Phase 1
 // covers camera-side techniques s=0 (BSDF hit on emitter/environment) and
-// s=1 (NEE); everything is integrated in SOLID ANGLE at each vertex (paper
-// sec. 7), so f is a pure product of local rho*cos terms and the shift
-// Jacobians are Appendix B's pdf/geometry ratios.
+// s=1 (NEE); Phase 2 adds t=1 light tracing (the lightweight-BDPT technique
+// set {s=0, s=1, t=1}) with caustic t=1 paths routed into the per-pixel
+// caustic reservoir. Everything is integrated in SOLID ANGLE at each vertex
+// (paper sec. 7), so f is a pure product of local rho*cos terms and the
+// shift Jacobians are Appendix B's pdf/geometry ratios. For t=1 paths, f is
+// measured in the same pixel units as eye radiance via the deterministic
+// camera-connection factor (imageToSurface), exactly like the classic BDPT
+// splat.
 //
 // Binding budget: GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS is 16 on common
 // hardware (Intel), and bindings 1-14 are taken by the scene/BDPT/lens
@@ -34,11 +39,18 @@ struct PathReservoir
 {
     vec4 core;    // x=W (UCW), y=pHat (omega*lum(f), current domain), z=confidence,
                   // w=tech bits (see RestirPackTech)
-    vec4 fSeed;   // xyz=f RGB of the selected path (current domain), w=camSeed (uint bits)
+    vec4 fSeed;   // xyz=f RGB of the selected path (current domain), w=subpath
+                  // replay seed (uint bits): camSeed for t>=2, light subpath
+                  // seed for t=1
     vec4 rcInfo;  // x=|n_rc . w_in| on this path, y=dist^2(x_{r-1}, x_r),
                   // z=omega_tau (technique MIS weight, copied through shifts),
                   // w=replayPdfProd: product of sampled pdfs over the REPLAYED
-                  //   scatters (vertices 1..r-2; all scatters if no rc)
+                  //   scatters (vertices 1..r-2; all scatters if no rc).
+                  // For t=1 the "reconnection vertex" is the path's x_1 (the
+                  // light subpath end y_{s-1}, re-anchored to the V-buffer hit
+                  // by shifts) and x/y describe the edge (y_{s-2}, y_{s-1});
+                  // w covers the replayed light samplers (pick*area for s=2,
+                  // everything up to the arrival of y_{s-2} otherwise).
     vec4 rcPosMat;// xyz=reconnection vertex x_r world position, w=materialIndex
                   // (uint bits; NO_MATERIAL for an NEE light point)
     vec4 rcNormal;// xyz=shading normal at x_r, oriented toward the valid
@@ -56,12 +68,17 @@ struct PathReservoir
     vec4 reservedG;
 };
 
-// One per-pixel caustic reservoir (Phase 3+). 4 x vec4 = 64 bytes.
+// One per-pixel caustic reservoir. 4 x vec4 = 64 bytes. Phase 2 populates
+// it per-frame from caustic t=1 LRM entries (light -> ... -> glass ->
+// diffuse -> camera); temporal replay/re-binning lands in Phase 3. Never
+// spatially reused. The final image is regular + caustic estimate.
 struct CausticReservoir
 {
-    vec4 core;
-    vec4 fSeed;
-    vec4 meta;
+    vec4 core;  // x=W, y=pHat, z=confidence, w=tech bits
+    vec4 fSeed; // xyz=f RGB (pixel-measurement units), w=light subpath seed (uint bits)
+    vec4 meta;  // x=omega_tau, y=replayed-pdf product (all sampled light
+                // pdfs - caustic shifts are pure replay), z/w reserved
+                // (Phase 3: subpixel landing position for the pixel filter)
     vec4 spare;
 };
 
@@ -99,9 +116,10 @@ const uint RESTIR_MAX_VERTS = 8u;
 // --------------------------------------------------- regions & G-buffer ---
 // restirParams: x=debug view, y=flags (bit0 active, bit1 temporal reuse,
 // bit2 spatial reuse, bit3 accumulate frames - see AccumulateFrames() in
-// common.glsl), z=frame counter, w=parity.
+// common.glsl, bit4 light tracing), z=frame counter, w=parity.
 bool RestirTemporalEnabled()  { return (uFrame.restirParams.y & 2u) != 0u; }
 bool RestirSpatialEnabled()   { return (uFrame.restirParams.y & 4u) != 0u; }
+bool RestirLightTracingEnabled() { return (uFrame.restirParams.y & 16u) != 0u; }
 
 uint RestirRegionOffset(uint region) { return region * RestirPixelCount(); }
 uint RestirFinalRegion() { return uFrame.restirParams.w; }        // parity
@@ -126,11 +144,14 @@ uint GBufPrevOffset() { return (1u - uFrame.restirParams.w) * RestirPixelCount()
 
 // ------------------------------------------------------ technique bits ----
 // tech word: s bits 0-7 | t bits 8-15 | flags bits 16+.
-// Flag bits: bit0 rcValid, bit1 envEnd, bits 4-7 rcIndex (vertex index of
-// the reconnection vertex, 1-based), bits 8-15 deltaMask (bit j-1 set =
-// path vertex x_j is a delta material).
+// Flag bits: bit0 rcValid, bit1 envEnd, bit2 caustic (t=1 path whose
+// y_{s-2} is delta), bits 4-7 rcIndex (vertex index of the reconnection
+// vertex, 1-based), bits 8-15 deltaMask (bit j-1 set = path vertex x_j is a
+// delta material; for t=1 the mask covers the light subpath vertices
+// y_1..y_8 instead).
 const uint RESTIR_FLAG_RCVALID = 1u;
 const uint RESTIR_FLAG_ENVEND  = 2u;
+const uint RESTIR_FLAG_CAUSTIC = 4u;
 
 uint RestirPackTech(uint s, uint t, uint flags) { return (s & 0xFFu) | ((t & 0xFFu) << 8) | (flags << 16); }
 uint RestirTechS(uint tech) { return tech & 0xFFu; }
@@ -156,6 +177,16 @@ PathReservoir RestirEmptyReservoir()
     r.reservedF = vec4(0.0);
     r.reservedG = vec4(0.0);
     return r;
+}
+
+CausticReservoir RestirEmptyCaustic()
+{
+    CausticReservoir c;
+    c.core = vec4(0.0, 0.0, 1.0, 0.0); // W=0, pHat=0, confidence=1
+    c.fSeed = vec4(0.0);
+    c.meta = vec4(0.0);
+    c.spare = vec4(0.0);
+    return c;
 }
 
 float RestirLum(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }

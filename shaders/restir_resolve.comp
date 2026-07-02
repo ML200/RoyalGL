@@ -3,10 +3,12 @@
 #include "restir_common.glsl"
 
 // ReSTIR pass: shade the final reservoirs into the accumulation image.
-// The GRIS estimate for a pixel is omega_tau(Y) * f(Y) * W_Y (paper Eq. 22);
-// primary-miss pixels show the background directly (deterministic, nothing
-// to resample). Accumulates like the other kernels: sample 0 overwrites,
-// later samples add, per-pixel count in alpha.
+// The GRIS estimate for a pixel is omega_tau(Y) * f(Y) * W_Y (paper Eq. 22),
+// summed over the regular and the caustic reservoir (paper Sec. 5.1: final
+// image = regular estimate + caustic estimate); primary-miss pixels show
+// the background directly (deterministic, nothing to resample). Accumulates
+// like the other kernels: sample 0 overwrites, later samples add, per-pixel
+// count in alpha.
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -29,8 +31,9 @@ void main()
     else
     {
         PathReservoir r = pixelRes[RestirRegionOffset(RestirFinalRegion()) + idx].path;
-        float omega = r.rcInfo.z;
-        color = omega * r.fSeed.xyz * r.core.x;
+        CausticReservoir c = pixelRes[RestirRegionOffset(RestirFinalRegion()) + idx].caustic;
+        color = r.rcInfo.z * r.fSeed.xyz * r.core.x
+              + c.meta.x * c.fSeed.xyz * c.core.x;
     }
     if (any(isnan(color)) || any(isinf(color))) color = vec3(0.0);
 

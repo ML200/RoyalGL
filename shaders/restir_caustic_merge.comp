@@ -1,0 +1,168 @@
+#version 460 core
+#include "common.glsl"
+#include "light_tree.glsl"
+#include "bdpt_common.glsl"
+#include "restir_common.glsl"
+#include "restir_lrm.glsl"
+#include "restir_caustic.glsl"
+
+// ReSTIR pass: caustic temporal reuse, stage 2 of 2 (paper Sec. 5.1
+// Eq. 51-52; docs/RESTIR_BDPT_PLAN.md Phase 3). Per pixel, merge the
+// canonical caustic reservoir (this frame's LRM candidates, written by
+// restir_camera.comp to the final region) with every shifted history
+// reservoir that restir_caustic_shift.comp re-binned into this pixel.
+//
+// MIS structure: a current-frame caustic path has exactly TWO possible
+// sources - the canonical sampler (any of this frame's N_L light subpaths)
+// and ONE history reservoir: the previous-frame pixel its inverse replay
+// lands in. So per candidate a 2-way generalized balance heuristic is a
+// complete partition:
+//   entry from prev pixel v:  m = c_v * (pHat_prev/J)
+//                                 / (c_v * (pHat_prev/J) + c_can * pHat_cur)
+//   canonical:                m = c_can * pHat_can
+//                                 / (c_can * pHat_can + c_v' * pHat_prev(T^-1) * J_back)
+// where v' is found by replaying the canonical path under the PREVIOUS
+// frame's sampler and projecting through the previous camera - the exact
+// mirror of the forward shift, so both directions agree on the support
+// (classification, occlusion, on-screen, non-miss landing pixel).
+//
+// Confidence: the paper's PROXY update c := min(c_can + c_v, cap) where v
+// is the motion-vector-mapped previous pixel - confidence must not depend
+// on realized samples (how many entries happened to land here), only on
+// sample-independent surface data.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+const float RESTIR_CONFIDENCE_CAP = 20.0;
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = ivec2(uFrame.frameInfo.xy);
+    if (pixel.x >= size.x || pixel.y >= size.y) return;
+
+    uint idx = RestirPixelIndex(pixel);
+    uint slot = RestirRegionOffset(RestirFinalRegion()) + idx;
+
+    GBufferPixel gCur = gbuf[GBufCurOffset() + idx];
+    if (gCur.posDepth.w < 0.0) return; // canonical (empty) stands
+
+    CausticReservoir can = pixelRes[slot].caustic;
+    float cCan = max(can.core.z, 1.0); // camera pass writes confidence 1
+
+    // ------------------- backward map: canonical into the prev domain ----
+    float pFromPrevC = 0.0;
+    if (can.core.x > 0.0 && can.core.y > 0.0 && uFrame.lightInfo.x > 0u)
+    {
+        uint tech = floatBitsToUint(can.core.w);
+        RestirCausticReplayResult back = RestirCausticReplay(
+            floatBitsToUint(can.fSeed.w), RestirTechS(tech),
+            RestirFlagsDeltaMask(RestirTechFlags(tech)),
+            uFrame.prevCamPos.xyz, uFrame.prevCamForward.xyz,
+            uFrame.prevCamRight.xyz, uFrame.prevCamUp.xyz,
+            uFrame.prevCameraParams.x, uFrame.prevCameraParams.y);
+        if (back.ok)
+        {
+            uint vIdx = RestirPixelIndex(back.pixel);
+            if (gbuf[GBufPrevOffset() + vIdx].posDepth.w >= 0.0)
+            {
+                float pHatPrevC = can.meta.x * RestirLum(back.f);
+                float Jb = can.meta.y / back.replayPdf; // |dT^-1/dC|
+                float cV = min(pixelRes[RestirRegionOffset(RestirHistoryRegion()) + vIdx].caustic.core.z,
+                               RESTIR_CONFIDENCE_CAP);
+                pFromPrevC = cV * pHatPrevC * Jb;
+                if (isnan(pFromPrevC) || isinf(pFromPrevC)) pFromPrevC = 0.0;
+            }
+        }
+    }
+
+    // ------------------------------------------------- streaming merge ---
+    uint rng = WangHash(idx * 15013u + uFrame.restirParams.z * 32749u + 0x2545F491u);
+    if (rng == 0u) rng = 0x9E3779B9u;
+
+    float wSum = 0.0;
+    vec3 selF = vec3(0.0);
+    float selPHat = 0.0, selOmega = 0.0, selReplayPdf = 0.0;
+    uint selTech = 0u, selSeed = 0u;
+
+    if (can.core.y > 0.0)
+    {
+        float mC = cCan * can.core.y / (cCan * can.core.y + pFromPrevC);
+        float wC = mC * can.core.y * can.core.x;
+        if (wC > 0.0 && !isnan(wC) && !isinf(wC))
+        {
+            wSum += wC;
+            selF = can.fSeed.xyz;
+            selPHat = can.core.y;
+            selOmega = can.meta.x;
+            selReplayPdf = can.meta.y;
+            selTech = floatBitsToUint(can.core.w);
+            selSeed = floatBitsToUint(can.fSeed.w);
+        }
+    }
+
+    uint eIdx = lrmHeads[1u + idx];
+    while (eIdx != LRM_SENTINEL)
+    {
+        LrmEntry e = lrmEntries[eIdx];
+        float pHatCur = e.rcInfo.z * RestirLum(e.fW.xyz);
+        float J = e.rcInfo.y;
+        if (pHatCur > 0.0 && J > 0.0)
+        {
+            float cV = uintBitsToFloat(e.meta.w);
+            float pFromPrev = cV * e.rcInfo.x / J; // c_v * pHat_prev / J
+            float m = pFromPrev / (pFromPrev + cCan * pHatCur);
+            float w = m * pHatCur * e.fW.w * J;
+            if (w > 0.0 && !isnan(w) && !isinf(w))
+            {
+                wSum += w;
+                if (RestirRand(rng) * wSum <= w)
+                {
+                    selF = e.fW.xyz;
+                    selPHat = pHatCur;
+                    selOmega = e.rcInfo.z;
+                    selReplayPdf = e.rcInfo.w;
+                    selTech = e.meta.x;
+                    selSeed = e.meta.y;
+                }
+            }
+        }
+        eIdx = e.meta.z;
+    }
+
+    // ------------------------------------------- confidence proxy --------
+    // Motion-vector-mapped previous pixel with the same surface validation
+    // as the regular temporal pass; disocclusions keep c at the canonical 1.
+    float cOut = cCan;
+    vec2 prevPixF;
+    if (RestirPrevProject(gCur.posDepth.xyz, prevPixF))
+    {
+        ivec2 prevPix = ivec2(prevPixF);
+        if (prevPix.x >= 0 && prevPix.y >= 0 && prevPix.x < size.x && prevPix.y < size.y)
+        {
+            uint pIdx = RestirPixelIndex(prevPix);
+            GBufferPixel gPrev = gbuf[GBufPrevOffset() + pIdx];
+            if (gPrev.posDepth.w >= 0.0 && GBufMaterial(gPrev) == GBufMaterial(gCur))
+            {
+                float depthScale = max(gCur.posDepth.w, 1e-3);
+                if (length(gPrev.posDepth.xyz - gCur.posDepth.xyz) < 0.02 * depthScale)
+                {
+                    float cV = min(pixelRes[RestirRegionOffset(RestirHistoryRegion()) + pIdx].caustic.core.z,
+                                   RESTIR_CONFIDENCE_CAP);
+                    cOut = min(cCan + cV, RESTIR_CONFIDENCE_CAP);
+                }
+            }
+        }
+    }
+
+    CausticReservoir outC = RestirEmptyCaustic();
+    if (wSum > 0.0 && selPHat > 0.0)
+    {
+        outC.core = vec4(wSum / selPHat, selPHat, 0.0, uintBitsToFloat(selTech));
+        outC.fSeed = vec4(selF, uintBitsToFloat(selSeed));
+        outC.meta = vec4(selOmega, selReplayPdf, 0.0, 0.0);
+        if (isnan(outC.core.x) || isinf(outC.core.x)) outC.core.x = 0.0;
+    }
+    outC.core.z = cOut;
+    pixelRes[slot].caustic = outC;
+}

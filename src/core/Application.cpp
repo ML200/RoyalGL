@@ -89,6 +89,7 @@ namespace RoyalGL
         if (const char* v = std::getenv("ROYALGL_RESTIR_DEBUG")) m_settings.restirDebugView = std::atoi(v);
         if (const char* v = std::getenv("ROYALGL_RESTIR_TEMPORAL")) m_settings.restirTemporal = (v[0] != '0');
         if (const char* v = std::getenv("ROYALGL_RESTIR_SPATIAL")) m_settings.restirSpatial = (v[0] != '0');
+        if (const char* v = std::getenv("ROYALGL_RESTIR_LIGHT")) m_settings.restirLightTracing = (v[0] != '0');
         // Ignore all camera input - keeps scripted soak tests deterministic
         // even if the window is focused or the mouse passes over it.
         m_cameraLocked = (std::getenv("ROYALGL_LOCK_CAMERA") != nullptr);

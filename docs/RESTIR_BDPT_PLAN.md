@@ -366,6 +366,40 @@ increasing risk.
   correlation blotches; verify confidence capping.
 
 ### Phase 2 — Light tracing (t=1) + LRM  → "Lightweight ReSTIR BDPT"
+
+> **Phase 2 status: DONE.** restir_light.comp (Alg. 1: one replayable light
+> subpath per invocation, t=1 candidates with m=1/N_L, V-buffer rejection at
+> creation), restir_lrm.glsl (LRM as per-pixel LINKED LIST — atomic head
+> exchange on binding 14, entry pool on binding 13, the sec.-3 fallback
+> instead of count/scan/scatter; lens-only bindings reclaimed since ReSTIR
+> is pinhole-only), LRM merge + caustic split in restir_camera.comp (caustic
+> reservoir written straight to the final region, per-frame RIS only),
+> reverse hybrid shift in restir_shift.glsl (light replay under the
+> DESTINATION domain's sampler — dst-anchored tree descent — priced by the
+> Eq. 53 pdf ratio; reconnection y_{s-2}→x₁′ with the Eq. 56 endpoint
+> geometry ratio; ω copied), caustic term in restir_resolve.comp, debug
+> views 7 (caustic W) / 8 (LRM occupancy), `restirLightTracing` toggle +
+> `ROYALGL_RESTIR_LIGHT` override.
+>
+> **Lightweight MIS:** with technique set {s=0, s=1, t=1}, both classic
+> recursions are restricted by dropping the interior dVCM additions (those
+> are the s≥2 connections): light side keeps the seed terms + the addition
+> at the first scatter (`dLW` in restir_light.comp), eye side carries the
+> single dVCM₁-seeded term (`dT1` in restir_camera.comp). The s=0/s=1
+> weights gained the t=1 competitor (including through delta chains, where
+> the s=1 term vanishes but t=1 doesn't).
+>
+> Soak results (fallback Cornell+duck, locked camera): light-off RIS
+> 0.116481 (= Phase 1 baseline), light-on RIS 0.116468 (−0.011%: the
+> V-buffer rejection darkening + caustic-on-miss-pixel drops), +temporal
+> 0.116466, +spatial 0.116442, +both 0.116431–0.116434 (−0.03%: copied-ω_τ
+> darkening — t=1 ω now embeds camera-pdf geometry that changes under
+> spatial shifts; the Sec. 6.4-bounded bias Phase 5 removes; temporal-only
+> shows none because static-camera shifts are near-identity). Light tracing
+> cuts accumulated relNoise: 0.0327 @ 3968 spp vs 0.0341 @ 5120 spp without.
+> LRM occupancy ~0.45 entries/pixel/frame at N_L=262144; caustic reservoirs
+> populated but sparse until Phase 3 accumulates them.
+
 - **2.1 LRM passes** (count/scan/scatter) replacing additive splatting *in ReSTIR
   mode only*. `restir_light.comp` emits candidate reservoirs with m = 1/N_L.
 - **2.2 Merge LRM into pixel reservoirs** in `restir_camera.comp`; caustic/non-caustic
@@ -376,6 +410,33 @@ increasing risk.
 - Milestone: **LW BDPT mode** from the paper, a shippable quality tier.
 
 ### Phase 3 — Caustic reservoirs
+
+> **Phase 3 status: DONE.** restir_caustic.glsl (pure-replay of a caustic
+> path under an explicit camera: dst-anchored tree descent, classification
+> checks, deterministic camera connection + landing-pixel projection),
+> restir_caustic_shift.comp (per PREVIOUS pixel: shift the caustic history
+> into the current frame, Eq. 53 replay-ratio Jacobian, re-bin via the LRM
+> linked list - cleared a second time after restir_camera consumed the
+> light-pass entries), restir_caustic_merge.comp (per pixel: canonical +
+> landed entries under a 2-source generalized balance heuristic - each
+> caustic path has exactly ONE possible history source, the prev pixel its
+> inverse replay lands in, so the canonical side does one backward replay
+> through the prev camera to find it; support checks mirrored in both
+> directions), proxy confidence `c := min(c_can + c_mv, 20)` from the
+> motion-vector-mapped prev pixel (sample-independent), debug view 9
+> (caustic confidence). Gated on restirTemporal && restirLightTracing.
+>
+> Soak results (fallback Cornell+duck, locked camera): accumulated means
+> unchanged vs Phase 2 (temporal 0.116467 vs 0.116466; both 0.116436 vs
+> 0.116431-0.116434) - no energy gain/loss. Caustic reservoirs accumulate:
+> confidence saturates at the cap (debug-9 p50 = 20/20), caustic-path
+> occupancy rises >10x (view-7 p99: 0 -> 6.4e-5), max caustic W drops
+> 18.0 -> 3.3 (firefly energy spread over accumulated reservoirs). The
+> per-frame estimate (accumulation off) drops relNoise 0.306 -> 0.0995
+> with matching means. The orbiting-camera sharpening test needs manual
+> driving (soaks lock the camera); motion robustness rests on
+> shift-failure => zero contribution, which is bias-safe.
+
 - **3.1 Temporal caustic replay + re-binning** (pass 7): replay previous frame's
   caustic paths, project, LRM re-bin, merge with Eq. 51–52 weights.
 - **3.2 Proxy confidence** `c_i += c_v` via motion vectors, cap 20.
@@ -420,7 +481,7 @@ increasing risk.
 | `shaders/restir_common.glsl` | **new** — reservoir structs, RIS/merge helpers, pairwise MIS |
 | `shaders/restir_shift.glsl` | **new** — ShiftPath (Algorithm 3), Jacobians (App. B), recursive reconnection MIS (Sec. 6) |
 | `shaders/restir_light.comp` | **new** — Algorithm 1 (light subpaths, LVC append, t=1 candidates, LRM stage) |
-| `shaders/lrm_scan.comp`, `lrm_scatter.comp` | **new** — LRM sort |
+| `shaders/lrm_scan.comp`, `lrm_scatter.comp` | ~~new — LRM sort~~ superseded: Phase 2 shipped the linked-list LRM (`shaders/restir_lrm.glsl`, bindings 13/14); revisit the sort in Phase 6 if traversal coherence hurts |
 | `shaders/restir_camera.comp` | **new** — Algorithm 2 (G-buffer, initial RIS, LRM merge) |
 | `shaders/restir_temporal.comp`, `restir_caustic_temporal.comp`, `restir_spatial.comp`, `restir_resolve.comp` | **new** — reuse + resolve passes |
 | `shaders/common.glsl` | counter-based RNG; material-only RR helper |

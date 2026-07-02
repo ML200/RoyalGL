@@ -1,6 +1,7 @@
 #version 460 core
 #include "common.glsl"
 #include "restir_common.glsl"
+#include "restir_lrm.glsl"
 
 // ReSTIR debug views: overwrites the accumulation image with a
 // visualization selected by uFrame.restirParams.x. Values still pass
@@ -18,6 +19,9 @@ const uint DEBUG_MOTION     = 3u;
 const uint DEBUG_W          = 4u;
 const uint DEBUG_CONFIDENCE = 5u;
 const uint DEBUG_TECHNIQUE  = 6u;
+const uint DEBUG_CAUSTIC_W  = 7u;
+const uint DEBUG_LRM_COUNT  = 8u;
+const uint DEBUG_CAUSTIC_C  = 9u;
 
 void main()
 {
@@ -67,6 +71,31 @@ void main()
         uint s = RestirTechS(tech);
         uint t = RestirTechT(tech);
         color = vec3(float(s) / 8.0, float(t) / 8.0, (s + t) > 0u ? 0.2 : 0.0);
+    }
+    else if (view == DEBUG_CAUSTIC_W)
+    {
+        color = vec3(pixelRes[resIdx].caustic.core.x);
+    }
+    else if (view == DEBUG_LRM_COUNT)
+    {
+        // LRM occupancy for this pixel (heatmap /8). With caustic temporal
+        // reuse enabled this shows the caustic RE-BIN entries (the last LRM
+        // use of the frame); otherwise the light-pass t=1 candidates.
+        if (RestirLightTracingEnabled())
+        {
+            uint count = 0u;
+            uint eIdx = lrmHeads[1u + pixIdx];
+            while (eIdx != LRM_SENTINEL && count < 64u)
+            {
+                count++;
+                eIdx = lrmEntries[eIdx].meta.z;
+            }
+            color = vec3(float(count) / 8.0);
+        }
+    }
+    else if (view == DEBUG_CAUSTIC_C)
+    {
+        color = vec3(pixelRes[resIdx].caustic.core.z / 20.0);
     }
 
     imageStore(uAccum, pixel, vec4(color, 1.0));

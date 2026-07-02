@@ -1,0 +1,258 @@
+#version 460 core
+#include "common.glsl"
+#include "light_tree.glsl"
+#include "bdpt_common.glsl"
+#include "restir_common.glsl"
+#include "restir_lrm.glsl"
+
+// ReSTIR pass: light subpaths + t=1 candidates (paper Alg. 1, restricted to
+// Phase 2's lightweight-BDPT technique set {s=0, s=1, t=1}; pinhole only -
+// ReSTIR mode never runs with the lens camera). One light subpath per
+// invocation, fully replayable from one base seed via the (vertex, purpose)
+// RNG streams. Every non-delta vertex is connected to the camera; a
+// connection that lands on screen becomes a one-sample candidate reservoir
+// binned into the LRM with initial resampling MIS weight m = 1/N_L (paper
+// Eq. 26). Candidates whose y_{s-2} is a delta (glass) vertex are CAUSTIC -
+// flagged for the caustic reservoir, since no camera-side technique can
+// sample them and their shift is pure replay.
+//
+// Technique MIS (omega_tau): with only {s=0, s=1, t=1} in play, both
+// competing techniques split a t=1 path at its light end - s=0 samples the
+// whole path from the camera, s=1 all but the light point. The classic
+// recursive quantities (bdpt_common.glsl) restrict cleanly:
+//   dVCM - unchanged seed directPdfA/emissionPdfW (the s=1 pdf ratio),
+//   dLW  - the classic dVC recursion WITHOUT the interior dVCM additions:
+//          those additions are the s>=2 vertex-connection techniques, which
+//          don't exist until Phase 4. The addition at the FIRST scatter
+//          (y_1 -> y_2) is the s=1 term and is kept; delta vertices scale
+//          by cosOut exactly as in the full recursion.
+// At a connection from y_j:
+//   wLight = (imageToSurface/N_L) * (j==1 ? dVCM + pdfRev*dLW : pdfRev*dLW)
+//   omega  = 1 / (1 + wLight)
+// which mirrors bdpt_light.comp's classic weight with the s>=2 terms
+// removed. restir_camera.comp applies the matching restriction on the eye
+// side (its dT1 accumulator), so the weights of the three techniques form
+// an exact partition of unity on every path.
+//
+// f / pdf convention (restir_common.glsl): fNum is the pure numerator
+// (Le * cos products; choicePdf*tint at delta scatters), pProd the product
+// of true sampled pdfs (solid angle; choicePdf at delta scatters), so
+// fNum/pProd equals bdpt_light.comp's throughput. The deterministic camera
+// connection contributes imageToSurface to f only - same units as the
+// classic t=1 splat, i.e. directly comparable to eye-path radiance.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// V-buffer rejection heuristic (paper's stability fix): a non-caustic t=1
+// candidate must be re-anchorable to its own pixel's primary hit - the
+// exact reconnection every later shift performs (restir_shift.glsl). This
+// rejects candidates in penumbrae whose V-buffer anchor is occluded from
+// y_{s-2} (tiny darkening bias, big reuse-stability win). prevMatId ==
+// NO_MATERIAL marks y_{s-2} = y_0, the emission point.
+bool LrmReconnectionValid(GBufferPixel g, vec3 prevPos, vec3 prevN, vec3 prevWi, uint prevMatId)
+{
+    Material mX1 = materials[GBufMaterial(g)];
+    if (MatIsDelta(mX1)) return false;
+    if (dot(mX1.emissive.rgb, mX1.emissive.rgb) > 0.0) return false;
+
+    vec3 toX1 = g.posDepth.xyz - prevPos;
+    float d2 = dot(toX1, toX1);
+    if (d2 <= 1e-12) return false;
+    float dist = sqrt(d2);
+    vec3 dirTo = toX1 / dist;
+
+    if (prevMatId == NO_MATERIAL)
+    {
+        // Emission point: one-sided emitter.
+        if (dot(prevN, dirTo) <= 1e-6) return false;
+    }
+    else
+    {
+        float pd, pr, co;
+        if (EvalBsdf(materials[prevMatId], prevN, prevWi, dirTo, pd, pr, co) == vec3(0.0))
+            return false;
+    }
+
+    // The anchor must accept light from y_{s-2} on its camera-facing side.
+    vec3 wiCam = normalize(uFrame.camPos.xyz - g.posDepth.xyz);
+    float pd2, pr2, co2;
+    if (EvalBsdf(mX1, g.normalMat.xyz, wiCam, -dirTo, pd2, pr2, co2) == vec3(0.0))
+        return false;
+
+    vec3 nf = (dot(prevN, dirTo) >= 0.0) ? prevN : -prevN;
+    Ray shadowRay = MakeRay(prevPos + nf * 1e-4, dirTo);
+    return !IntersectSceneOccluded(shadowRay, dist * 0.999);
+}
+
+void main()
+{
+    uint pathIdx = gl_GlobalInvocationID.x;
+    if (pathIdx >= BdptNumLightPaths()) return;
+    if (uFrame.lightInfo.x == 0u) return;
+
+    // Base seed: stored in every emitted candidate so shifts can replay the
+    // subpath. Uses the never-resetting frame counter and a constant
+    // distinct from the other kernels' seeding.
+    uint baseSeed = WangHash(pathIdx * 7877u + uFrame.restirParams.z * 15859u + 0x51633e2du);
+    g_rngSeed = baseSeed;
+    RngStream(0u, RNG_EMIT);
+
+    // ------------------------------------------------------- emission ----
+    float pickPdfTrue;
+    uint lightIdx = BdptSampleLightIndex(pickPdfTrue);
+    if (pickPdfTrue <= 0.0) return;
+    LightTri lt = lightTris[lightIdx];
+    vec3 lightNormal = lt.normalArea.xyz;
+    vec3 origin = BdptSampleLightPoint(lightIdx, RandomFloat2());
+    vec3 dir = CosineSampleHemisphere(lightNormal);
+    float cosTheta = dot(lightNormal, dir);
+    if (cosTheta <= 1e-6) return;
+
+    float invArea = 1.0 / max(lt.normalArea.w, 1e-10);
+    float emissionPdfTrue = pickPdfTrue * invArea * cosTheta / PI;
+    float directPdfA, emissionPdfW;
+    BdptLightPdfs(lightIdx, cosTheta, directPdfA, emissionPdfW);
+    if (emissionPdfW <= 0.0 || emissionPdfTrue <= 0.0) return;
+
+    vec3 fNum = lt.emissionWeight.rgb * cosTheta;
+    float pProd = emissionPdfTrue;
+    // Replayed-pdf product at the arrival of the PREVIOUS vertex y_{j-1}:
+    // the reverse hybrid shift replays exactly those samplers (the scatter
+    // leaving y_{j-1} is replaced by the reconnection). For y_0 that is the
+    // pick * area part only - the emission direction is discarded too.
+    float pdfPrevArrival = pickPdfTrue * invArea;
+
+    float dVCM = directPdfA / emissionPdfW;
+    float dLW = cosTheta / emissionPdfW;
+
+    // Previous path vertex y_{j-1}, starting at the emission point y_0.
+    vec3 prevPos = origin;
+    vec3 prevN = lightNormal;
+    vec3 prevWi = vec3(0.0);
+    uint prevMat = NO_MATERIAL;
+    bool prevIsDelta = false;
+
+    uint deltaMask = 0u;
+    uint maxLen = BdptMaxPathLength();
+    uint pathLength = 1u; // segments from the light after the next hit
+    float numLightPaths = float(BdptNumLightPaths());
+    float ipd = BdptImagePlaneDist();
+
+    Ray ray = MakeRay(origin + lightNormal * 1e-4, dir);
+
+    for (uint iter = 0u; iter < BDPT_MAX_LIGHT_VERTS; ++iter)
+    {
+        Hit hit;
+        if (!IntersectScene(ray, hit)) break;
+
+        vec3 hitPos = ray.origin + ray.dir * hit.t;
+        float cosIn = abs(dot(hit.normal, ray.dir));
+        if (cosIn <= 1e-6) break;
+
+        dVCM *= hit.t * hit.t;
+        dVCM /= cosIn;
+        dLW /= cosIn;
+
+        Material mat = materials[hit.materialIndex];
+        vec3 wi = -ray.dir;
+
+        // Light subpaths terminate on emitters (shared invariant of every
+        // strategy in both pipelines).
+        if (dot(mat.emissive.rgb, mat.emissive.rgb) > 0.0) break;
+
+        bool isDelta = MatIsDelta(mat);
+        if (isDelta) deltaMask |= 1u << (pathLength - 1u);
+
+        if (!isDelta && pathLength + 1u <= maxLen)
+        {
+            // --------------------------------------- t=1 candidate -------
+            vec3 toCam = uFrame.camPos.xyz - hitPos;
+            float dist2 = dot(toCam, toCam);
+            float dist = sqrt(max(dist2, 1e-12));
+            vec3 dirToCam = toCam / dist;
+            ivec2 pixel;
+            float cosAtCam;
+            if (dist2 > 1e-12 && BdptDirToPixel(-dirToCam, pixel, cosAtCam))
+            {
+                float bsdfDirPdfW, bsdfRevPdfW, cosToCam;
+                vec3 fb = EvalBsdf(mat, hit.normal, wi, dirToCam, bsdfDirPdfW, bsdfRevPdfW, cosToCam);
+                uint pixIdx = RestirPixelIndex(pixel);
+                GBufferPixel g = gbuf[GBufCurOffset() + pixIdx];
+
+                // Candidates landing on primary-miss pixels are dropped: the
+                // resolve shows the deterministic background there
+                // (consistent with the pixel-center V-buffer baseline).
+                if (fb != vec3(0.0) && g.posDepth.w >= 0.0)
+                {
+                    float imagePointToCamDist = ipd / cosAtCam;
+                    float imageToSurface = (imagePointToCamDist * imagePointToCamDist) / cosAtCam
+                                           * cosToCam / dist2;
+
+                    float wLight = (imageToSurface / numLightPaths)
+                                 * (pathLength == 1u ? (dVCM + bsdfRevPdfW * dLW)
+                                                     : (bsdfRevPdfW * dLW));
+                    float omega = 1.0 / (1.0 + wLight);
+
+                    vec3 fPix = fNum * fb * imageToSurface;
+                    float w = omega * RestirLum(fPix) / (pProd * numLightPaths);
+                    bool caustic = prevIsDelta;
+
+                    if (w > 0.0 && !isnan(w) && !isinf(w))
+                    {
+                        vec3 nf = (dot(hit.normal, dirToCam) >= 0.0) ? hit.normal : -hit.normal;
+                        Ray shadowRay = MakeRay(hitPos + nf * 1e-4, dirToCam);
+                        if (!IntersectSceneOccluded(shadowRay, dist * 0.999))
+                        {
+                            bool accept = caustic
+                                || LrmReconnectionValid(g, prevPos, prevN, prevWi, prevMat);
+                            if (accept)
+                            {
+                                uint flags = (caustic ? RESTIR_FLAG_CAUSTIC : RESTIR_FLAG_RCVALID)
+                                           | (deltaMask << 8);
+                                uint tech = RestirPackTech(pathLength + 1u, 1u, flags);
+                                // Caustic shifts replay everything, so their
+                                // replayed-pdf product is the full arrival
+                                // pdf of y_{s-1}.
+                                float replayPdf = caustic ? pProd : pdfPrevArrival;
+                                LrmAppend(pixIdx, vec4(fPix, w),
+                                          vec4(cosIn, hit.t * hit.t, omega, replayPdf),
+                                          tech, baseSeed, 0u);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (pathLength + 2u > maxLen) break;
+
+        // -------------------------------------------------- BSDF bounce ---
+        RngStream(pathLength, RNG_BSDF);
+        BsdfSample bs = SampleBsdf(mat, hit.normal, wi, true);
+        if (bs.weight == vec3(0.0)) break;
+        if (!bs.specular && bs.pdfDir <= 0.0) break;
+
+        // Lightweight MIS recursion: the dVCM addition at the first scatter
+        // is the s=1 technique; later additions would be s>=2 vertex
+        // connections and are dropped.
+        if (bs.specular)
+            dLW *= bs.cosOut;
+        else
+            dLW = (bs.cosOut / bs.pdfDir) * ((pathLength == 1u ? dVCM : 0.0) + bs.pdfRev * dLW);
+
+        float pdfStep = bs.choicePdf * (bs.specular ? 1.0 : bs.pdfDir);
+        pdfPrevArrival = pProd; // arrival pdf of the vertex we now leave
+        fNum *= bs.weight * pdfStep;
+        pProd *= pdfStep;
+
+        prevPos = hitPos;
+        prevN = hit.normal;
+        prevWi = wi;
+        prevMat = hit.materialIndex;
+        prevIsDelta = isDelta;
+        pathLength++;
+
+        vec3 offN = (dot(bs.dir, hit.normal) >= 0.0) ? hit.normal : -hit.normal;
+        ray = MakeRay(hitPos + offN * 1e-4, bs.dir);
+    }
+}
