@@ -273,6 +273,7 @@ void main()
     vec3 x, n, wi;
     uint matId;
     uint triIdx = 0u;
+    float lastD2 = 0.0;
     vec4 fSlot = wfArena[jb + 4u];
     vec3 f = fSlot.xyz;
     float replayPdf = fSlot.w;
@@ -311,8 +312,9 @@ void main()
         n = hitB.xyz;
         matId = floatBitsToUint(hitB.w) >> 24;
         triIdx = floatBitsToUint(hitB.w) & 0x00FFFFFFu;
+        lastD2 = hitA.w * hitA.w;
         float cosArr = max(abs(dot(n, -wi)), 1e-6);
-        dVCM *= hitA.w * hitA.w / cosArr;
+        dVCM *= lastD2 / cosArr;
         dVC /= cosArr;
         dT1 /= cosArr;
 
@@ -325,6 +327,15 @@ void main()
             uint lightIdx = (uFrame.lightInfo.x > 0u) ? triToLight[triIdx] : LT_SENTINEL;
             vec3 lightN = (lightIdx != LT_SENTINEL) ? lightTris[lightIdx].normalArea.xyz : n;
             if (dot(lightN, wi) <= 1e-6) { WfJobFail(jb); return; }
+            // Symmetric criteria: the base path stayed pure replay only
+            // because no pair - including its terminal emitter pair -
+            // passed the reconnection criteria; if the offset's terminal
+            // pair passes them, the offset scan would have reconnected
+            // and the shift is not invertible.
+            vec4 rcCrit = wfArena[jb + 10u];
+            if (floatBitsToUint(rcCrit.y) != 0u
+                && RestirRcFootprintOk(lastD2, rcCrit.x, abs(dot(n, wi)), em, true, rcCrit.z))
+            { WfJobFail(jb); return; }
             f *= em.emissive.rgb;
 
             float omega = RS_BASE.rcInfo.z;
@@ -355,6 +366,21 @@ void main()
     // Premature emitter: every vertex processed here is a non-terminal
     // vertex of the base path (see the megakernel's comment).
     if (dot(mat.emissive.rgb, mat.emissive.rgb) > 0.0) { WfJobFail(jb); return; }
+
+    // Reconnection-criteria invertibility (ReSTIR PT Enhanced sec. 4): if
+    // the offset pair (x'_{i-1}, x'_i) passes the criteria at a vertex
+    // where the base path did NOT reconnect, the offset path's own scan
+    // would reconnect HERE instead of at the base's rc vertex - the shift
+    // is not invertible, so reject. (The reconnection pair itself is
+    // validated in its branch below; slot 10 carries the previous replayed
+    // scatter's pdf and eligibility.)
+    if (i >= 2u)
+    {
+        vec4 rcCrit = wfArena[jb + 10u];
+        if (floatBitsToUint(rcCrit.y) != 0u && MatRcCacheable(mat)
+            && RestirRcFootprintOk(lastD2, rcCrit.x, abs(dot(n, wi)), mat, false, rcCrit.z))
+        { WfJobFail(jb); return; }
+    }
 
     if (lightRc && i == t - 1u)
     {
@@ -447,9 +473,22 @@ void main()
 
         if (RS_BASE.rcInfo.x <= 0.0 || RS_BASE.rcInfo.y <= 0.0) { WfJobFail(jb); return; }
 
-        // Re-evaluate the rc vertex's BSDF between the new arrival dir and
-        // the cached suffix dir (identical to restir_shift.glsl).
+        // Offset-side reconnection criteria for the pair itself: interior
+        // rc and emitter-terminal rc were footprint-gated at creation, so
+        // the offset pair must pass the SAME criteria in this domain
+        // (symmetric acceptance; light-point and connection-vertex rc are
+        // ungated fallbacks on both sides). pdfDir is the evaluated pdf of
+        // the reconnection direction at x'_{r-1}.
         bool emitterRc = (s == 0u && r == t - 1u);
+        if (rcMatBits != NO_MATERIAL && (emitterRc || r < t - 1u))
+        {
+            bool prevOk = MatRcCacheable(mat)
+                          && MatRcRoughness(mat) >= RESTIR_RC_ALPHA_MIN;
+            if (!prevOk
+                || !RestirRcFootprintOk(d2, pdfDir, cosRc, materials[rcMatBits],
+                                        emitterRc, wfArena[jb + 10u].z))
+            { WfJobFail(jb); return; }
+        }
         float pFwdRc = 0.0, pRevRc = 0.0;
         if (rcMatBits != NO_MATERIAL && !emitterRc)
         {
@@ -543,5 +582,10 @@ void main()
     wfArena[jb + 3u] = vec4(-bs.dir, 0.0);
     wfArena[jb + 4u] = vec4(f, replayPdf);
     wfArena[jb + 5u] = vec4(dVCM, dVC, dT1, J);
+    // Criteria state for the next arrival's pair check (rc-eligible
+    // materials are single-lobe, so bs.pdfDir is the edge's full pdf).
+    wfArena[jb + 10u].x = bs.specular ? 0.0 : bs.pdfDir;
+    wfArena[jb + 10u].y = uintBitsToFloat(
+        (MatRcCacheable(mat) && MatRcRoughness(mat) >= RESTIR_RC_ALPHA_MIN) ? 1u : 0u);
     WfAppend(WfCtrlShade(uWfRound + 1u), WfShiftStepQBase(uWfRound + 1u), jobIdx);
 }

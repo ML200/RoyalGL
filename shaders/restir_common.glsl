@@ -213,6 +213,14 @@ bool RestirConnectionsEnabled()  { return (uFrame.restirParams.y & 32u) != 0u; }
 // Phase 5: recompute omega_tau for shifted paths (unbiased) instead of
 // copying it from the base path (paper Sec. 6.4's bounded darkening).
 bool RestirMisRecomputeEnabled() { return (uFrame.restirParams.y & 64u) != 0u; }
+// Off (ROYALGL_RESTIR_STRAT=0): uniform random spatial candidate picks
+// instead of the antithetic stratified pattern - A/B isolation of the
+// Salaün 2025 stratification benefit; the estimator is unbiased either way.
+bool RestirStratifiedEnabled()   { return (uFrame.restirParams.y & 128u) != 0u; }
+// Duplication-map temporal decorrelation (ReSTIR PT Enhanced sec. 5).
+// Introduces a small bias in correlated regions; ROYALGL_RESTIR_DECORR=0
+// restores exact unbiasedness for soaks.
+bool RestirDecorrEnabled()       { return (uFrame.restirParams.y & 256u) != 0u; }
 
 // ---------------------------------------------- MIS eval light pdfs ------
 // EVAL pick pdf for every ReSTIR MIS quantity: the power-proportional CDF
@@ -348,6 +356,50 @@ CausticReservoir RestirEmptyCaustic()
 }
 
 float RestirLum(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+// ------------ footprint-based reconnection criteria (ReSTIR PT Enhanced,
+// sec. 4). A pair (x_{k-1}, x_k) qualifies as the reconnection pair when
+// both ray footprints clear a fixed fraction of the pixel's PRIMARY ray
+// footprint (eq. 5; scene-independent, adapts to distance and roughness):
+//   fwd: 1/(p_{k-1}(w) G(x_{k-1}->x_k)) >= T   (area footprint at x_k)
+//   inv: 1/(p_k(w') G(x_k->x_{k-1}))    >= T   (reverse footprint;
+//        evaluated with the GGX peak-pdf proxy p_max ~ 1/(pi a^2) and
+//        cos ~ 1, i.e. d^2 pi a^2 >= T, so it is known before the scatter
+//        at x_k is sampled; skipped for diffuse/emissive x_k - their
+//        continuation pdf is arrival-independent, paper footnote 6)
+// plus a single-vertex roughness threshold alpha_{k-1} >= 0.2, folded into
+// the callers' prevConnectable state. Replaces the historical
+// material-class-only criterion (which reconnected at ANY non-delta pair,
+// hurting glossy reuse and corner-adjacent shifts).
+const float RESTIR_RC_FOOT_C = 2e-4; // c/100 with the paper's c = 0.02
+const float RESTIR_RC_ALPHA_MIN = 0.2;
+
+// (c/100) x primary footprint area ||x0-x1||^2 / (<n1,d>/(4pi)).
+float RestirRcFootThreshold(float primaryDist, float cosPrimary)
+{
+    return RESTIR_RC_FOOT_C * primaryDist * primaryDist * 4.0 * PI
+           / max(cosPrimary, 1e-3);
+}
+
+// dist2/pdfEdge/cosAtK describe the pair edge: pdfEdge is the solid-angle
+// pdf of the edge direction at x_{k-1} (sampled at creation, evaluated at
+// reconnection), cosAtK = |n_k . edge|.
+bool RestirRcFootprintOk(float dist2, float pdfEdge, float cosAtK,
+                         Material rcMat, bool rcEmissive, float T)
+{
+    if (pdfEdge <= 0.0) return false;
+    if (dist2 < T * pdfEdge * cosAtK) return false; // fwd footprint
+    if (!rcEmissive)
+    {
+        int mt = int(rcMat.params.w + 0.5);
+        if (mt == 2 || mt == 3) // glossy x_k: inverse footprint (proxy)
+        {
+            float a = rcMat.params.y;
+            if (dist2 * PI * a * a < T) return false;
+        }
+    }
+    return true;
+}
 
 // Small standalone xorshift for reservoir-selection draws, independent of
 // the path-replay streams in g_rngState.

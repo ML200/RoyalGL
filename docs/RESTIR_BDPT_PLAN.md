@@ -768,6 +768,120 @@ increasing risk.
 > (MK). The pre-existing ~-0.02% spatial drift persists unchanged -
 > confirming it was never this mechanism (Phase 5 notes).
 
+### Phase 8 — Megakernel removal + histogram-stratified spatial reuse
+
+> **Phase 8 status: DONE.**
+>
+> **Megakernel removal.** The wavefront path is now the ONLY ReSTIR
+> pipeline: `restir_camera/temporal/spatial.comp`, the orphaned
+> `restir_shift.glsl`, the unidirectional `pathtrace.comp`, the
+> `ROYALGL_RESTIR_WAVEFRONT` mask, and the `enableBidir`/`enableNEE`
+> settings (+ `ROYALGL_BIDIR/NEE`) are gone. Non-ReSTIR frames always
+> render the three-pass BDPT (also the lens-mode fallback and the
+> unbiased reference); machines with <18 SSBO bindings fall back to it
+> too. Post-removal soak matches the previous default band (0.116465).
+>
+> **Histogram-stratified spatial reuse** (Salaün et al., "Histogram
+> Stratification for Spatio-Temporal Reservoir Sampling", SIGGRAPH '25)
+> replaces the uniform-disk neighbor selection:
+> - `restir_wf_ssort.comp` (one 256-thread workgroup per 16x16 block,
+>   grid origin jittered per frame): shared-memory bitonic sort of the
+>   block's post-temporal candidates by (cluster key, pHat). The sorted
+>   list is the inverse CDF of the block's luminance histogram (Heitz &
+>   Belcour 2019); cluster key = primary-hit instance+material is the
+>   paper's object-id spatial mask. Output goes to the spare arena
+>   region [25N,26N) - no new SSBO binding, the ray-tracing kernels
+>   stay at NVIDIA's 16-storage-block limit.
+> - `sinit`: per pixel ONE scrambled-Sobol draw per frame (van der
+>   Corput over the frame counter, per-pixel XOR scramble) fans into K
+>   antithetic stratified positions pos_k = k even ? k/K+u : (k+1)/K-u
+>   (u in [0,1/K)) - one per stratum, pairwise summing to 1 (paper
+>   fig. 3) - which index the pixel's cluster run in the sorted list.
+> - **Merge had to become LINEAR over rounds**: the K rounds share one
+>   u, so which candidate a round sees correlates with the sorted
+>   VALUES (round 0 = dimmest stratum). Chaining pair-merges against a
+>   running aggregate under that correlation measured 4% DARK
+>   (0.111474); selection-vs-value conditioning breaks the chained-GRIS
+>   independence assumption. `smerge` now builds, per round, the
+>   2-technique pairwise-MIS estimator E_k = (FROZEN canonical vs
+>   candidate) - identical math to the old chained step with the
+>   canonical substituted for the aggregate - and mixes the K rounds
+>   with constant weight 1/K by streaming WRS (outer weight v_k =
+>   wSum_k/K; the winner's pHat cancels against its UCW, so W = V/pHat
+>   stays in final form after every round, no finalization pass).
+>   Linearity makes value-correlated selection harmless: each E_k's
+>   expectation only involves its round's marginally-uniform pick.
+>   Self-picks fold in the canonical EXACTLY (a reservoir pair-merged
+>   with itself is the identity - confidences cancel), so 1-pixel
+>   clusters are no-ops instead of W inflations.
+> - Defaults: spatial candidates 4 (paper), block 16x16 (paper's best
+>   trade-off), confidence cap unchanged (8). `ROYALGL_RESTIR_SPATIAL_NBRS`
+>   and `ROYALGL_RESTIR_STRAT=0` (uniform-random picks from the same
+>   clustered pool) exist for scripted A/B.
+> - Soaks: strat + rand + K=1 + spatial-off all in band
+>   (0.116464-0.116521); conductor 0.116615 (PT 0.11674); moving duck
+>   per-frame relNoise 0.0905 hot=0 (recorded band was ~0.12); orbit
+>   hot=0; plain BDPT 0.116591. K=4 accumulated relNoise 0.0322 @1280
+>   vs K=1 0.0357 @448. Antithetic-vs-random measured a wash ON THIS
+>   SCENE (0.03249 vs 0.03251 @1088; Cornell blocks are locally
+>   luminance-uniform, so the sorted list is nearly flat - the paper's
+>   gains come from scenes with strong local variation). Spatial pass
+>   15.5 ms at 1600x900 for 4 candidates incl. the sort (~0.3 ms).
+
+### Phase 9 — ReSTIR PT Enhanced adoptions (Lin et al. 2026)
+
+> **Phase 9 status: DONE.** From "ReSTIR PT Enhanced: Algorithmic
+> Advances for Faster and More Robust ReSTIR Path Tracing":
+>
+> **Adopted.**
+> - **Footprint reconnection criteria (sec. 4)** replace the
+>   material-class-only rc-pair scan: dual ray-footprint thresholds at
+>   a fixed fraction (c=0.02) of the pixel's primary footprint
+>   (RestirRcFootprintOk, restir_common.glsl) + a single-vertex
+>   roughness threshold (0.2) folded into prevConnectable. The inverse
+>   footprint uses the GGX peak-pdf proxy pi*alpha^2*d^2 >= T so it is
+>   known before the scatter at x_k is sampled (deviation from the
+>   paper, which defers the decision; exact for diffuse/emitter x_k
+>   per their footnote 6). Bijectivity: creation gates the pair in the
+>   source domain; shiftstep re-evaluates the SAME criteria on the
+>   offset path (job slot 10 carries pdf/eligibility/threshold) - an
+>   earlier offset pair passing, or the reconnection/terminal-emitter
+>   pair failing, rejects the shift. Light-point and connection-vertex
+>   rc stay ungated fallbacks on both sides (which is also the paper's
+>   sec. 6.2.3 forced light reconnection - we already had it).
+> - **Duplication-map decorrelation (sec. 5)**: restir_wf_dupmap.comp
+>   counts same-seed (fSeed.w) reservoirs in 17x17 at END of frame ->
+>   D in the persistent arena slot [26N,27N).w; next frame's tmerge
+>   caps history confidence at lerp(cCap, 1, D^0.1). Slightly biased
+>   by design; ROYALGL_RESTIR_DECORR=0 restores exactness (soaks:
+>   static Cornell shows NO measurable bias, 0.116473 vs 0.116478).
+> - **Color noise reduction (sec. 6.3)**: smerge accumulates VECTOR
+>   resampling weights m*omega*F*W*J into [26N,27N).xyz (1/K mixture);
+>   resolve shades that marginalized sum instead of the winner-only
+>   omega*f*W whenever spatial reuse ran. Scalar weights still drive
+>   the reservoirs (shading decoupled from resampling). Per-frame
+>   relNoise 0.093 -> 0.084 at HALF the spatial candidates.
+> - **Unified DI+GI (sec. 6.1)**: verified already inherent - the BDPT
+>   technique set (s=0 emitter hits, s=1 NEE incl. the primary vertex,
+>   t=1, s>=2) has always fed one reservoir; no separate DI pass
+>   exists to unify.
+>
+> **Not adopted.** Paired/reciprocal spatial reuse (sec. 3) is
+> mutually exclusive with the Phase 8 histogram-stratified selection
+> (pairing textures would replace the sorted-cluster draw); stream
+> compaction (sec. 6.2.2) is the wavefront architecture we already
+> run; dual motion vectors (sec. 6.4) need a motion-vector channel the
+> G-buffer doesn't carry yet (future work); reservoir compression and
+> presampled light tiles don't pay off at our reservoir layout / light
+> counts.
+>
+> Soaks (decorr off): default 0.116473-0.116479; conductor ReSTIR
+> 0.116619 vs same-session BDPT 0.116693 (-0.06%); layered 0.117808
+> (band 0.11778); moving duck per-frame relNoise 0.0806 hot=0 (was
+> 0.0905 pre-criteria). All-on GPU total 31.1 ms at 1600x900 (spatial
+> 10.3, temporal 5.2, camera 10.2) - the criteria cost nothing
+> measurable and kill bad corner/glossy reconnections earlier.
+
 ---
 
 ## 7. Files touched / created

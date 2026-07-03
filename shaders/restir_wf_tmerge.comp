@@ -27,7 +27,12 @@ void main()
     vec4 aCore = pixelRes[inSlot].path.core;
     vec4 bCore = pixelRes[bSlot].path.core;
     // header.z = anchor-distance confidence fade (see restir_wf_tinit.comp).
-    float cB = min(bCore.z, RestirConfidenceCap()) * header.z;
+    // WfDecorrCap: duplication-adaptive confidence cap (ReSTIR PT Enhanced
+    // sec. 5) - history from regions the previous frame measured as highly
+    // correlated claims fewer effective samples, so fireflies stop
+    // spreading and persisting. Slightly biased; ROYALGL_RESTIR_DECORR=0
+    // restores the plain cap.
+    float cB = min(bCore.z, WfDecorrCap(prevIdx)) * header.z;
     float cA = aCore.z;
 
     // Forward shift result: history -> current domain.

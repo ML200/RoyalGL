@@ -159,11 +159,29 @@ void main()
     uint maxLen = BdptMaxPathLength();
     float numLightPaths = float(BdptNumLightPaths());
 
-    // Reconnection vertex: first connectable pair (megakernel order: after
-    // the mask update, before the emitter branch). Layered vertices are
-    // not rc-cacheable (see MatRcCacheable).
+    // Reconnection vertex: first pair passing the criteria (after the mask
+    // update, before the emitter branch). Structural gates: layered/delta
+    // vertices are not rc-cacheable (MatRcCacheable), and prevConnectable
+    // also carries the single-vertex roughness threshold. On top of that,
+    // the footprint criteria (ReSTIR PT Enhanced sec. 4) postpone
+    // reconnection past short edges and low-roughness glossy vertices -
+    // scene-independent thresholds derived from the pixel's primary
+    // footprint. pdf of this pair's edge = pProd / slot2.w (the scatter at
+    // x_{k-1}; rc-eligible materials are single-lobe, choicePdf = 1).
     bool selfConnectable = MatRcCacheable(mat) || isEmissive;
     if (!rcFound && pathLen >= 2u && prevConnectable && selfConnectable)
+    {
+        ivec2 pixel = ivec2(int(idx % uFrame.frameInfo.x), int(idx / uFrame.frameInfo.x));
+        GBufferPixel g1 = RestirLoadGBuf(GBufCurOffset() + idx);
+        float cosPrim = abs(dot(g1.normalMat.xyz, RestirPrimaryRay(pixel).dir));
+        float T = RestirRcFootThreshold(g1.posDepth.w, cosPrim);
+        float pdfEdge = pProd / max(wfArena[base + 2u].w, 1e-30);
+        selfConnectable = RestirRcFootprintOk(lastEdgeDist2, pdfEdge, abs(dot(n, wi)),
+                                              mat, isEmissive, T);
+    }
+    else
+        selfConnectable = false;
+    if (selfConnectable)
     {
         rcFound = true;
         rcIdx = pathLen;
@@ -482,8 +500,10 @@ void main()
     float pdfPrevArrival = pProd;
     fCur *= bs.weight * pdfStep;
     pProd *= pdfStep;
-    // See restir_camera.comp: layered can't be x_{r-1} of an rc pair.
-    prevConnectable = MatRcCacheable(mat);
+    // x_{k-1} eligibility: structurally cacheable (no layered/delta) AND
+    // rough enough (single-vertex threshold, ReSTIR PT Enhanced sec. 4.2).
+    prevConnectable = MatRcCacheable(mat)
+                      && MatRcRoughness(mat) >= RESTIR_RC_ALPHA_MIN;
 
     // MIS recursions (identical to the megakernel; consume the OLD dVCM,
     // update dVCM last).

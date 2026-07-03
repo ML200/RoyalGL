@@ -230,6 +230,18 @@ bool MatRcCacheable(Material m)
     return t != 1 && t != 4;
 }
 
+// Scalar roughness proxy for the reconnection criteria (ReSTIR PT
+// Enhanced sec. 4.2): diffuse counts as fully rough, delta as perfectly
+// smooth. Layered is structurally excluded from rc pairs regardless
+// (MatRcCacheable), so its value here never matters.
+float MatRcRoughness(Material m)
+{
+    int t = int(m.params.w + 0.5);
+    if (t == 0) return 1.0;
+    if (t == 2 || t == 3) return m.params.y;
+    return 0.0;
+}
+
 // Exact unpolarized dielectric Fresnel reflectance; returns 1 on total
 // internal reflection.
 float FresnelDielectric(float cosI, float etaI, float etaT)

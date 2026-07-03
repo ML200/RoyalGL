@@ -21,25 +21,12 @@ namespace RoyalGL
         float backgroundIntensity = 1.0f;
         int maxSamples = 0; // 0 = unlimited
 
-        // Next-event estimation via the light tree, MIS-combined with BSDF
-        // sampling (balance heuristic). Only affects the unidirectional
-        // pipeline (bidir has its own s=1 strategy). Off = pure BSDF
-        // sampling; both converge to the same image, which makes this a
-        // useful A/B check.
-        bool enableNEE = true;
-
-        // Bidirectional path tracing (three compute passes, recursive MIS
-        // weights - see docs/ARCHITECTURE.md). Converges to the same image
-        // as the unidirectional pipeline; caustics through delta glass are
-        // only reachable efficiently here (t=1 light tracing).
-        bool enableBidir = true;
-
         // ReSTIR BDPT (docs/RESTIR_BDPT_PLAN.md): per-frame spatiotemporal
-        // reservoir reuse over bidirectional path candidates. Forces the
-        // bidirectional pipeline and full-frame (non-tiled) dispatch.
-        // Pinhole cameras only - lens mode falls back to plain BDPT (the
-        // stochastic pupil makes the primary hit a random variable, which
-        // is Area-ReSTIR territory).
+        // reservoir reuse over bidirectional path candidates, full-frame
+        // (non-tiled) wavefront dispatch. Pinhole cameras only - lens mode
+        // falls back to plain BDPT (the stochastic pupil makes the primary
+        // hit a random variable, which is Area-ReSTIR territory). Off =
+        // plain progressive BDPT.
         bool enableRestir = true;
         // 0=off, then G-buffer normals / depth / motion vectors, reservoir
         // W / confidence / technique index (see shaders/restir_debug.comp).
@@ -48,8 +35,22 @@ namespace RoyalGL
         // unbiasedness baseline).
         bool restirTemporal = true;
         bool restirSpatial = true;
-        int restirSpatialNeighbors = 1;
-        float restirSpatialRadius = 30.0f; // pixels
+        // Spatial candidates per pixel and frame, drawn with the antithetic
+        // stratified pattern from the block's sorted candidate list
+        // (Salaün 2025; the paper uses 4). Even counts pair antithetically;
+        // 2 = one antithetic pair {u, 1-u}, half the shift cost of 4.
+        int restirSpatialNeighbors = 2;
+        // A/B switch (env ROYALGL_RESTIR_STRAT=0, no UI): off = uniform
+        // random picks from the same sorted/clustered pool - isolates the
+        // benefit of the antithetic stratification itself.
+        bool restirStratified = true;
+        // Duplication-map temporal decorrelation (ReSTIR PT Enhanced
+        // sec. 5): end-of-frame same-seed counting adaptively lowers the
+        // temporal confidence cap in correlated regions. Trades a small,
+        // bounded bias (paper: ~3% in pathological scenes, far less
+        // typically) for much faster firefly/blob decay. Off = exactly
+        // unbiased (soak mode). Env: ROYALGL_RESTIR_DECORR.
+        bool restirDecorrelate = true;
         // Confidence (M) cap for all reuse passes (paper uses 20): bounds
         // the effective temporal sample count a reservoir can claim.
         // Lower = fresher (outliers and stale history wash out in fewer
@@ -85,8 +86,7 @@ namespace RoyalGL
         bool accumulate = true;
 
         // Physical lens camera (Steinert et al. 2011). Lens mode renders
-        // through the unidirectional pipeline regardless of enableBidir -
-        // exact BDPT MIS through a lens is future work.
+        // through the plain BDPT pipeline (ReSTIR is pinhole-only).
         CameraMode cameraMode = CameraMode::Pinhole;
         LensSettings lens;
 
@@ -97,14 +97,13 @@ namespace RoyalGL
                    backgroundColor == other.backgroundColor &&
                    backgroundIntensity == other.backgroundIntensity &&
                    maxSamples == other.maxSamples &&
-                   enableNEE == other.enableNEE &&
-                   enableBidir == other.enableBidir &&
                    enableRestir == other.enableRestir &&
                    restirDebugView == other.restirDebugView &&
                    restirTemporal == other.restirTemporal &&
                    restirSpatial == other.restirSpatial &&
                    restirSpatialNeighbors == other.restirSpatialNeighbors &&
-                   restirSpatialRadius == other.restirSpatialRadius &&
+                   restirStratified == other.restirStratified &&
+                   restirDecorrelate == other.restirDecorrelate &&
                    restirConfidenceCap == other.restirConfidenceCap &&
                    restirLightTracing == other.restirLightTracing &&
                    restirConnections == other.restirConnections &&

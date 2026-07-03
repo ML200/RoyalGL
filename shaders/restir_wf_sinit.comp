@@ -4,80 +4,139 @@
 #include "restir_wf_common.glsl"
 #include "restir_wf_shift.glsl"
 
-// Wavefront spatial reuse, stage 1 of neighbor round uWfRound: neighbor
-// selection + shift-job creation (the head of restir_spatial.comp's k-th
-// loop iteration). Round 0 also initializes the running aggregate in the
-// final-region slot (it lives there, exactly like the megakernel). The
-// neighbor-selection RNG chain is persisted in the per-pixel header so the
-// draw sequence across sinit/smerge rounds is identical to the megakernel's
-// single loop:
+// Wavefront spatial reuse, stage 1 of candidate round uWfRound: histogram-
+// stratified candidate selection (Salaün et al. 2025) + shift-job creation.
+// Round 0 also initializes the running aggregate in the final-region slot.
+//
+// Candidate selection replaces the historical uniform-disk neighbor draw:
+// restir_wf_ssort.comp has sorted each 16x16 block's candidates by
+// (cluster, luminance) into a per-cluster inverse CDF; round k picks the
+// rank at the k-th position of an ANTITHETIC stratified pattern (paper
+// fig. 3, generalized to K rounds):
+//     u ~ [0, 1/K),   pos_k = k even ? k/K + u : (k+1)/K - u
+// so the K positions are one-per-stratum and pairwise sum to 1 - high
+// candidates pair with low ones and errors cancel for the monotone sorted
+// list. The single u per pixel and frame comes from a per-pixel
+// XOR-scrambled Sobol (van der Corput) sequence indexed by the frame
+// counter, giving stratification ACROSS frames as well (the paper's
+// temporal dimension; the EMA/M-cap window then averages a stratified set).
+//
+// The K rounds share ONE u, so which candidate a round sees is correlated
+// with the candidates' sorted VALUES (round 0 always draws from the lowest
+// luminance stratum, round K-1 from the highest). A merge that is linear
+// over the rounds is immune to that correlation (each round's pick is
+// still marginally uniform over the cluster); a CHAINED merge against a
+// running aggregate is not - it measured 4% dark. smerge therefore
+// pair-merges each candidate against the FROZEN canonical (this pixel's
+// post-temporal reservoir) and mixes the K pair estimators with constant
+// weight 1/K via streaming WRS - the paper's linear resampling estimator
+// in streaming form. Self-picks collapse to the canonical exactly, so
+// 1-pixel clusters degrade to a no-op instead of inflating W.
+//
+// Per-pixel header (wfArena[idx], region [0, N)):
 //   header.x = uintBits(rng state)   header.y = uintBits(pixel alive)
-//   header.z = uintBits(neighborIdx + 1; 0 = this round has no valid
-//              neighbor - smerge skips, megakernel `continue`)
-// Neighbor selection uses only sample-independent surface data, as
-// confidence-weight correctness requires.
+//   header.z = uintBits(candidateIdx + 1; == idx+1 marks a self round,
+//              0 only for dead pixels)
+//   header.w = the antithetic base draw u (float)
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Van der Corput radical inverse of the frame index, XOR-scrambled per
+// pixel: one progressive, stratified [0,1) sequence per pixel across
+// frames (the paper's per-pixel Sobol; XOR scrambling preserves the
+// power-of-two stratification while decorrelating pixels).
+float WfSobolSel(uint frame, uint pixelIdx)
+{
+    uint v = bitfieldReverse(frame);
+    v ^= WangHash(pixelIdx * 0x27d4eb2du + 0x165667b1u);
+    return float(v) * 2.3283064365386963e-10; // / 2^32
+}
 
 void main()
 {
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= RestirPixelCount()) return;
-    ivec2 size = ivec2(uFrame.frameInfo.xy);
     ivec2 pixel = ivec2(int(idx % uFrame.frameInfo.x), int(idx / uFrame.frameInfo.x));
 
     uint outSlot = RestirRegionOffset(RestirFinalRegion()) + idx;
+    uint canonSlot = RestirRegionOffset(RESTIR_SCRATCH_REGION) + idx;
     GBufferPixel gCur = RestirLoadGBuf(GBufCurOffset() + idx);
+    float K = max(uFrame.prevCameraParams.w, 1.0);
 
     if (uWfRound == 0u)
     {
-        pixelRes[outSlot].path = pixelRes[RestirRegionOffset(RESTIR_SCRATCH_REGION) + idx].path;
+        if (uFrame.prevCameraParams.w < 0.5)
+        {
+            // 0 candidate rounds: the pass is a plain copy to the final
+            // region (the host dispatches only this round).
+            pixelRes[outSlot].path = pixelRes[canonSlot].path;
+            return;
+        }
+        // The mixture aggregate starts EMPTY (V = W*pHat = 0); the
+        // canonical enters through every round's pair estimator. Its
+        // confidence seeds the running confidence total.
+        PathReservoir empty = pixelRes[canonSlot].path;
+        empty.core = vec4(0.0, 0.0, pixelRes[canonSlot].path.core.z, empty.core.w);
+        pixelRes[outSlot].path = empty;
+        // Marginalized RGB shading accumulator (component write: .w holds
+        // the frame-persistent duplication score).
+        wfArena[WfShadeAccSlot(idx)].xyz = vec3(0.0);
         uint rng = WangHash(idx * 26699u + uFrame.restirParams.z * 30323u + 0x8DA6B343u);
         if (rng == 0u) rng = 0x9E3779B9u;
         wfArena[idx] = vec4(uintBitsToFloat(rng),
                             uintBitsToFloat((gCur.posDepth.w < 0.0) ? 0u : 1u),
-                            uintBitsToFloat(0u), 0.0);
+                            uintBitsToFloat(0u),
+                            WfSobolSel(uFrame.restirParams.z, idx));
     }
     if (floatBitsToUint(wfArena[idx].y) == 0u) return;
 
-    uint rng = floatBitsToUint(wfArena[idx].x);
+    // This pixel's cluster run in its block's sorted candidate list.
+    uint sortSlot = WfSortSlotBase() + idx;
+    uint start = floatBitsToUint(wfArena[sortSlot].y);
+    uint count = floatBitsToUint(wfArena[sortSlot].z);
 
-    // Uniform disk offset (megakernel draw order: u1, u2, then validation).
-    float u1 = RestirRand(rng);
-    float u2 = RestirRand(rng);
-    float radius = max(uFrame.prevCameraParams.z, 1.0);
-    float rad = radius * sqrt(u1);
-    float phi = 6.28318530718 * u2;
-    ivec2 nbr = pixel + ivec2(round(rad * cos(phi)), round(rad * sin(phi)));
+    // Antithetic stratified position for this round (A/B: uniform random
+    // from the same pool when stratification is disabled).
+    float pos;
+    if (RestirStratifiedEnabled())
+    {
+        float u = wfArena[idx].w / K;
+        float k = float(uWfRound);
+        pos = ((uWfRound & 1u) == 0u) ? (k / K + u) : ((k + 1.0) / K - u);
+    }
+    else
+    {
+        uint rng = floatBitsToUint(wfArena[idx].x);
+        pos = RestirRand(rng);
+        wfArena[idx].x = uintBitsToFloat(rng);
+    }
 
-    wfArena[idx].x = uintBitsToFloat(rng);
-    wfArena[idx].z = uintBitsToFloat(0u); // no valid neighbor yet
-
-    if (nbr == pixel || nbr.x < 0 || nbr.y < 0 || nbr.x >= size.x || nbr.y >= size.y) return;
-
-    uint nIdx = RestirPixelIndex(nbr);
-    GBufferPixel gN = RestirLoadGBuf(GBufCurOffset() + nIdx);
-    if (gN.posDepth.w < 0.0) return;
-    if (GBufMaterial(gN) != GBufMaterial(gCur)) return;
-    // Surface similarity heuristics (domain choice, sample-independent).
-    if (abs(gN.posDepth.w - gCur.posDepth.w) > 0.1 * gCur.posDepth.w) return;
-    if (dot(gN.normalMat.xyz, gCur.normalMat.xyz) < 0.9) return;
-
+    uint nIdx = idx; // self round unless a distinct candidate turns up
+    if (count > 1u)
+    {
+        uint rank = start + min(uint(pos * float(count)), count - 1u);
+        ivec2 origin, lo, sz;
+        WfSortBlockRect(WfSortBlockOf(pixel), origin, lo, sz);
+        nIdx = WfSortRankPixel(origin, lo, sz, rank);
+    }
     wfArena[idx].z = uintBitsToFloat(nIdx + 1u);
+    if (nIdx == idx) return; // self round: smerge folds in the canonical
 
     uint job0 = idx * 2u;
     uint job1 = idx * 2u + 1u;
     wfArena[WfShiftJobBase(job0)].z = uintBitsToFloat(WF_JOB_FAIL);
     wfArena[WfShiftJobBase(job1)].z = uintBitsToFloat(WF_JOB_FAIL);
 
-    // Forward: neighbor sample into this pixel's domain.
+    // Forward: candidate sample into this pixel's domain.
     uint nSlot = RestirRegionOffset(RESTIR_SCRATCH_REGION) + nIdx;
     vec4 nCore = pixelRes[nSlot].path.core;
     if (nCore.x > 0.0 && nCore.y > 0.0)
         WfShiftCreateJob(job0, nSlot, idx, false);
 
-    // Backward: the running aggregate into the neighbor's domain.
-    vec4 rCore = pixelRes[outSlot].path.core;
-    if (rCore.x > 0.0 && rCore.y > 0.0)
-        WfShiftCreateJob(job1, outSlot, nIdx, false);
+    // Backward: the FROZEN canonical into the candidate's domain (the pair
+    // estimator is canonical-vs-candidate; the running aggregate never
+    // feeds MIS, which is what keeps the mixture linear over rounds).
+    vec4 cCore = pixelRes[canonSlot].path.core;
+    if (cCore.x > 0.0 && cCore.y > 0.0)
+        WfShiftCreateJob(job1, canonSlot, nIdx, false);
 }

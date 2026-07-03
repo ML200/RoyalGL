@@ -64,8 +64,6 @@ shaders/
                     shared BSDF layer (Lambertian + delta dielectric).
   light_tree.glsl   Light tree sampling for NEE: stochastic descent, leaf
                     triangle pick, pdf re-descent for MIS.
-  pathtrace.comp    Unidirectional megakernel: ray gen (pinhole formula),
-                    BVH traversal, light-tree NEE + MIS shading, accumulate.
   bdpt_common.glsl  BDPT shared layer: light-vertex/splat SSBOs, camera
                     projection/pdf helpers, power-CDF light sampling, and
                     the recursive MIS quantity documentation.
@@ -93,14 +91,12 @@ shaders/
      (bindings 1-4, owned by `BVHBuilder`), the light tree SSBOs
      (bindings 5-7, owned by `LightTree`) and the accumulation image
      (image unit 0),
-   - dispatches `pathtrace.comp` with one thread per pixel. Each thread
-     generates a primary ray via the pinhole formula, traces **one full
-     path** (up to `maxBounces` diffuse bounces with Russian roulette),
-     at each vertex adding MIS-weighted direct light from one light-tree
-     NEE sample (see "Direct lighting" below), and adds the result to the
-     accumulation image (`imageLoad` + `imageStore`; safe without atomics
-     because each pixel is written by exactly one invocation per
-     dispatch).
+   - dispatches either the ReSTIR BDPT wavefront pass graph (default, see
+     docs/RESTIR_BDPT_PLAN.md) or the plain three-pass BDPT pipeline
+     (ReSTIR off or lens mode; see "Bidirectional path tracing" below).
+     The historical unidirectional megakernel (`pathtrace.comp`) and the
+     ReSTIR megakernel pass variants were removed - every ReSTIR pass now
+     runs as wavefront kernels split at ray boundaries.
 4. `FullscreenPass` draws a full-screen triangle sampling the accumulation
    image, dividing by the sample count, applying exposure + ACES + gamma,
    into the default framebuffer.
@@ -269,18 +265,19 @@ RoyalGL's scene is one flattened world-space triangle soup:
   index interval), multiplying the same smoothed probabilities the sampler
   used.
 
-`RenderSettings::enableNEE` toggles the whole scheme at runtime (off =
-pure BSDF sampling); both settings converge to the same image, which makes
-the toggle a useful bias check. The light tree only serves the
-unidirectional pipeline - see the note on receiver dependence below.
+This scheme served the removed unidirectional pipeline; the light tree
+buffers remain bound for emitter lookups (`triToLight`, `lightTris`) and
+the camera-anchored selection pdf cache (`bdpt_lightsel.comp`) - BDPT and
+ReSTIR sample lights through the power CDF instead (see the note on
+receiver dependence below).
 
 ## Bidirectional path tracing (Veach ch. 10, recursive MIS)
 
-`RenderSettings::enableBidir` (default on) switches `PathTracer::Render`
-from the unidirectional megakernel to a three-pass bidirectional pipeline.
-Both pipelines converge to the same image (verified against each other),
-but caustics cast by the glass duck - light -> glass -> ... -> diffuse -
-are only sampled efficiently by the bidirectional strategy set.
+The three-pass bidirectional pipeline is the renderer for every non-ReSTIR
+frame (`RenderSettings::enableRestir` off, or lens mode). It is the
+unbiased reference the ReSTIR estimators are validated against; caustics
+cast by the glass duck - light -> glass -> ... -> diffuse - are only
+sampled efficiently by the bidirectional strategy set.
 
 **Passes** (all compute, separated by `glMemoryBarrier`):
 
@@ -351,7 +348,7 @@ stacking repeated emission adds into fireflies. With both in place the
 accumulation buffer's maximum equals the emitter radiance exactly and
 per-sample noise dropped ~3.6x (measured via `ROYALGL_STATS=1`, which
 logs luminance tail percentiles, a local-residual noise metric, and GPU
-per-pass timings; `ROYALGL_BIDIR/NEE/LENS` override settings for scripted
+per-pass timings; `ROYALGL_RESTIR/LENS` override settings for scripted
 A/B runs).
 
 The unidirectional MIS weights use the deterministic light-tree pdf
@@ -446,7 +443,7 @@ an exact tag/commit:
 | Dear ImGui v1.92.8-docking | UI | no upstream CMake support; vendored as a plain library target in `FetchLibs.cmake` |
 | cgltf v1.15 | `.gltf`/`.glb` parsing | single header |
 | stb (pinned commit) | `stb_image`/`stb_image_write` | PNG export, texture decode |
-| tinybvh (pinned commit) | CPU BVH build | GPU traversal is hand-written in `pathtrace.comp` |
+| tinybvh (pinned commit) | CPU BVH build | GPU traversal is hand-written in `common.glsl` |
 | Intel Open Image Denoise 2.5.0 | denoising | optional, prebuilt Windows binaries fetched by URL; `ROYALGL_ENABLE_OIDN` can turn it off, and the build degrades gracefully if the package isn't found |
 
 See the root `README.md` for build instructions.

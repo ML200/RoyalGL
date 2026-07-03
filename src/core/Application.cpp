@@ -82,13 +82,15 @@ namespace RoyalGL
         m_ui = std::make_unique<UILayer>(m_window->Handle());
 
         // Env-var overrides for scripted A/B experiments (no rebuild):
-        // ROYALGL_BIDIR=0/1, ROYALGL_NEE=0/1, ROYALGL_STATS=1.
-        if (const char* v = std::getenv("ROYALGL_BIDIR")) m_settings.enableBidir = (v[0] != '0');
-        if (const char* v = std::getenv("ROYALGL_NEE")) m_settings.enableNEE = (v[0] != '0');
+        // ROYALGL_RESTIR=0/1 (off = plain BDPT reference), ROYALGL_STATS=1.
         if (const char* v = std::getenv("ROYALGL_RESTIR")) m_settings.enableRestir = (v[0] != '0');
         if (const char* v = std::getenv("ROYALGL_RESTIR_DEBUG")) m_settings.restirDebugView = std::atoi(v);
         if (const char* v = std::getenv("ROYALGL_RESTIR_TEMPORAL")) m_settings.restirTemporal = (v[0] != '0');
         if (const char* v = std::getenv("ROYALGL_RESTIR_SPATIAL")) m_settings.restirSpatial = (v[0] != '0');
+        if (const char* v = std::getenv("ROYALGL_RESTIR_SPATIAL_NBRS"))
+            m_settings.restirSpatialNeighbors = std::max(std::atoi(v), 0);
+        if (const char* v = std::getenv("ROYALGL_RESTIR_STRAT")) m_settings.restirStratified = (v[0] != '0');
+        if (const char* v = std::getenv("ROYALGL_RESTIR_DECORR")) m_settings.restirDecorrelate = (v[0] != '0');
         if (const char* v = std::getenv("ROYALGL_RESTIR_LIGHT")) m_settings.restirLightTracing = (v[0] != '0');
         if (const char* v = std::getenv("ROYALGL_RESTIR_CONN")) m_settings.restirConnections = (v[0] != '0');
         if (const char* v = std::getenv("ROYALGL_RESTIR_MISFIX")) m_settings.restirRecomputeMis = (v[0] != '0');
@@ -454,6 +456,23 @@ namespace RoyalGL
                 {
                     ExportPNG(exportEnv);
                     exported = true;
+                }
+            }
+
+            // Headless denoise check: ROYALGL_DENOISE=1 runs the denoiser
+            // once (writes denoised.png) after ROYALGL_EXPORT_AT samples
+            // accumulated (default 256).
+            static const char* denoiseEnv = std::getenv("ROYALGL_DENOISE");
+            static bool denoised = false;
+            if (denoiseEnv && denoiseEnv[0] != '0' && !denoised)
+            {
+                uint32_t at = 256;
+                if (const char* v = std::getenv("ROYALGL_EXPORT_AT"))
+                    at = static_cast<uint32_t>(std::max(std::atoi(v), 1));
+                if (m_pathTracer->SampleCount() >= at)
+                {
+                    RunDenoiser();
+                    denoised = true;
                 }
             }
 

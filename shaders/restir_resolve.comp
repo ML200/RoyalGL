@@ -1,6 +1,7 @@
 #version 460 core
 #include "common.glsl"
 #include "restir_common.glsl"
+#include "restir_wf_common.glsl"
 
 // ReSTIR pass: shade the final reservoirs into the accumulation image.
 // The GRIS estimate for a pixel is omega_tau(Y) * f(Y) * W_Y (paper Eq. 22),
@@ -9,6 +10,13 @@
 // the background directly (deterministic, nothing to resample). Accumulates
 // like the other kernels: sample 0 overwrites, later samples add, per-pixel
 // count in alpha.
+//
+// Color noise reduction (ReSTIR PT Enhanced sec. 6.3): when the spatial
+// mixture ran, the regular estimate is the MARGINALIZED sum of vector
+// resampling weights accumulated by smerge (arena [26N,27N).xyz) instead
+// of the winner-only omega*f*W - same expectation, but chroma noise from
+// all considered candidates averages out. Scalar weights still drive the
+// reservoirs passed to future resampling (shading is decoupled).
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -30,10 +38,18 @@ void main()
     }
     else
     {
-        PathReservoir r = pixelRes[RestirRegionOffset(RestirFinalRegion()) + idx].path;
         CausticReservoir c = pixelRes[RestirRegionOffset(RestirFinalRegion()) + idx].caustic;
-        color = r.rcInfo.z * r.fSeed.xyz * r.core.x
-              + c.meta.x * c.fSeed.xyz * c.core.x;
+        vec3 regular;
+        if (RestirSpatialEnabled() && uFrame.prevCameraParams.w >= 0.5)
+        {
+            regular = wfArena[WfShadeAccSlot(idx)].xyz;
+        }
+        else
+        {
+            PathReservoir r = pixelRes[RestirRegionOffset(RestirFinalRegion()) + idx].path;
+            regular = r.rcInfo.z * r.fSeed.xyz * r.core.x;
+        }
+        color = regular + c.meta.x * c.fSeed.xyz * c.core.x;
     }
     if (any(isnan(color)) || any(isinf(color))) color = vec3(0.0);
 

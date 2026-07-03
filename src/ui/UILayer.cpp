@@ -123,20 +123,13 @@ namespace RoyalGL
                     ImGui::SliderFloat("Diffraction edge width (mm)", &settings.lens.diffractionEdgeWidthMm,
                                         0.005f, 0.5f, "%.3f", ImGuiSliderFlags_Logarithmic);
                 }
-                if (!settings.enableBidir)
-                    ImGui::TextDisabled("Flares need the bidirectional pipeline.");
             }
         }
 
         ImGui::Separator();
-        ImGui::Checkbox("Bidirectional (BDPT)", &settings.enableBidir);
-        ImGui::BeginDisabled(settings.enableBidir);
-        ImGui::Checkbox("NEE (light tree) + MIS", &settings.enableNEE);
-        ImGui::EndDisabled();
-        if (settings.enableBidir && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            ImGui::SetTooltip("Unidirectional-only: BDPT has its own light sampling strategy.");
-
-        ImGui::Checkbox("ReSTIR BDPT (WIP)", &settings.enableRestir);
+        ImGui::Checkbox("ReSTIR BDPT", &settings.enableRestir);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Off: plain progressive BDPT (the unbiased reference pipeline).");
         if (settings.enableRestir)
         {
             if (settings.cameraMode == CameraMode::Lens)
@@ -145,11 +138,22 @@ namespace RoyalGL
             ImGui::Checkbox("Vertex connections (s>=2)", &settings.restirConnections);
             ImGui::Checkbox("Recompute shift MIS (unbiased)", &settings.restirRecomputeMis);
             ImGui::Checkbox("Temporal reuse", &settings.restirTemporal);
+            if (settings.restirTemporal)
+            {
+                ImGui::Checkbox("Decorrelate (duplication map)", &settings.restirDecorrelate);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Adaptively lowers the temporal confidence cap where many\n"
+                                      "pixels share one sample (ReSTIR PT Enhanced). Kills firefly\n"
+                                      "blobs/streaks at the cost of a small bias; off = unbiased.");
+            }
             ImGui::Checkbox("Spatial reuse", &settings.restirSpatial);
             if (settings.restirSpatial)
             {
-                ImGui::SliderInt("Spatial neighbors", &settings.restirSpatialNeighbors, 1, 8);
-                ImGui::SliderFloat("Spatial radius (px)", &settings.restirSpatialRadius, 4.0f, 100.0f);
+                ImGui::SliderInt("Spatial candidates", &settings.restirSpatialNeighbors, 1, 8);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Antithetic stratified picks from the 16x16-block sorted\n"
+                                      "candidate histogram (Salaün 2025). Even counts pair\n"
+                                      "antithetically; the paper recommends 4.");
             }
             if (settings.restirTemporal || settings.restirSpatial)
             {

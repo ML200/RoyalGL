@@ -14,13 +14,11 @@ namespace RoyalGL
 {
     // Owns the progressive-accumulation path tracer: the compute shader
     // programs, the HDR accumulation image, and the per-frame uniform
-    // buffer. Two pipelines share the accumulation image, selected by
-    // RenderSettings::enableBidir per frame:
-    //  - unidirectional: one megakernel (pathtrace.comp) with light-tree
-    //    NEE + MIS,
+    // buffer. Two pipelines share the accumulation image:
     //  - bidirectional: three passes (light subpaths -> eye subpaths with
     //    vertex connections -> splat resolve), see shaders/bdpt_*.comp and
-    //    docs/ARCHITECTURE.md.
+    //    docs/ARCHITECTURE.md. Runs when ReSTIR is off or in lens mode.
+    //  - ReSTIR BDPT: wavefront pass graph (docs/RESTIR_BDPT_PLAN.md).
     // Call Reset() whenever the camera, scene, or settings change;
     // otherwise call Render() once per frame to add one more sample.
     class PathTracer
@@ -49,7 +47,6 @@ namespace RoyalGL
         int Height() const { return m_height; }
 
     private:
-        Shader m_computeShader;
         Shader m_bdptLightSelShader;
         Shader m_bdptLightShader;
         Shader m_bdptEyeShader;
@@ -57,18 +54,14 @@ namespace RoyalGL
         Shader m_lensPupilShader;
         Shader m_restirGbufferShader;
         Shader m_restirLightShader;
-        Shader m_restirCameraShader;
-        Shader m_restirTemporalShader;
         Shader m_restirCausticShiftShader;
         Shader m_restirCausticMergeShader;
-        Shader m_restirSpatialShader;
         Shader m_restirResolveShader;
         Shader m_restirDebugShader;
-        // Wavefront ReSTIR kernels (docs/RESTIR_BDPT_PLAN.md Phase 7): the
-        // camera RIS / temporal / spatial megakernels split at every ray
-        // boundary, with GPU-driven compacted queues. The megakernels above
-        // remain as the A/B + low-binding-count fallback
-        // (ROYALGL_RESTIR_WAVEFRONT=0).
+        // Wavefront ReSTIR kernels (docs/RESTIR_BDPT_PLAN.md Phase 7):
+        // camera RIS / temporal / spatial split at every ray boundary, with
+        // GPU-driven compacted queues. This is the only ReSTIR pipeline -
+        // the historical megakernel variants are gone.
         Shader m_wfCamInitShader;
         Shader m_wfCamShadeShader;
         Shader m_wfCamTraceShader;
@@ -81,6 +74,14 @@ namespace RoyalGL
         Shader m_wfTMergeShader;
         Shader m_wfSInitShader;
         Shader m_wfSMergeShader;
+        // Histogram-stratified spatial reuse (Salaün et al. 2025): per-block
+        // candidate sort into cluster-masked inverse CDFs, consumed by the
+        // antithetic selection in restir_wf_sinit.comp.
+        Shader m_wfSSortShader;
+        // Sample duplication map (ReSTIR PT Enhanced sec. 5): end-of-frame
+        // 17x17 same-seed counting; next frame's temporal merge lowers the
+        // confidence cap where duplication is high.
+        Shader m_wfDupMapShader;
         Texture m_accum;
         Buffer m_frameUBO{BufferType::Uniform, 0};
 
@@ -114,18 +115,12 @@ namespace RoyalGL
         // 512 bytes are 32 dispatch-control entries that double as
         // glDispatchComputeIndirect args (the queue buffer is also bound as
         // GL_DISPATCH_INDIRECT_BUFFER). Bindings 16-17 exceed the
-        // 16-binding portability budget - wavefront mode is gated on
-        // GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS >= 18 and
-        // ROYALGL_RESTIR_WAVEFRONT (default on).
+        // 16-binding portability budget - ReSTIR is gated on
+        // GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS >= 18 (falls back to plain
+        // BDPT otherwise, e.g. on Intel iGPUs with 16 bindings).
         Buffer m_wfArenaBuffer{BufferType::ShaderStorage, 16};
         Buffer m_wfQueueBuffer{BufferType::ShaderStorage, 17};
-        // Per-pass wavefront selection (ROYALGL_RESTIR_WAVEFRONT): 0 = all
-        // megakernel, 1/unset = all wavefront, else a bitmask - bit0
-        // camera RIS, bit1 temporal, bit2 spatial (e.g. 6 = wavefront
-        // shifts + megakernel camera, the fastest measured combination on
-        // the RTX 5090 at 1600x900; see RESTIR_BDPT_PLAN.md Phase 7).
-        uint32_t m_wavefrontMask = 7;
-        bool m_wavefrontRestir = true; // any bit set (buffers + gate)
+        bool m_restirSupported = true; // enough SSBO bindings for wavefront
         // ROYALGL_RESTIR_CAUSTIC=0: skip the caustic temporal passes
         // (shift + merge) - the caustic reservoir then holds only the
         // per-frame canonical RIS result. Isolation switch for chasing

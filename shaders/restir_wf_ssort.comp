@@ -1,0 +1,113 @@
+#version 460 core
+#include "common.glsl"
+#include "restir_common.glsl"
+#include "restir_wf_common.glsl"
+
+// Histogram construction for stratified spatial reuse (Salaün et al. 2025):
+// one workgroup per jittered 16x16 block sorts the block's post-temporal
+// candidates by (cluster key, target luminance) in shared memory. By the
+// Heitz & Belcour 2019 equivalence, the sorted list is the inverse CDF of
+// the block's per-cluster luminance histograms, so uniform positions in a
+// cluster's run are exact inverse-CDF samples of its candidate histogram.
+// Cluster key = primary-hit instance + material: the paper's object-id
+// spatial mask (sec. 4.3) - pixels only ever draw candidates from their own
+// cluster's run, which replaces sinit's old depth/normal/material rejection
+// heuristics.
+//
+// Empty-but-valid reservoirs (pHat 0) stay in the list: selecting one
+// contributes nothing, but its confidence still dilutes the merge exactly
+// like the old disk sampling could land on an empty neighbor.
+//
+// Output layout: see the WfSort* comment block in restir_wf_common.glsl.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+shared uvec2 sKey[256]; // x = cluster key, y = float bits of pHat (both asc)
+shared uint  sPix[256]; // payload: linear pixel index
+
+bool KeyLess(uvec2 a, uvec2 b) { return a.x < b.x || (a.x == b.x && a.y < b.y); }
+
+void main()
+{
+    uint t = gl_LocalInvocationID.x;
+    ivec2 origin, lo, sz;
+    WfSortBlockRect(ivec2(gl_WorkGroupID.xy), origin, lo, sz);
+    int validCount = (sz.x > 0 && sz.y > 0) ? sz.x * sz.y : 0;
+    if (validCount == 0) return; // fully outside (whole workgroup exits)
+
+    // Thread t owns the block's t-th valid pixel (scanline order inside the
+    // clipped rectangle) - it contributes that pixel's candidate to the
+    // sort AND serves as rank slot t of the permutation afterwards.
+    uvec2 key = uvec2(0xFFFFFFFFu, 0xFFFFFFFFu);
+    uint myIdx = 0u;
+    bool mine = false;
+    if (int(t) < validCount)
+    {
+        ivec2 p = origin + lo + ivec2(int(t) % sz.x, int(t) / sz.x);
+        myIdx = RestirPixelIndex(p);
+        GBufferPixel g = RestirLoadGBuf(GBufCurOffset() + myIdx);
+        if (g.posDepth.w >= 0.0)
+        {
+            uint cluster = (InstanceOfTriangle(GBufTriangle(g)) << 8u) | GBufMaterial(g);
+            float pHat = pixelRes[RestirRegionOffset(RESTIR_SCRATCH_REGION) + myIdx].path.core.y;
+            key = uvec2(cluster, floatBitsToUint(max(pHat, 0.0)));
+            mine = true;
+        }
+    }
+    sKey[t] = key;
+    sPix[t] = myIdx;
+
+    // Bitonic sort over the full 256 entries (invalid/missing pixels carry
+    // the max key and sink to the end, past every cluster run).
+    for (uint k = 2u; k <= 256u; k <<= 1u)
+    {
+        for (uint j = k >> 1u; j > 0u; j >>= 1u)
+        {
+            barrier();
+            uint p = t ^ j;
+            if (p > t)
+            {
+                bool asc = (t & k) == 0u;
+                uvec2 ka = sKey[t], kb = sKey[p];
+                if (KeyLess(kb, ka) == asc)
+                {
+                    uint pa = sPix[t], pb = sPix[p];
+                    sKey[t] = kb; sKey[p] = ka;
+                    sPix[t] = pb; sPix[p] = pa;
+                }
+            }
+        }
+    }
+    barrier();
+
+    if (int(t) >= validCount) return;
+
+    // Rank map: rank t's winner, stored at this thread's own pixel slot.
+    // Component stores stay disjoint per thread - no races.
+    uint slot = WfSortSlotBase() + myIdx;
+    wfArena[slot].x = uintBitsToFloat(sPix[t]);
+
+    // This pixel's cluster run [start, start+count): binary search the
+    // sorted keys for the cluster's lower/upper bound.
+    uint start = 0u, count = 0u;
+    if (mine)
+    {
+        uint clusterKey = key.x;
+        uint loIdx = 0u, hiIdx = uint(validCount);
+        while (loIdx < hiIdx) // first rank with key.x >= clusterKey
+        {
+            uint mid = (loIdx + hiIdx) >> 1u;
+            if (sKey[mid].x < clusterKey) loIdx = mid + 1u; else hiIdx = mid;
+        }
+        start = loIdx;
+        hiIdx = uint(validCount);
+        while (loIdx < hiIdx) // one past the last rank with key.x == clusterKey
+        {
+            uint mid = (loIdx + hiIdx) >> 1u;
+            if (sKey[mid].x <= clusterKey) loIdx = mid + 1u; else hiIdx = mid;
+        }
+        count = loIdx - start;
+    }
+    wfArena[slot].y = uintBitsToFloat(start);
+    wfArena[slot].z = uintBitsToFloat(count);
+}

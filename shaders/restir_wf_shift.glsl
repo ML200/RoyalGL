@@ -51,6 +51,10 @@
 //  7 hitB    xyz hit normal, w uintBits(mat<<24|tri)
 //  8 res     x rcCos, y rcDist2, z omega, w final Jacobian
 //  9 shadow  xyz reconnection direction, w surface distance
+// 10 rcCrit  x last replayed scatter's direction pdf, y uintBits(previous
+//            vertex passes the rc criteria), z destination footprint
+//            threshold (camera replay only; see restir_common.glsl's
+//            RestirRcFootprintOk)
 uint WfShiftJobBase(uint jobIdx) { return RestirPixelCount() + jobIdx * 12u; }
 
 const uint WF_JOB_RUNNING        = 0u;
@@ -178,6 +182,12 @@ void WfShiftCreateJob(uint jobIdx, uint baseSlot, uint dstIdx, bool isPrev)
     wfArena[jb + 3u] = vec4(dstWi, 0.0);
     wfArena[jb + 4u] = vec4(1.0, 1.0, 1.0, 1.0);
     wfArena[jb + 5u] = vec4(dVCM, dVC, dT1, 1.0);
+    // Reconnection-criteria state for the camera replay (slot 10): the
+    // destination pixel's footprint threshold; pdf/eligibility of the
+    // previous vertex fill in as the walk scatters.
+    float cosPrim = abs(dot(dstG.normalMat.xyz, dstWi));
+    wfArena[jb + 10u] = vec4(0.0, uintBitsToFloat(0u),
+                             RestirRcFootThreshold(dstG.posDepth.w, cosPrim), 0.0);
     wfArena[jb].z = uintBitsToFloat(WF_JOB_RUNNING);
     WfAppend(WfCtrlShade(0u), WfShiftStepQBase(0u), jobIdx);
 }

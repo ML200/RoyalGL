@@ -1,0 +1,66 @@
+#version 460 core
+#include "common.glsl"
+#include "restir_common.glsl"
+#include "restir_wf_common.glsl"
+
+// Sample duplication map (ReSTIR PT Enhanced sec. 5): at the END of a
+// frame, each pixel counts how many of the 288 other reservoirs in its
+// 17x17 neighborhood carry the same replay seed (fSeed.w) - i.e., are
+// shifted copies of the same initial candidate. The score D = count/288
+// lands in the persistent arena slot (.w) and the NEXT frame's temporal
+// merge lowers its confidence cap where D is high, so correlation blobs
+// stop compounding.
+//
+// One 16x16 workgroup covers its tile plus an 8-pixel halo (32x32 seeds)
+// in shared memory; the window compares are all shared-memory reads.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+shared uint sSeed[32][32];
+
+uint SeedAt(ivec2 p, ivec2 size)
+{
+    if (p.x < 0 || p.y < 0 || p.x >= size.x || p.y >= size.y)
+        return 0xFFFFFFFFu; // outside: matches nothing real
+    uint idx = RestirPixelIndex(p);
+    vec4 core = pixelRes[RestirRegionOffset(RestirFinalRegion()) + idx].path.core;
+    // Empty reservoirs are nobody's duplicate: give them a per-pixel
+    // dummy so uniform empty regions don't read as fully correlated.
+    if (core.x <= 0.0 || core.y <= 0.0) return 0x80000000u ^ idx;
+    return floatBitsToUint(pixelRes[RestirRegionOffset(RestirFinalRegion()) + idx].path.fSeed.w);
+}
+
+void main()
+{
+    ivec2 size = ivec2(uFrame.frameInfo.xy);
+    ivec2 tileOrigin = ivec2(gl_WorkGroupID.xy) * 16 - 8;
+    uint t = gl_LocalInvocationIndex;
+
+    // Cooperative 32x32 halo load (4 entries per thread).
+    for (uint i = t; i < 32u * 32u; i += 256u)
+    {
+        ivec2 local = ivec2(int(i % 32u), int(i / 32u));
+        sSeed[local.y][local.x] = SeedAt(tileOrigin + local, size);
+    }
+    barrier();
+
+    ivec2 pixel = ivec2(gl_WorkGroupID.xy) * 16 + ivec2(gl_LocalInvocationID.xy);
+    if (pixel.x >= size.x || pixel.y >= size.y) return;
+    uint idx = RestirPixelIndex(pixel);
+
+    ivec2 me = ivec2(gl_LocalInvocationID.xy) + 8; // my slot in the tile
+    uint mySeed = sSeed[me.y][me.x];
+
+    // Empty reservoirs score 0 (checked on the reservoir itself - the
+    // dummy-seed range overlaps real hash values).
+    vec4 myCore = pixelRes[RestirRegionOffset(RestirFinalRegion()) + idx].path.core;
+    uint count = 0u;
+    if (myCore.x > 0.0 && myCore.y > 0.0)
+    {
+        for (int dy = -8; dy <= 8; ++dy)
+            for (int dx = -8; dx <= 8; ++dx)
+                if ((dx != 0 || dy != 0) && sSeed[me.y + dy][me.x + dx] == mySeed)
+                    count++;
+    }
+    wfArena[WfShadeAccSlot(idx)].w = float(count) / 288.0;
+}

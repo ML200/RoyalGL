@@ -38,19 +38,15 @@ namespace RoyalGL
     }
 
     PathTracer::PathTracer()
-        : m_computeShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "pathtrace.comp")),
-          m_bdptLightSelShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "bdpt_lightsel.comp")),
+        : m_bdptLightSelShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "bdpt_lightsel.comp")),
           m_bdptLightShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "bdpt_light.comp")),
           m_bdptEyeShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "bdpt_eye.comp")),
           m_bdptResolveShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "bdpt_resolve.comp")),
           m_lensPupilShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "lens_pupil.comp")),
           m_restirGbufferShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_gbuffer.comp")),
           m_restirLightShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_light.comp")),
-          m_restirCameraShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_camera.comp")),
-          m_restirTemporalShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_temporal.comp")),
           m_restirCausticShiftShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_caustic_shift.comp")),
           m_restirCausticMergeShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_caustic_merge.comp")),
-          m_restirSpatialShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_spatial.comp")),
           m_restirResolveShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_resolve.comp")),
           m_restirDebugShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_debug.comp")),
           m_wfCamInitShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_wf_caminit.comp")),
@@ -64,31 +60,25 @@ namespace RoyalGL
           m_wfTInitShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_wf_tinit.comp")),
           m_wfTMergeShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_wf_tmerge.comp")),
           m_wfSInitShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_wf_sinit.comp")),
-          m_wfSMergeShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_wf_smerge.comp"))
+          m_wfSMergeShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_wf_smerge.comp")),
+          m_wfSSortShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_wf_ssort.comp")),
+          m_wfDupMapShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_wf_dupmap.comp"))
     {
         m_timersEnabled = (std::getenv("ROYALGL_STATS") != nullptr);
 
         // Wavefront ReSTIR needs SSBO bindings 16-17 (restir_wf_common.glsl)
         // - available on discrete GPUs (NVIDIA 96, AMD 64) but not on Intel
-        // iGPUs (16). ROYALGL_RESTIR_WAVEFRONT: 0 = all megakernel,
-        // 1/unset = all wavefront, else bitmask (bit0 camera, bit1
-        // temporal, bit2 spatial - "6" keeps the megakernel camera pass,
-        // the fastest measured combination; see the header comment).
+        // iGPUs (16). Without them ReSTIR falls back to plain BDPT.
         if (const char* v = std::getenv("ROYALGL_RESTIR_CAUSTIC"))
             m_causticPassesEnabled = (v[0] != '0');
-        const char* wfEnv = std::getenv("ROYALGL_RESTIR_WAVEFRONT");
-        m_wavefrontMask = 7u;
-        if (wfEnv && wfEnv[0] != '\0' && !(wfEnv[0] == '1' && wfEnv[1] == '\0'))
-            m_wavefrontMask = static_cast<uint32_t>(std::strtoul(wfEnv, nullptr, 10)) & 7u;
         GLint maxSsboBindings = 0;
         GL_CALL(glGetIntegerv(GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS, &maxSsboBindings));
-        if (maxSsboBindings < 18 && m_wavefrontMask != 0u)
+        if (maxSsboBindings < 18)
         {
-            ROYALGL_LOG_INFO("ReSTIR wavefront disabled: only ", maxSsboBindings,
-                             " SSBO bindings available (need 18)");
-            m_wavefrontMask = 0u;
+            ROYALGL_LOG_INFO("ReSTIR disabled: only ", maxSsboBindings,
+                             " SSBO bindings available (need 18); rendering plain BDPT");
+            m_restirSupported = false;
         }
-        m_wavefrontRestir = m_wavefrontMask != 0u;
         if (m_timersEnabled)
             GL_CALL(glGenQueries(2 * kTimerSlots, &m_timerQueries[0][0]));
 
@@ -173,15 +163,15 @@ namespace RoyalGL
         m_lrmEntryBuffer.Upload(nullptr, size_t(m_numLightPaths) * kMaxLrmEntriesPerPath * kLrmEntryBytes,
                                 GL_DYNAMIC_COPY);
         m_lrmHeadBuffer.Upload(nullptr, (pixelCount + 1) * sizeof(uint32_t), GL_DYNAMIC_COPY);
-        if (m_wavefrontRestir)
-        {
-            // Wavefront scratch (restir_wf_common.glsl): 26 vec4s per pixel
-            // of arena (camera path state / shift jobs alias the same
-            // storage), and 32 dispatch-control entries + 6 uints per pixel
-            // of work-item queues in one buffer.
-            m_wfArenaBuffer.Upload(nullptr, pixelCount * 26 * 16, GL_DYNAMIC_COPY);
-            m_wfQueueBuffer.Upload(nullptr, 512 + pixelCount * 6 * sizeof(uint32_t), GL_DYNAMIC_COPY);
-        }
+        // Wavefront scratch (restir_wf_common.glsl): 27 vec4s per pixel
+        // of arena (camera path state / shift jobs alias the same storage;
+        // [26N,27N) is the persistent shading-accumulator + duplication-
+        // score region), and 32 dispatch-control entries + 6 uints per
+        // pixel of work-item queues in one buffer. The arena starts zeroed
+        // so the first frame reads duplication score 0, not garbage.
+        m_wfArenaBuffer.Upload(nullptr, pixelCount * 27 * 16, GL_DYNAMIC_COPY);
+        GL_CALL(glClearNamedBufferData(m_wfArenaBuffer.Id(), GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr));
+        m_wfQueueBuffer.Upload(nullptr, 512 + pixelCount * 6 * sizeof(uint32_t), GL_DYNAMIC_COPY);
         // Zero-filled: a zeroed reservoir is a valid empty reservoir
         // (W=0, confidence=0).
         GL_CALL(glClearNamedBufferData(m_reservoirBuffer.Id(), GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr));
@@ -199,8 +189,7 @@ namespace RoyalGL
         // ReSTIR needs a deterministic pinhole primary hit; lens mode falls
         // back to plain progressive BDPT. ReSTIR always uses the
         // bidirectional pipeline and full-frame dispatch.
-        bool restirActive = settings.enableRestir && !lensMode;
-        bool bidir = settings.enableBidir || restirActive;
+        bool restirActive = settings.enableRestir && !lensMode && m_restirSupported;
         if (restirActive)
         {
             EnsureRestirBuffers(); // may invalidate m_prevCamValid on resize
@@ -221,7 +210,7 @@ namespace RoyalGL
                                       m_sampleCount, static_cast<uint32_t>(settings.maxBounces));
         frame.renderParams = glm::vec4(settings.exposure, lightTree.TotalPower(), 0.0f,
                                         settings.lens.flareIntensity);
-        frame.lightInfo = glm::uvec4(lightTree.LightCount(), settings.enableNEE ? 1u : 0u, m_numLightPaths,
+        frame.lightInfo = glm::uvec4(lightTree.LightCount(), 0u, m_numLightPaths,
                                      static_cast<uint32_t>(std::max(settings.lens.flareSamples, 1)));
 
         float aspectRatio = static_cast<float>(m_width) / static_cast<float>(m_height);
@@ -242,9 +231,9 @@ namespace RoyalGL
         frame.prevCamUp = m_prevCamValid ? m_prevCamUp : frame.camUp;
         frame.prevCameraParams = m_prevCamValid ? m_prevCameraParams : frame.cameraParams;
         // z/w of prevCameraParams are unused by the projection helpers and
-        // carry the spatial reuse parameters instead; prevCamPos.w carries
+        // carry spatial reuse parameters instead; prevCamPos.w carries
         // the confidence cap (RestirConfidenceCap() in restir_common.glsl).
-        frame.prevCameraParams.z = settings.restirSpatialRadius;
+        frame.prevCameraParams.z = 0.0f; // free (was the disk-sampling radius)
         frame.prevCameraParams.w = static_cast<float>(settings.restirSpatialNeighbors);
         frame.prevCamPos.w = std::max(settings.restirConfidenceCap, 1.0f);
         uint32_t restirFlags = (restirActive ? 1u : 0u)
@@ -253,7 +242,9 @@ namespace RoyalGL
                              | (settings.accumulate ? 8u : 0u)
                              | (settings.restirLightTracing ? 16u : 0u)
                              | (settings.restirConnections ? 32u : 0u)
-                             | (settings.restirRecomputeMis ? 64u : 0u);
+                             | (settings.restirRecomputeMis ? 64u : 0u)
+                             | (settings.restirStratified ? 128u : 0u)
+                             | (settings.restirDecorrelate ? 256u : 0u);
         frame.restirParams = glm::uvec4(static_cast<uint32_t>(settings.restirDebugView),
                                         restirFlags, m_frameCounter, m_restirParity);
 
@@ -345,11 +336,8 @@ namespace RoyalGL
                 m_lightSelPdfBuffer.Upload(nullptr, size_t(m_lightSelPdfCount) * sizeof(float), GL_DYNAMIC_COPY);
             }
             m_lightSelPdfBuffer.BindBase();
-            if (m_wavefrontRestir)
-            {
-                m_wfArenaBuffer.BindBase();
-                m_wfQueueBuffer.BindBase();
-            }
+            m_wfArenaBuffer.BindBase();
+            m_wfQueueBuffer.BindBase();
 
             // Camera-anchored light-selection pdf cache (receiver-
             // independent NEE pdfs, required for replayable shifts).
@@ -404,11 +392,8 @@ namespace RoyalGL
             }
 
             // ---------------- wavefront helpers (Phase 7) ----------------
-            // Same math as the megakernels, split at every ray boundary
-            // with GPU-driven compacted queues (restir_wf_common.glsl).
-            bool wfCamera = (m_wavefrontMask & 1u) != 0u;
-            bool wfTemporal = (m_wavefrontMask & 2u) != 0u;
-            bool wfSpatial = (m_wavefrontMask & 4u) != 0u;
+            // Every pass is split at ray boundaries with GPU-driven
+            // compacted queues (restir_wf_common.glsl).
             uint32_t pixelCount = uint32_t(m_width) * uint32_t(m_height);
             GLuint groupsN = (pixelCount + 63u) / 64u;
             // Mirrors BdptMaxPathLength() in bdpt_common.glsl.
@@ -447,11 +432,9 @@ namespace RoyalGL
                     wfBarrier();
                 }
             };
-            if (m_wavefrontRestir)
-                GL_CALL(glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, m_wfQueueBuffer.Id()));
+            GL_CALL(glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, m_wfQueueBuffer.Id()));
 
             rtBegin(2, "restir camera RIS");
-            if (wfCamera)
             {
                 wfClearCtrl();
                 m_wfCamInitShader.Use();
@@ -479,32 +462,19 @@ namespace RoyalGL
                 m_wfCamFinalShader.Use();
                 m_wfCamFinalShader.Dispatch(groupsN, 1u, 1u);
             }
-            else
-            {
-                m_restirCameraShader.Use();
-                m_restirCameraShader.Dispatch(groupsX, groupsY, 1u);
-            }
             rtEnd();
             GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));
 
             if (settings.restirTemporal)
             {
                 rtBegin(3, "restir temporal");
-                if (wfTemporal)
-                {
-                    wfClearCtrl();
-                    m_wfTInitShader.Use();
-                    m_wfTInitShader.Dispatch(groupsN, 1u, 1u);
-                    wfBarrier();
-                    wfShiftRounds();
-                    m_wfTMergeShader.Use();
-                    m_wfTMergeShader.Dispatch(groupsN, 1u, 1u);
-                }
-                else
-                {
-                    m_restirTemporalShader.Use();
-                    m_restirTemporalShader.Dispatch(groupsX, groupsY, 1u);
-                }
+                wfClearCtrl();
+                m_wfTInitShader.Use();
+                m_wfTInitShader.Dispatch(groupsN, 1u, 1u);
+                wfBarrier();
+                wfShiftRounds();
+                m_wfTMergeShader.Use();
+                m_wfTMergeShader.Dispatch(groupsN, 1u, 1u);
                 rtEnd();
                 GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));
             }
@@ -530,37 +500,39 @@ namespace RoyalGL
             if (settings.restirSpatial)
             {
                 rtBegin(6, "restir spatial");
-                if (wfSpatial)
+                uint32_t nbrs = uint32_t(std::max(settings.restirSpatialNeighbors, 0));
+                if (nbrs > 0)
                 {
-                    uint32_t nbrs = uint32_t(std::max(settings.restirSpatialNeighbors, 0));
-                    if (nbrs == 0)
-                    {
-                        // sinit round 0 still runs: it copies the
-                        // post-temporal reservoir into the final region
-                        // (the megakernel does this before its loop).
-                        wfClearCtrl();
-                        m_wfSInitShader.Use();
-                        m_wfSInitShader.SetUint("uWfRound", 0u);
-                        m_wfSInitShader.Dispatch(groupsN, 1u, 1u);
-                    }
-                    for (uint32_t nbrRound = 0; nbrRound < nbrs; ++nbrRound)
-                    {
-                        wfClearCtrl();
-                        m_wfSInitShader.Use();
-                        m_wfSInitShader.SetUint("uWfRound", nbrRound);
-                        m_wfSInitShader.Dispatch(groupsN, 1u, 1u);
-                        wfBarrier();
-                        wfShiftRounds();
-                        m_wfSMergeShader.Use();
-                        m_wfSMergeShader.SetUint("uWfRound", nbrRound);
-                        m_wfSMergeShader.Dispatch(groupsN, 1u, 1u);
-                        wfBarrier();
-                    }
+                    // Histogram construction (Salaün 2025): sort each
+                    // jittered 16x16 block's candidates into per-cluster
+                    // inverse CDFs. One extra block per axis covers every
+                    // jitter offset; fully-outside groups exit immediately.
+                    m_wfSSortShader.Use();
+                    m_wfSSortShader.Dispatch(GLuint(m_width + 15) / 16u + 1u,
+                                             GLuint(m_height + 15) / 16u + 1u, 1u);
+                    GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));
                 }
-                else
+                if (nbrs == 0)
                 {
-                    m_restirSpatialShader.Use();
-                    m_restirSpatialShader.Dispatch(groupsX, groupsY, 1u);
+                    // sinit round 0 still runs: it copies the
+                    // post-temporal reservoir into the final region.
+                    wfClearCtrl();
+                    m_wfSInitShader.Use();
+                    m_wfSInitShader.SetUint("uWfRound", 0u);
+                    m_wfSInitShader.Dispatch(groupsN, 1u, 1u);
+                }
+                for (uint32_t nbrRound = 0; nbrRound < nbrs; ++nbrRound)
+                {
+                    wfClearCtrl();
+                    m_wfSInitShader.Use();
+                    m_wfSInitShader.SetUint("uWfRound", nbrRound);
+                    m_wfSInitShader.Dispatch(groupsN, 1u, 1u);
+                    wfBarrier();
+                    wfShiftRounds();
+                    m_wfSMergeShader.Use();
+                    m_wfSMergeShader.SetUint("uWfRound", nbrRound);
+                    m_wfSMergeShader.Dispatch(groupsN, 1u, 1u);
+                    wfBarrier();
                 }
                 rtEnd();
                 GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));
@@ -570,6 +542,18 @@ namespace RoyalGL
             m_restirResolveShader.Use();
             m_restirResolveShader.Dispatch(groupsX, groupsY, 1u);
             rtEnd();
+
+            if (settings.restirTemporal && settings.restirDecorrelate)
+            {
+                // End-of-frame duplication map over the final reservoirs;
+                // consumed by next frame's temporal merge (adaptive cCap).
+                GL_CALL(glPushDebugGroup(GL_DEBUG_SOURCE_APPLICATION, 101u, -1, "restir dupmap"));
+                GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));
+                m_wfDupMapShader.Use();
+                m_wfDupMapShader.Dispatch((GLuint(m_width) + 15u) / 16u,
+                                          (GLuint(m_height) + 15u) / 16u, 1u);
+                GL_CALL(glPopDebugGroup());
+            }
             m_sampleCount++;
         }
 
@@ -604,22 +588,8 @@ namespace RoyalGL
         {
         do
         {
-        if (!bidir)
-        {
-            uint32_t rows = std::min(m_rowsPerTile, static_cast<uint32_t>(m_height) - m_cursor);
-            uploadFrame(m_cursor, m_cursor + rows);
-            beginTimer(0);
-            m_computeShader.Use();
-            m_computeShader.Dispatch(groupsX, (rows + 7u) / 8u, 1u);
-            endTimer();
-            m_cursor += rows;
-            if (m_cursor >= static_cast<uint32_t>(m_height))
-            {
-                m_cursor = 0;
-                m_sampleCount++;
-            }
-        }
-        else
+        // Plain progressive BDPT (three tiled passes). The only non-ReSTIR
+        // pipeline - it also serves lens mode and unbiased reference soaks.
         {
             m_lightVertexBuffer.BindBase();
             m_splatBuffer.BindBase();
