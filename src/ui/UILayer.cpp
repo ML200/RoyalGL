@@ -151,6 +151,15 @@ namespace RoyalGL
                 ImGui::SliderInt("Spatial neighbors", &settings.restirSpatialNeighbors, 1, 8);
                 ImGui::SliderFloat("Spatial radius (px)", &settings.restirSpatialRadius, 4.0f, 100.0f);
             }
+            if (settings.restirTemporal || settings.restirSpatial)
+            {
+                ImGui::SliderFloat("Confidence cap (M)", &settings.restirConfidenceCap, 1.0f, 64.0f,
+                                   "%.0f");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Max effective sample count a reservoir can claim (paper: 20).\n"
+                                      "Lower = outliers/stale history wash out faster; higher = smoother\n"
+                                      "but temporal correlation lingers ~cap frames.");
+            }
             const char* dbgNames[] = {"Off", "G-buffer normals", "G-buffer depth", "Motion vectors",
                                       "Reservoir W", "Confidence", "Technique (s,t)",
                                       "Caustic W", "LRM entries", "Caustic confidence"};

@@ -615,6 +615,159 @@ increasing risk.
 - Optional: lens-mode ReSTIR investigation (Area ReSTIR), GGX materials (real
   roughness threshold 0.08 semantics kick in here).
 
+### Phase 7 — Wavefront camera RIS + shift passes
+
+> **Phase 7 status: DONE.** The camera RIS pass and the temporal/spatial
+> replay passes are converted to a wavefront architecture with streaming
+> compaction (`shaders/restir_wf_*.comp|glsl`); the megakernels remain as
+> the A/B + low-binding fallback, selected per pass by
+> `ROYALGL_RESTIR_WAVEFRONT` (0 = all megakernel, 1/unset = all wavefront,
+> else bitmask: bit0 camera, bit1 temporal, bit2 spatial).
+>
+> **Architecture.** Every ray cast is hoisted out of the bookkeeping
+> kernels so BVH traversal stacks never share registers with RIS/shift
+> state: camera = caminit → [camshade → camtrace + camshadow] × maxLen →
+> camfinal; shifts (one generic "job" = one RestirShiftPath evaluation,
+> shared by temporal and spatial) = tinit/sinit → [shiftstep → shifttrace
+> + shiftshadow] × maxLen → tmerge/smerge. Work-item queues are compacted
+> by atomic append; dispatches are GPU-driven (glDispatchComputeIndirect
+> reads the appenders' counters — no readbacks; appenders maintain the
+> group count with atomicMax). Candidate visibility is resolved by lean
+> any-hit kernels; the RIS acceptance draw is DEFERRED one round so the
+> per-pixel RestirRand order is exactly the megakernel's — the wavefront
+> estimator is the same estimator (all path sampling replays the
+> counter-based streams; only the RIS-chain RNG state is persisted).
+> Buffers: bindings 16 (arena: 26 vec4/pixel, camera state and shift jobs
+> alias it) and 17 (queues, with the 32 dispatch-ctrl entries in the first
+> 512 bytes — NVIDIA caps compute shaders at 16 storage BLOCKS and the
+> tracing kernels' include graph already sits at that limit, hence two
+> blocks and the non-tracing kernels dropping light_tree/bdpt_common).
+>
+> **Validation** (fallback Cornell+duck, locked camera, same session):
+> RIS-only wavefront = megakernel EXACTLY (0.116472 both); temporal-only
+> 0.116468, spatial-only 0.116447 (= megakernel), temporal+spatial
+> 0.116437-0.116450 vs megakernel 0.116436 — all within short-soak noise.
+>
+> **Perf** (RTX 5090, 1600×900, all-on, same-session A/B): spatial
+> 21.4 → 10.0 ms (−53%), temporal 5.4 → 3.7 ms (−30%), camera 4.0 → 8.1 ms
+> (regression: the per-round barriers + arena state round-trips outweigh
+> the occupancy win on short coherent Cornell paths — the megakernel
+> camera was already fast after the Phase 6 occupancy round). Totals:
+> 34.5 → 22.8 ms (mask 7), 21.9 ms (mask 6 = megakernel camera + wavefront
+> shifts, current best). Subgroup-aggregated queue appends measured no
+> better than plain atomics (reverted — state traffic and round barriers
+> dominate, not counter contention). Expect the wavefront camera pass to
+> win on scenes with longer/incoherent paths (glass-heavy, Veach-style);
+> re-evaluate the default mask then.
+>
+> **Post-Phase-7 robustness round** (grazing-angle transients): the
+> confidence (M) cap is now a live editor setting
+> (`RenderSettings::restirConfidenceCap`, slider 1–64, uploaded in
+> prevCamPos.w, `RestirConfidenceCap()` in restir_common.glsl) — it
+> directly controls how many frames an outlier/stale sample persists.
+> Temporal history validation gained the normal-agreement test the
+> spatial pass already had (same-material different-orientation surfaces
+> passed the 2%-of-depth position test at silhouettes/grazing walls);
+> the caustic proxy-confidence lookup mirrors it. All four reuse merges
+> (megakernel + wavefront) now apply a SYMMETRIC Jacobian support
+> restriction `J ∈ [1/10, 10]` (`RestirJacobianValid`) in both the
+> candidate weight and the backward MIS term — unbiased (forward and
+> inverse Jacobians are reciprocals, so both directions restrict the
+> same shift map), and it kills the grazing-angle reconnection-Jacobian
+> explosions that showed up as short-lived bright blotches on
+> newly-appearing sharp-angle surfaces. Temporal validation also gained a
+> depth-level test (the spatial pass's 10% relative-depth heuristic, made
+> camera-motion-aware: gPrev.w is measured from the PREVIOUS camera, so it
+> is compared against the current point's distance to that camera - a
+> naive |dPrev-dCur| would reject all history during a dolly). With the
+> 2%-of-depth world-position test this is mostly belt-and-braces (the
+> position test implies <=2% depth agreement); it fires independently
+> under extreme camera motion and guards any future relaxation of the
+> position test. Soaks unchanged (WF 0.116423-0.116444 / MK
+> 0.116430-0.116461, within the both-config band).
+>
+> **Anchored t=1 candidates (the actual fix for the grazing W blow-up).**
+> The J-guard alone did not eliminate the transient: the ROOT CAUSE was a
+> mismatched target function, not the Jacobian. Non-caustic t=1 candidates
+> were created with f/pHat evaluated at the FREE landing point y_{s-1},
+> while every shift evaluation (forward and backward) re-anchors to the
+> V-buffer pixel center. At grazing incidence f varies by orders of
+> magnitude across one pixel footprint (imageToSurface ~ cosToCam/
+> cos^3AtCam/d^2 plus the reconnection geometry), so the temporal balance
+> heuristic compared a free-point numerator against an anchored-point
+> denominator - the partition of unity broke on exactly the BRIGHT
+> candidates (f_free >> f_anchored => m_A ~ 1 while the history side also
+> claims the path family), W inflated, inherited confidence ~cap in one
+> merge, and decayed over ~cap frames. Camera-side techniques are anchored
+> from birth, which is why the artifact needed light tracing. Fix
+> (restir_light.comp): non-caustic t=1 candidates are ANCHORED AT
+> CREATION - the free landing only selects the pixel; the candidate is
+> built by the same Eq. 56 reverse-hybrid reconnection every shift
+> performs (J_creation = (cosRcA/cosIn)(d2free/d2A) prices the collapse),
+> with omega recomputed at the anchored geometry via the classic recursion
+> across the replaced scatter (the formulas the shift's Phase 5 comment
+> documented as the "future fix"). The old LrmReconnectionValid heuristic
+> is subsumed (the creation reconnection IS that test), a static-camera
+> temporal shift is now an exact identity (J = 1), and insertion/shift
+> target functions agree everywhere. Caustic candidates stay free-landing
+> (pure replay was always self-consistent).
+>
+> Two further t=1-gated Jacobian channels needed the same symmetric
+> guard: (1) the CREATION collapse Jacobian itself - at camera-grazing
+> pixels the footprint is huge, the free landing can be far from the
+> anchor, and (cosRcA/cosIn)(d2free/d2A) reaches ~1e5, minting a huge-W
+> reservoir at birth (RestirJacobianValid now rejects those candidates -
+> the grazing analog of the paper's stability heuristic; costs -0.009%
+> on the Cornell soak); (2) the CAUSTIC replay Jacobian - the light-tree
+> descent is camera-anchored, so during camera motion the same seed can
+> descend to a different light and the full-replay pdf ratio is
+> arbitrary; restir_caustic_shift.comp rejects out-of-range forward
+> shifts and restir_caustic_merge.comp mirrors the test on the backward
+> map.
+>
+> **Stale copied omega was the deepest of the transient channels:
+> `restirRecomputeMis` now defaults ON and covers t=1 shifts too.** With
+> light tracing enabled, EVERY technique's omega carries the t=1
+> competitor seed N_L*d^2/cosIn1 - violently anchor-dependent at grazing
+> incidence. Copied omega is exact under identity shifts (the Phase 5
+> static validation) but under camera motion the history's omega is
+> stale w.r.t. the new anchor while the fresh candidate's is current:
+> pHat = omega*lum(f) stops being a function of the path, the temporal
+> balance-heuristic partition breaks by the omega ratio (orders of
+> magnitude at grazing), and exactly the bright side gets over-counted -
+> the last piece of the "W blows up on newly-visible sharp-angle
+> surfaces, decays over ~cap frames, only with t=1 enabled" transient.
+> The t=1 reverse shift now RECOMPUTES omega at the destination anchor
+> (both restir_shift.glsl and the wavefront shiftstep, which regained
+> the light-side MIS recursion in job slot 5); the old reason to copy -
+> recompute amplifying the free-landing re-anchoring approximation - is
+> obsolete since candidates are anchored at creation. Rocking-orbit A/B
+> (ROYALGL_ORBIT rocks the camera; per-frame estimate stats): temporal-
+> only hot pixels (lum>30) with copied omega disappear with recompute.
+> Recompute-mode reuse baselines: T+S 0.116472-0.116489,
+> lightweight-set T+S 0.116513.
+>
+> **Anchor-distance confidence fade + new defaults.** The residual t=1
+> transient tracks reuse between spatially DISTANT anchors (user
+> observation): along a grazing surface the t=1 target function varies
+> rapidly with the anchor, so chained merges between far-apart (but
+> accepted) anchors random-walk W into a bright transient even with
+> exact omega/Jacobians - unbiased, but heavy-tailed. Temporal history
+> confidence is now scaled by 1 - sep/(0.02*depth) (the acceptance
+> radius), a sample-independent G-buffer function: the MIS partition
+> stays exact, a static camera reproduces old soaks bit-for-bit
+> (fade=1), and far-anchor history decays instead of compounding.
+> Defaults changed to ship the robust configuration: enableRestir ON,
+> spatial neighbors 1, confidence cap 8 (pure-default soaks: WF
+> 0.116535 / MK 0.116531). NEW SOAK BASELINES (the
+> estimator semantics changed: t=1 is now point-sampled at the pixel
+> center like every other technique, and the old double-gating - free
+> visibility AND anchor reconnectability - no longer drops penumbra
+> energy): RIS 0.116556, temporal 0.116556 (= RIS exactly, identity
+> shifts), spatial 0.116530, temporal+spatial 0.116513 (WF) / 0.116524
+> (MK). The pre-existing ~-0.02% spatial drift persists unchanged -
+> confirming it was never this mechanism (Phase 5 notes).
+
 ---
 
 ## 7. Files touched / created

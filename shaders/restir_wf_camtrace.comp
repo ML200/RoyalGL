@@ -1,0 +1,40 @@
+#version 460 core
+#include "common.glsl"
+#include "restir_common.glsl"
+#include "restir_wf_common.glsl"
+#include "restir_wf_cam.glsl"
+
+// Wavefront camera RIS, stage 3: closest-hit for the sampled BSDF bounce.
+// Deliberately tiny - the live state is one ray, the traversal stack and
+// the hit record, so occupancy is bounded by the BVH walk alone (the whole
+// point of the wavefront split). Reads the ray from the path state (origin
+// = current vertex, direction = -wi as written by camshade), writes the hit
+// block that shade round k+1 consumes.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void main()
+{
+    uint qslot = WfCtrlExtend(uWfRound);
+    if (gl_GlobalInvocationID.x >= WfCount(qslot)) return;
+    uint idx = wfQueue[WfCamExtendQBase() + gl_GlobalInvocationID.x];
+    uint base = WfCamBase(idx);
+
+    vec3 pos = wfArena[base + 0u].xyz;
+    vec3 n = wfArena[base + 1u].xyz;
+    vec3 dir = -wfArena[base + 2u].xyz;
+
+    vec3 offN = (dot(dir, n) >= 0.0) ? n : -n;
+    Ray ray = MakeRay(pos + offN * 1e-4, dir);
+    Hit hit;
+    if (IntersectScene(ray, hit))
+    {
+        wfArena[base + 10u] = vec4(ray.origin + ray.dir * hit.t, hit.t);
+        wfArena[base + 11u] = vec4(hit.normal,
+                                   PackGBufMatTri(hit.materialIndex, hit.triIndex));
+    }
+    else
+    {
+        wfArena[base + 10u].w = -1.0;
+    }
+}

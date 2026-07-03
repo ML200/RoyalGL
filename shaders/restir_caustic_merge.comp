@@ -33,8 +33,6 @@
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-const float RESTIR_CONFIDENCE_CAP = 20.0;
-
 void main()
 {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
@@ -74,8 +72,10 @@ void main()
                 float pHatPrevC = omegaPrev * RestirLum(back.f);
                 float Jb = pixelRes[slot].caustic.meta.y / back.replayPdf; // |dT^-1/dC|
                 float cV = min(pixelRes[RestirRegionOffset(RestirHistoryRegion()) + vIdx].caustic.core.z,
-                               RESTIR_CONFIDENCE_CAP);
-                pFromPrevC = cV * pHatPrevC * Jb;
+                               RestirConfidenceCap());
+                // Mirror of restir_caustic_shift.comp's symmetric Jacobian
+                // support restriction on the forward map.
+                pFromPrevC = RestirJacobianValid(Jb) ? cV * pHatPrevC * Jb : 0.0;
                 if (isnan(pFromPrevC) || isinf(pFromPrevC)) pFromPrevC = 0.0;
             }
         }
@@ -147,14 +147,19 @@ void main()
         {
             uint pIdx = RestirPixelIndex(prevPix);
             GBufferPixel gPrev = gbuf[GBufPrevOffset() + pIdx];
-            if (gPrev.posDepth.w >= 0.0 && GBufMaterial(gPrev) == GBufMaterial(gCur))
+            // Same surface validation as the regular temporal pass,
+            // including the normal-agreement and depth-level tests.
+            float expPrevDepth = max(length(gCur.posDepth.xyz - uFrame.prevCamPos.xyz), 1e-3);
+            if (gPrev.posDepth.w >= 0.0 && GBufMaterial(gPrev) == GBufMaterial(gCur)
+                && dot(gPrev.normalMat.xyz, gCur.normalMat.xyz) >= 0.9
+                && abs(gPrev.posDepth.w - expPrevDepth) < 0.1 * expPrevDepth)
             {
                 float depthScale = max(gCur.posDepth.w, 1e-3);
                 if (length(gPrev.posDepth.xyz - gCur.posDepth.xyz) < 0.02 * depthScale)
                 {
                     float cV = min(pixelRes[RestirRegionOffset(RestirHistoryRegion()) + pIdx].caustic.core.z,
-                                   RESTIR_CONFIDENCE_CAP);
-                    cOut = min(cCan + cV, RESTIR_CONFIDENCE_CAP);
+                                   RestirConfidenceCap());
+                    cOut = min(cCan + cV, RestirConfidenceCap());
                 }
             }
         }

@@ -1,0 +1,496 @@
+#version 460 core
+#include "common.glsl"
+#include "light_tree.glsl"
+#include "bdpt_common.glsl"
+#include "restir_common.glsl"
+#include "restir_wf_common.glsl"
+#include "restir_wf_shift.glsl"
+
+// Wavefront shift, stage 2: advance one job by one vertex (uWfRound = r).
+// Camera replay (t>=2) processes shifted vertex i = r+1; light replay (t=1)
+// replays the emission at r=0 and vertex y_r at r>=1. Exact port of the
+// megakernel restir_shift.glsl with the two ray types hoisted out: a
+// scattered job appends itself to the next step round's queue, which
+// doubles as the trace queue (shifttrace runs on the same entries between
+// the two step rounds); a reconnecting job prewrites its complete result
+// and appends to the shadow queue (shiftshadow only flips PENDING_SHADOW
+// to OK/FAIL). No BVH traversal in this kernel.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Reverse-hybrid reconnection y_{s-2} -> x_1' + the deterministic camera
+// connection (RestirShiftLightPath's tail). prevIsLight marks the s=2 case
+// (y_{s-2} is the emission point; lightIdx feeds the seeds and support
+// gate). In recompute mode omega is re-evaluated at the destination anchor
+// from the light-side MIS recursion carried in job slot 5 - identical to
+// the megakernel restir_shift.glsl (see the stale-omega rationale there).
+void WfLightReconnect(uint jobIdx, uint jb, uint baseSlot, uint dstIdx, bool isPrev,
+                      vec3 prevPos, vec3 prevN, vec3 prevWi, uint prevMatId,
+                      bool prevIsLight, uint lightIdx, vec3 f, float replayPdf)
+{
+    uint jobBaseSlot = baseSlot;
+    GBufferPixel dstG = WfDstG(dstIdx, isPrev);
+    ivec2 pix = ivec2(int(dstIdx % uFrame.frameInfo.x), int(dstIdx / uFrame.frameInfo.x));
+    vec3 dstWi = WfDstWi(pix, isPrev);
+    Material mX1 = materials[GBufMaterial(dstG)];
+    uint s = RestirTechS(floatBitsToUint(RS_BASE.core.w));
+
+    vec3 x1 = dstG.posDepth.xyz;
+    vec3 toX1 = x1 - prevPos;
+    float d2 = dot(toX1, toX1);
+    if (d2 <= 1e-12) { WfJobFail(jb); return; }
+    float dist = sqrt(d2);
+    vec3 dirTo = toX1 / dist;
+
+    // Light-side factor + MIS state across the reconnected edge.
+    float pd = 0.0, pr = 0.0, cosOut = 0.0;
+    float mVCM, mVC, mLW;
+    if (prevIsLight)
+    {
+        float cosL = dot(prevN, dirTo);
+        if (cosL <= 1e-6) { WfJobFail(jb); return; } // one-sided emitter
+        f *= cosL;
+        float directPdfA, emissionPdfW;
+        RestirLightPdfs(lightIdx, cosL, directPdfA, emissionPdfW);
+        if (emissionPdfW <= 0.0) { WfJobFail(jb); return; }
+        mVCM = directPdfA / emissionPdfW;
+        mVC = cosL / emissionPdfW;
+        mLW = mVC;
+        pd = cosL / PI;
+        cosOut = cosL;
+    }
+    else
+    {
+        vec3 fb = EvalBsdf(materials[prevMatId], prevN, prevWi, dirTo, pd, pr, cosOut);
+        if (fb == vec3(0.0)) { WfJobFail(jb); return; }
+        f *= fb * cosOut;
+        vec4 mis = wfArena[jb + 5u];
+        mVCM = mis.x;
+        mVC = mis.y;
+        mLW = mis.z;
+    }
+
+    // x_1' factors: BSDF toward the destination camera plus the
+    // deterministic t=1 camera factor (imageToSurface).
+    float pdX, prX, cosRc;
+    vec3 fbX = EvalBsdf(mX1, dstG.normalMat.xyz, dstWi, -dirTo, pdX, prX, cosRc);
+    if (fbX == vec3(0.0)) { WfJobFail(jb); return; }
+    vec3 nfX = (dot(dstG.normalMat.xyz, dstWi) >= 0.0) ? dstG.normalMat.xyz : -dstG.normalMat.xyz;
+    float cosToCam = dot(nfX, dstWi);
+    float cosAtCam = dot(WfDstCamForward(isPrev), -dstWi);
+    if (cosAtCam <= 1e-3 || cosToCam <= 1e-6) { WfJobFail(jb); return; }
+    float d2cam = dstG.posDepth.w * dstG.posDepth.w;
+    float imagePointToCamDist = WfDstIpd(isPrev) / cosAtCam;
+    float imageToSurface = (imagePointToCamDist * imagePointToCamDist) / cosAtCam
+                           * cosToCam / max(d2cam, 1e-12);
+    f *= fbX * imageToSurface;
+
+    // omega at the destination anchor (identical to restir_shift.glsl).
+    float omega = RS_BASE.rcInfo.z;
+    if (RestirMisRecomputeEnabled())
+    {
+        float nVCM = (d2 / cosRc) / pd;
+        float nVC, nLW;
+        if (prevIsLight)
+        {
+            nVC = mVC / cosRc;
+            nLW = nVC;
+        }
+        else
+        {
+            nVC = (cosOut / pd) * (mVCM + pr * mVC) / cosRc;
+            nLW = (cosOut / pd) * ((s == 3u ? mVCM : 0.0) + pr * mLW) / cosRc;
+        }
+        float wL = (imageToSurface / float(BdptNumLightPaths()))
+            * (RestirConnectionsEnabled()
+                   ? (nVCM + pdX * nVC)
+                   : (s == 2u ? (nVCM + pdX * nLW) : (pdX * nLW)));
+        if (isnan(wL) || isinf(wL) || wL < 0.0) { WfJobFail(jb); return; }
+        omega = 1.0 / (1.0 + wL);
+    }
+
+    // Jacobians: reverse reconnection (Eq. 56, i=2) + random replay (Eq. 53).
+    if (RS_BASE.rcInfo.x <= 0.0 || RS_BASE.rcInfo.y <= 0.0 || replayPdf <= 0.0)
+    { WfJobFail(jb); return; }
+    float J = (cosRc / RS_BASE.rcInfo.x) * (RS_BASE.rcInfo.y / d2);
+    J *= RS_BASE.rcInfo.w / replayPdf;
+
+    wfArena[jb + 1u] = vec4(prevPos, 0.0);
+    wfArena[jb + 2u] = vec4(prevN, 0.0);
+    wfArena[jb + 9u] = vec4(dirTo, dist);
+    WfJobComplete(jb, f, replayPdf, J, cosRc, d2, omega, true);
+    if (floatBitsToUint(wfArena[jb].z) == WF_JOB_PENDING_SHADOW)
+        WfAppend(WfCtrlShadow(uWfRound), WfShiftShadowQBase(), jobIdx);
+}
+
+void main()
+{
+    uint qslot = WfCtrlShade(uWfRound);
+    if (gl_GlobalInvocationID.x >= WfCount(qslot)) return;
+    uint jobIdx = wfQueue[WfShiftStepQBase(uWfRound) + gl_GlobalInvocationID.x];
+    uint jb = WfShiftJobBase(jobIdx);
+
+    uint jobBaseSlot = floatBitsToUint(wfArena[jb].x);
+    uint dstBits = floatBitsToUint(wfArena[jb].y);
+    uint dstIdx = dstBits & 0x7FFFFFFFu;
+    bool isPrev = (dstBits & 0x80000000u) != 0u;
+
+    uint tech = floatBitsToUint(RS_BASE.core.w);
+    uint s = RestirTechS(tech);
+    uint t = RestirTechT(tech);
+    uint flags = RestirTechFlags(tech);
+    uint deltaMask = RestirFlagsDeltaMask(flags);
+    g_rngSeed = floatBitsToUint(RS_BASE.fSeed.w);
+
+    bool misRecompute = RestirMisRecomputeEnabled();
+    bool conn = RestirConnectionsEnabled();
+
+    // ================================================== t = 1 (LIGHT) ====
+    if (t == 1u)
+    {
+        uint j = uWfRound;
+        if (j == 0u)
+        {
+            // ---------------------------------------------- emission -----
+            RngStream(0u, RNG_EMIT);
+            float pdfDescent, pdfLeaf;
+            uint leaf = LT_Descend(WfDstCamPos(isPrev), WfDstCamForward(isPrev), pdfDescent);
+            if (pdfDescent <= 0.0) { WfJobFail(jb); return; }
+            uint lightIdx = LT_SampleLeafTriangle(leaf, pdfLeaf);
+            float pickPdf = pdfDescent * pdfLeaf;
+            if (pickPdf <= 0.0) { WfJobFail(jb); return; }
+            LightTri lt = lightTris[lightIdx];
+            vec3 lightN = lt.normalArea.xyz;
+            vec3 origin = BdptSampleLightPoint(lightIdx, RandomFloat2());
+            float invArea = 1.0 / max(lt.normalArea.w, 1e-10);
+
+            if (s == 2u)
+            {
+                // Only the pick and the area sample are replayed - the
+                // emission direction is what the reconnection replaces.
+                WfLightReconnect(jobIdx, jb, jobBaseSlot, dstIdx, isPrev,
+                                 origin, lightN, vec3(0.0), 0u, true, lightIdx,
+                                 lt.emissionWeight.rgb, pickPdf * invArea);
+                return;
+            }
+
+            vec3 dir = CosineSampleHemisphere(lightN);
+            float cosTheta = dot(lightN, dir);
+            if (cosTheta <= 1e-6) { WfJobFail(jb); return; }
+            float directPdfA, emissionPdfW;
+            RestirLightPdfs(lightIdx, cosTheta, directPdfA, emissionPdfW);
+            if (emissionPdfW <= 0.0) { WfJobFail(jb); return; } // support gate
+
+            wfArena[jb + 1u] = vec4(origin, 0.0);
+            wfArena[jb + 2u] = vec4(lightN, 0.0);
+            wfArena[jb + 3u] = vec4(-dir, 0.0);
+            wfArena[jb + 4u] = vec4(lt.emissionWeight.rgb * cosTheta,
+                                    pickPdf * invArea * cosTheta / PI);
+            // Light-side MIS recursion seeds (consumed by the reconnection's
+            // omega recompute; restir_light.comp conventions).
+            wfArena[jb + 5u] = vec4(directPdfA / emissionPdfW,
+                                    cosTheta / emissionPdfW,
+                                    cosTheta / emissionPdfW, 0.0);
+            WfAppend(WfCtrlShade(uWfRound + 1u), WfShiftStepQBase(uWfRound + 1u), jobIdx);
+            return;
+        }
+
+        // ------------------------------------- walk vertex y_j (j >= 1) --
+        vec4 hitA = wfArena[jb + 6u];
+        if (hitA.w < 0.0) { WfJobFail(jb); return; }
+        vec4 hitB = wfArena[jb + 7u];
+        vec3 x = hitA.xyz;
+        vec3 n = hitB.xyz;
+        uint matId = floatBitsToUint(hitB.w) >> 24;
+        Material mat = materials[matId];
+        vec3 wi = wfArena[jb + 3u].xyz;
+
+        // Base subpaths have no interior emitters (bijectivity).
+        if (dot(mat.emissive.rgb, mat.emissive.rgb) > 0.0) { WfJobFail(jb); return; }
+        bool isDelta = MatIsDelta(mat);
+        if (isDelta != (((deltaMask >> (j - 1u)) & 1u) == 1u)) { WfJobFail(jb); return; }
+        float cosInJ = abs(dot(n, -wi));
+        if (cosInJ <= 1e-6) { WfJobFail(jb); return; }
+
+        vec3 f = wfArena[jb + 4u].xyz;
+        float replayPdf = wfArena[jb + 4u].w;
+
+        // Arrival conversions for the light-side MIS recursion
+        // (restir_shift.glsl's walk, kept in job slot 5).
+        vec4 mis = wfArena[jb + 5u];
+        mis.x *= hitA.w * hitA.w / cosInJ; // mVCM
+        mis.y /= cosInJ;                   // mVC
+        mis.z /= cosInJ;                   // mLW
+        wfArena[jb + 5u] = mis;
+
+        if (j + 2u == s)
+        {
+            WfLightReconnect(jobIdx, jb, jobBaseSlot, dstIdx, isPrev,
+                             x, n, wi, matId, false, 0u, f, replayPdf);
+            return;
+        }
+
+        // -------------------------------------------- replayed scatter ---
+        RngStream(j, RNG_BSDF);
+        BsdfSample bs = SampleBsdf(mat, n, wi, true);
+        if (bs.weight == vec3(0.0)) { WfJobFail(jb); return; }
+        if (!bs.specular && bs.pdfDir <= 0.0) { WfJobFail(jb); return; }
+        float pdfStep = bs.choicePdf * (bs.specular ? 1.0 : bs.pdfDir);
+
+        // Scatter updates of the light-side recursion (megakernel order:
+        // both consume the OLD mVCM; mVCM updates last).
+        if (bs.specular)
+        {
+            mis.y *= bs.cosOut;
+            mis.z *= bs.cosOut;
+            mis.x = 0.0;
+        }
+        else
+        {
+            float mVCn = (bs.cosOut / bs.pdfDir) * (mis.x + bs.pdfRev * mis.y);
+            float mLWn = (bs.cosOut / bs.pdfDir) * ((j == 1u ? mis.x : 0.0) + bs.pdfRev * mis.z);
+            mis = vec4(1.0 / bs.pdfDir, mVCn, mLWn, 0.0);
+        }
+        wfArena[jb + 5u] = mis;
+
+        wfArena[jb + 1u] = vec4(x, hitB.w);
+        wfArena[jb + 2u] = vec4(n, 0.0);
+        wfArena[jb + 3u] = vec4(-bs.dir, 0.0);
+        wfArena[jb + 4u] = vec4(f * bs.weight * pdfStep, replayPdf * pdfStep);
+        WfAppend(WfCtrlShade(uWfRound + 1u), WfShiftStepQBase(uWfRound + 1u), jobIdx);
+        return;
+    }
+
+    // ================================================ t >= 2 (CAMERA) ====
+    bool rcValid = (flags & RESTIR_FLAG_RCVALID) != 0u;
+    bool envEnd = (flags & RESTIR_FLAG_ENVEND) != 0u;
+    bool lightRc = (flags & RESTIR_FLAG_LIGHTRC) != 0u;
+    uint r = RestirFlagsRcIndex(flags);
+    uint i = uWfRound + 1u;
+
+    vec3 x, n, wi;
+    uint matId;
+    uint triIdx = 0u;
+    vec4 fSlot = wfArena[jb + 4u];
+    vec3 f = fSlot.xyz;
+    float replayPdf = fSlot.w;
+    vec4 misSlot = wfArena[jb + 5u];
+    float dVCM = misSlot.x, dVC = misSlot.y, dT1 = misSlot.z;
+    float J = misSlot.w;
+
+    if (i == 1u)
+    {
+        vec4 cur = wfArena[jb + 1u];
+        x = cur.xyz;
+        matId = floatBitsToUint(cur.w) >> 24;
+        n = wfArena[jb + 2u].xyz;
+        wi = wfArena[jb + 3u].xyz;
+    }
+    else
+    {
+        vec4 hitA = wfArena[jb + 6u];
+        wi = wfArena[jb + 3u].xyz; // already the new wi = -bs.dir
+        if (hitA.w < 0.0)
+        {
+            // Environment terminal: the scatter happened at vertex i-1, so
+            // the megakernel's (i+2)==t check reads (i-1)+2 == i+1 here.
+            if (!envEnd || rcValid || (i + 1u) != t) { WfJobFail(jb); return; }
+            f *= uFrame.background.rgb * uFrame.background.a;
+            if (replayPdf <= 0.0) { WfJobFail(jb); return; }
+            float Jf = J * RS_BASE.rcInfo.w / replayPdf;
+            // omega: 1 either way (eye-only technique) - copied.
+            WfJobComplete(jb, f, replayPdf, Jf, 0.0, 0.0, RS_BASE.rcInfo.z, false);
+            return;
+        }
+        if (envEnd && (i + 1u) == t) { WfJobFail(jb); return; } // base escaped, shift didn't
+
+        vec4 hitB = wfArena[jb + 7u];
+        x = hitA.xyz;
+        n = hitB.xyz;
+        matId = floatBitsToUint(hitB.w) >> 24;
+        triIdx = floatBitsToUint(hitB.w) & 0x00FFFFFFu;
+        float cosArr = max(abs(dot(n, -wi)), 1e-6);
+        dVCM *= hitA.w * hitA.w / cosArr;
+        dVC /= cosArr;
+        dT1 /= cosArr;
+
+        // Pure-replay terminal: the final vertex must be a front-facing
+        // emitter (s=0 with a specular chain).
+        if (!rcValid && !envEnd && !lightRc && i == t - 1u)
+        {
+            Material em = materials[matId];
+            if (dot(em.emissive.rgb, em.emissive.rgb) <= 0.0) { WfJobFail(jb); return; }
+            uint lightIdx = (uFrame.lightInfo.x > 0u) ? triToLight[triIdx] : LT_SENTINEL;
+            vec3 lightN = (lightIdx != LT_SENTINEL) ? lightTris[lightIdx].normalArea.xyz : n;
+            if (dot(lightN, wi) <= 1e-6) { WfJobFail(jb); return; }
+            f *= em.emissive.rgb;
+
+            float omega = RS_BASE.rcInfo.z;
+            if (misRecompute)
+            {
+                float denom = 1.0;
+                if (lightIdx != LT_SENTINEL)
+                {
+                    float directPdfA, emissionPdfW;
+                    RestirLightPdfs(lightIdx, dot(lightN, wi), directPdfA, emissionPdfW);
+                    denom = 1.0 + directPdfA * dVCM
+                          + emissionPdfW * (conn ? dVC : dT1);
+                }
+                if (isnan(denom) || isinf(denom)) { WfJobFail(jb); return; }
+                omega = 1.0 / max(denom, 1.0);
+            }
+            if (replayPdf <= 0.0) { WfJobFail(jb); return; }
+            float Jf = J * RS_BASE.rcInfo.w / replayPdf;
+            WfJobComplete(jb, f, replayPdf, Jf, 0.0, 0.0, omega, false);
+            return;
+        }
+    }
+
+    // ------------------------------------------- vertex i loop body ------
+    Material mat = materials[matId];
+    bool isDelta = MatIsDelta(mat);
+    if (isDelta != (((deltaMask >> (i - 1u)) & 1u) == 1u)) { WfJobFail(jb); return; }
+    // Premature emitter: every vertex processed here is a non-terminal
+    // vertex of the base path (see the megakernel's comment).
+    if (dot(mat.emissive.rgb, mat.emissive.rgb) > 0.0) { WfJobFail(jb); return; }
+
+    if (lightRc && i == t - 1u)
+    {
+        // ---------------------- connection-edge reconnection -------------
+        vec3 toY = RS_BASE.lyPosMat.xyz - x;
+        float d2y = dot(toY, toY);
+        if (d2y <= 1e-12) { WfJobFail(jb); return; }
+        float distY = sqrt(d2y);
+        vec3 dirY = toY / distY;
+
+        float cosY = dot(RS_BASE.lyNormal.xyz, -dirY);
+        if (cosY <= 1e-6) { WfJobFail(jb); return; } // wrong side of y_{s-1}
+
+        float pdfDirY, pdfRevY, cosOutY;
+        vec3 fbY = EvalBsdf(mat, n, wi, dirY, pdfDirY, pdfRevY, cosOutY);
+        if (fbY == vec3(0.0)) { WfJobFail(jb); return; }
+
+        f *= fbY * (cosOutY * cosY / d2y); // fCam * geometry term
+        f *= RS_BASE.lyTput.xyz;           // rho_y * light prefix numerator
+
+        float omega = RS_BASE.rcInfo.z;
+        if (misRecompute)
+        {
+            float camDirPdfA = pdfDirY * cosY / d2y;
+            float lightDirPdfA = (cosY / PI) * cosOutY / d2y;
+            float denom = camDirPdfA * RS_BASE.misCache.x + 1.0
+                        + lightDirPdfA * (dVCM + pdfRevY * dVC);
+            if (isnan(denom) || isinf(denom)) { WfJobFail(jb); return; }
+            omega = 1.0 / max(denom, 1.0);
+        }
+
+        if (replayPdf <= 0.0) { WfJobFail(jb); return; }
+        float Jf = J * RS_BASE.rcInfo.w / replayPdf;
+        wfArena[jb + 1u] = vec4(x, 0.0);
+        wfArena[jb + 2u] = vec4(n, 0.0);
+        wfArena[jb + 9u] = vec4(dirY, distY);
+        // No reconnection-vertex Jacobian data (rcCos/rcDist2 = 0): y's
+        // position is parametrized on the light side, see restir_shift.glsl.
+        WfJobComplete(jb, f, replayPdf, Jf, 0.0, 0.0, omega, true);
+        if (floatBitsToUint(wfArena[jb].z) == WF_JOB_PENDING_SHADOW)
+            WfAppend(WfCtrlShadow(uWfRound), WfShiftShadowQBase(), jobIdx);
+        return;
+    }
+
+    if (rcValid && i == r - 1u)
+    {
+        // ------------------------------------------ reconnection ---------
+        vec3 toRc = RS_BASE.rcPosMat.xyz - x;
+        float d2 = dot(toRc, toRc);
+        if (d2 <= 1e-12) { WfJobFail(jb); return; }
+        float dist = sqrt(d2);
+        vec3 dir = toRc / dist;
+
+        float cosRc = dot(RS_BASE.rcNormal.xyz, -dir);
+        if (cosRc <= 1e-6) { WfJobFail(jb); return; }
+
+        float pdfDir, pdfRev, cosOut;
+        vec3 fb = EvalBsdf(mat, n, wi, dir, pdfDir, pdfRev, cosOut);
+        if (fb == vec3(0.0)) { WfJobFail(jb); return; }
+
+        if (RS_BASE.rcInfo.x <= 0.0 || RS_BASE.rcInfo.y <= 0.0) { WfJobFail(jb); return; }
+
+        f *= fb * cosOut;          // rho*cos at x'_{r-1}
+        f *= RS_BASE.rcLsuf.xyz;   // cached suffix radiance
+        J *= (cosRc / RS_BASE.rcInfo.x) * (RS_BASE.rcInfo.y / d2); // Eq. 55
+
+        float omega = RS_BASE.rcInfo.z;
+        if (misRecompute)
+        {
+            float dVCMr = (d2 / cosRc) / pdfDir;
+            float dVCr = (cosOut / pdfDir) * (dVCM + pdfRev * dVC) / cosRc;
+            float dT1r = (cosOut / pdfDir) * (i == 1u ? dT1 : pdfRev * dT1) / cosRc;
+            float denom;
+            if (floatBitsToUint(RS_BASE.rcPosMat.w) == NO_MATERIAL)
+            {
+                // s=1 with the sampled light point as rc vertex.
+                float directPdfW = RS_BASE.misCache.y * d2 / cosRc;
+                if (directPdfW <= 1e-20) { WfJobFail(jb); return; }
+                float prefac = RS_BASE.misCache.z * cosOut / (directPdfW * cosRc);
+                float wCam = conn ? prefac * (dVCM + pdfRev * dVC)
+                                  : prefac * (i == 1u ? dT1 : pdfRev * dT1);
+                denom = 1.0 + pdfDir / directPdfW + wCam;
+            }
+            else if (s == 0u && r == t - 1u)
+            {
+                // rc vertex IS the terminal emitter.
+                denom = RS_BASE.misCache.x + RS_BASE.misCache.y * dVCMr
+                      + RS_BASE.misCache.z * (conn ? dVCr : dT1r);
+            }
+            else
+            {
+                float X = conn ? (dVCMr + (cosRc / PI) * dVCr)
+                               : ((cosRc / PI) * dT1r);
+                denom = RS_BASE.misCache.x + RS_BASE.misCache.y * X;
+            }
+            if (isnan(denom) || isinf(denom)) { WfJobFail(jb); return; }
+            omega = 1.0 / max(denom, 1.0);
+        }
+
+        if (replayPdf <= 0.0) { WfJobFail(jb); return; }
+        float Jf = J * RS_BASE.rcInfo.w / replayPdf;
+        wfArena[jb + 1u] = vec4(x, 0.0);
+        wfArena[jb + 2u] = vec4(n, 0.0);
+        wfArena[jb + 9u] = vec4(dir, dist);
+        WfJobComplete(jb, f, replayPdf, Jf, cosRc, d2, omega, true);
+        if (floatBitsToUint(wfArena[jb].z) == WF_JOB_PENDING_SHADOW)
+            WfAppend(WfCtrlShadow(uWfRound), WfShiftShadowQBase(), jobIdx);
+        return;
+    }
+
+    // ------------------------------------------------ replayed scatter ---
+    RngStream(i, RNG_BSDF);
+    BsdfSample bs = SampleBsdf(mat, n, wi, false);
+    if (bs.weight == vec3(0.0)) { WfJobFail(jb); return; }
+    if (!bs.specular && bs.pdfDir <= 0.0) { WfJobFail(jb); return; }
+
+    float pdfStep = bs.choicePdf * (bs.specular ? 1.0 : bs.pdfDir);
+    f *= bs.weight * pdfStep;
+    replayPdf *= pdfStep;
+
+    // MIS recursions (identical to restir_camera.comp / restir_shift.glsl).
+    if (bs.specular)
+    {
+        dVC *= bs.cosOut;
+        dT1 = (i == 1u) ? 0.0 : dT1 * bs.cosOut;
+        dVCM = 0.0;
+    }
+    else
+    {
+        dVC = (bs.cosOut / bs.pdfDir) * (dVCM + bs.pdfRev * dVC);
+        dT1 = (bs.cosOut / bs.pdfDir) * (i == 1u ? dT1 : dT1 * bs.pdfRev);
+        dVCM = 1.0 / bs.pdfDir;
+    }
+
+    wfArena[jb + 1u] = vec4(x, 0.0);
+    wfArena[jb + 2u] = vec4(n, 0.0);
+    wfArena[jb + 3u] = vec4(-bs.dir, 0.0);
+    wfArena[jb + 4u] = vec4(f, replayPdf);
+    wfArena[jb + 5u] = vec4(dVCM, dVC, dT1, J);
+    WfAppend(WfCtrlShade(uWfRound + 1u), WfShiftStepQBase(uWfRound + 1u), jobIdx);
+}

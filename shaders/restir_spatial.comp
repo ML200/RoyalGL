@@ -21,8 +21,6 @@
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-const float RESTIR_CONFIDENCE_CAP = 20.0;
-
 void main()
 {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
@@ -72,7 +70,7 @@ void main()
 
         uint nSlot = RestirRegionOffset(RESTIR_SCRATCH_REGION) + nIdx;
         vec4 nCore = pixelRes[nSlot].path.core;
-        float cN = min(nCore.z, RESTIR_CONFIDENCE_CAP);
+        float cN = min(nCore.z, RestirConfidenceCap());
         float cR = rCore.z;
 
         // Forward shift: neighbor sample into this pixel's domain.
@@ -100,8 +98,10 @@ void main()
             }
         }
 
+        // Symmetric Jacobian support restriction in both directions
+        // (RestirJacobianValid, restir_common.glsl).
         float w_R = 0.0, w_N = 0.0;
-        if (pHatN_cur > 0.0 && SN.jacobian > 0.0)
+        if (pHatN_cur > 0.0 && RestirJacobianValid(SN.jacobian))
         {
             float pHatFromN = nCore.y / SN.jacobian;
             float mN = cN * pHatFromN / (cN * pHatFromN + cR * pHatN_cur);
@@ -109,7 +109,7 @@ void main()
         }
         if (rCore.y > 0.0)
         {
-            float pHatFromN_R = pHatR_nbr * JR_back;
+            float pHatFromN_R = RestirJacobianValid(JR_back) ? pHatR_nbr * JR_back : 0.0;
             float mR = cR * rCore.y / (cR * rCore.y + cN * pHatFromN_R);
             w_R = mR * rCore.y * rCore.x;
         }
@@ -117,7 +117,7 @@ void main()
         if (isnan(w_N) || isinf(w_N)) w_N = 0.0;
 
         float wSum = w_R + w_N;
-        float cOut = min(cR + cN, RESTIR_CONFIDENCE_CAP);
+        float cOut = min(cR + cN, RestirConfidenceCap());
 
         if (wSum <= 0.0)
         {

@@ -1,0 +1,474 @@
+#version 460 core
+#include "common.glsl"
+#include "light_tree.glsl"
+#include "bdpt_common.glsl"
+#include "restir_common.glsl"
+#include "restir_wf_common.glsl"
+#include "restir_wf_cam.glsl"
+
+// Wavefront camera RIS, stage 2: shade round k (uWfRound = k = the index of
+// the vertex being processed; every queued path is at vertex k). Exact port
+// of restir_camera.comp's loop body with the ray casts hoisted out:
+//  1. absorb round k-1's shadow-tested NEE/CONN candidates (deferred RIS
+//     draws, megakernel order),
+//  2. environment terminal if round k-1's bounce missed,
+//  3. advance to vertex k from the trace result (arrival MIS conversions),
+//  4. vertex logic: delta mask, rc detection, s=0 emitter terminal (inline
+//     absorb - no visibility needed), NEE + LVC candidate creation (weights
+//     and MIS caches computed here, occlusion deferred to camshadow),
+//  5. BSDF bounce: state advance + extend/shadow/next-shade enqueues.
+// No BVH traversal happens here - that is the whole point: the RIS state
+// never shares registers with a traversal stack.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+#define SELP pixelRes[outSlot].path
+
+void main()
+{
+    uint qslot = WfCtrlShade(uWfRound);
+    if (gl_GlobalInvocationID.x >= WfCount(qslot)) return;
+    uint entry = wfQueue[WfCamShadeQBase(uWfRound) + gl_GlobalInvocationID.x];
+    uint idx = entry & ~WF_SHADE_ABSORB_ONLY;
+    uint base = WfCamBase(idx);
+    uint outSlot = RestirRegionOffset(RestirCandidateOutRegion()) + idx;
+    uint pathLen = uWfRound;
+
+    // ------------------------------------------------------ absorb -------
+    vec4 misA = wfArena[base + 4u];
+    float wSum = misA.w;
+    uint risRng = floatBitsToUint(wfArena[base + 5u].z);
+    WfCamAbsorb(base, 0u, outSlot, wSum, risRng);
+    WfCamAbsorb(base, 1u, outSlot, wSum, risRng);
+
+    if ((entry & WF_SHADE_ABSORB_ONLY) != 0u)
+    {
+        wfArena[base + 4u].w = wSum;
+        wfArena[base + 5u].z = uintBitsToFloat(risRng);
+        return;
+    }
+
+    vec4 fCurProd = wfArena[base + 3u];
+    vec3 fCur = fCurProd.xyz;
+    float pProd = fCurProd.w;
+    uint camSeed = floatBitsToUint(wfArena[base + 5u].w);
+    g_rngSeed = camSeed;
+
+    uint stFlags = floatBitsToUint(wfArena[base + 1u].w);
+    bool rcFound = (stFlags & WF_CAMF_RCFOUND) != 0u;
+    bool prevConnectable = (stFlags & WF_CAMF_PREVCONN) != 0u;
+    uint deltaMask = WfCamFlagsDeltaMask(stFlags);
+    uint rcIdx = WfCamFlagsRcIdx(stFlags);
+
+    float dVCM = misA.x, dVC = misA.y, dT1 = misA.z;
+    float misK1 = wfArena[base + 5u].x, misK2 = wfArena[base + 5u].y;
+    float replayPdfBase = wfArena[base + 7u].w; // valid iff rcFound
+    float rcBaseCos = wfArena[base + 8u].w;
+    float rcBaseDist2 = wfArena[base + 9u].x;
+
+    vec3 x, n, wi;
+    uint matId, triIdx;
+    float lastEdgeDist2 = 0.0;
+
+    if (pathLen == 1u)
+    {
+        vec4 posMat = wfArena[base + 0u];
+        vec4 nrm = wfArena[base + 1u];
+        x = posMat.xyz;
+        n = nrm.xyz;
+        wi = wfArena[base + 2u].xyz;
+        uint mt = floatBitsToUint(posMat.w);
+        matId = mt >> 24;
+        triIdx = mt & 0x00FFFFFFu;
+    }
+    else
+    {
+        // --------------------------- consume round k-1's trace result ----
+        vec4 hitA = wfArena[base + 10u];
+        wi = wfArena[base + 2u].xyz; // already the NEW wi = -bs.dir
+        if (hitA.w < 0.0)
+        {
+            // ------------------------------------------- s = 0, env ------
+            // The environment is only reachable by BSDF sampling: omega = 1.
+            // fCur/pProd already include round k-1's scatter.
+            vec3 fCand = fCur * uFrame.background.rgb * uFrame.background.a;
+            float w = RestirLum(fCand) / pProd;
+            if (w > 0.0 && !isnan(w) && !isinf(w))
+            {
+                wSum += w;
+                if (RestirRand(risRng) * wSum <= w)
+                {
+                    uint flags = (rcFound ? RESTIR_FLAG_RCVALID : RESTIR_FLAG_ENVEND) | (deltaMask << 8);
+                    if (rcFound) flags |= (rcIdx & 0xFu) << 4;
+                    // env pseudo-vertex: scatter happened at vertex k-1, so
+                    // t = (k-1) + 2 (matches the megakernel's pathLen+2).
+                    SELP.core.w = uintBitsToFloat(RestirPackTech(0u, pathLen + 1u, flags));
+                    SELP.core.y = RestirLum(fCand);
+                    SELP.fSeed = vec4(fCand, uintBitsToFloat(camSeed));
+                    if (rcFound)
+                    {
+                        SELP.rcInfo = vec4(rcBaseCos, rcBaseDist2, 1.0, replayPdfBase);
+                        SELP.rcPosMat = wfArena[base + 6u];
+                        SELP.rcNormal = vec4(wfArena[base + 7u].xyz, 0.0);
+                        SELP.rcLsuf = vec4(SafeDiv(fCand, wfArena[base + 8u].xyz), 0.0);
+                        SELP.misCache = vec4(1.0, 0.0, 0.0, 0.0); // env: no competitors
+                    }
+                    else
+                    {
+                        SELP.rcInfo = vec4(0.0, 0.0, 1.0, pProd);
+                    }
+                }
+            }
+            wfArena[base + 4u].w = wSum;
+            wfArena[base + 5u].z = uintBitsToFloat(risRng);
+            return;
+        }
+
+        // Advance to vertex k (megakernel's loop-bottom arrival block).
+        vec4 hitB = wfArena[base + 11u];
+        x = hitA.xyz;
+        n = hitB.xyz;
+        uint mt = floatBitsToUint(hitB.w);
+        matId = mt >> 24;
+        triIdx = mt & 0x00FFFFFFu;
+        lastEdgeDist2 = hitA.w * hitA.w;
+        float cosArr = max(abs(dot(n, -wi)), 1e-6); // bounce dir = -wi
+        dVCM *= lastEdgeDist2 / cosArr;
+        dVC /= cosArr;
+        dT1 /= cosArr;
+        misK1 /= cosArr;
+        misK2 /= cosArr;
+    }
+
+    // ------------------------------------------------- vertex k logic ----
+    Material mat = materials[matId];
+    bool isDelta = MatIsDelta(mat);
+    if (isDelta) deltaMask |= 1u << (pathLen - 1u);
+    bool isEmissive = dot(mat.emissive.rgb, mat.emissive.rgb) > 0.0;
+
+    bool haveLights = uFrame.lightInfo.x > 0u;
+    bool lightTracing = RestirLightTracingEnabled() && haveLights;
+    bool connections = RestirConnectionsEnabled() && haveLights;
+    uint maxLen = BdptMaxPathLength();
+    float numLightPaths = float(BdptNumLightPaths());
+
+    // Reconnection vertex: first connectable pair (megakernel order: after
+    // the mask update, before the emitter branch).
+    bool selfConnectable = !isDelta;
+    if (!rcFound && pathLen >= 2u && prevConnectable && selfConnectable)
+    {
+        rcFound = true;
+        rcIdx = pathLen;
+        rcBaseCos = abs(dot(n, wi));
+        rcBaseDist2 = lastEdgeDist2;
+        replayPdfBase = wfArena[base + 2u].w; // pdfPrevArrival
+        wfArena[base + 6u] = vec4(x, uintBitsToFloat(matId));
+        wfArena[base + 7u] = vec4((dot(n, wi) >= 0.0) ? n : -n, replayPdfBase);
+        wfArena[base + 8u] = vec4(fCur, rcBaseCos); // fArriveRc
+        wfArena[base + 9u].x = rcBaseDist2;
+    }
+
+    // ---------------------------------------------------------- s = 0 ----
+    if (isEmissive)
+    {
+        uint lightIdx = haveLights ? triToLight[triIdx] : LT_SENTINEL;
+        vec3 lightN = (lightIdx != LT_SENTINEL) ? lightTris[lightIdx].normalArea.xyz : n;
+        float cosHit = dot(lightN, wi);
+        if (cosHit > 1e-6)
+        {
+            float omega = 1.0;
+            float directPdfA = 0.0, emissionPdfW = 0.0;
+            bool hasCompetitors = pathLen > 1u && lightIdx != LT_SENTINEL;
+            if (hasCompetitors)
+            {
+                RestirLightPdfs(lightIdx, cosHit, directPdfA, emissionPdfW);
+                float ratioSum = 1.0 + directPdfA * dVCM
+                               + emissionPdfW * (connections ? dVC : dT1);
+                omega = 1.0 / ratioSum;
+            }
+
+            vec3 fCand = fCur * mat.emissive.rgb;
+            float w = omega * RestirLum(fCand) / pProd;
+            if (w > 0.0 && !isnan(w) && !isinf(w))
+            {
+                wSum += w;
+                if (RestirRand(risRng) * wSum <= w)
+                {
+                    uint flags = (rcFound ? RESTIR_FLAG_RCVALID : 0u) | (deltaMask << 8);
+                    if (rcFound) flags |= (rcIdx & 0xFu) << 4;
+                    SELP.core.w = uintBitsToFloat(RestirPackTech(0u, pathLen + 1u, flags));
+                    SELP.core.y = omega * RestirLum(fCand);
+                    SELP.fSeed = vec4(fCand, uintBitsToFloat(camSeed));
+                    if (rcFound)
+                    {
+                        SELP.rcInfo = vec4(rcBaseCos, rcBaseDist2, omega, replayPdfBase);
+                        SELP.rcPosMat = wfArena[base + 6u];
+                        SELP.rcNormal = vec4(wfArena[base + 7u].xyz, 0.0);
+                        SELP.rcLsuf = vec4(SafeDiv(fCand, wfArena[base + 8u].xyz), 0.0);
+                        if (!hasCompetitors)
+                            SELP.misCache = vec4(1.0, 0.0, 0.0, 0.0);
+                        else if (rcIdx == pathLen)
+                            SELP.misCache = vec4(1.0, directPdfA, emissionPdfW, 0.0);
+                        else
+                            SELP.misCache = vec4(
+                                1.0 + directPdfA * dVCM
+                                    + emissionPdfW * (connections ? misK1 : 0.0),
+                                emissionPdfW * misK2, 0.0, 0.0);
+                    }
+                    else
+                    {
+                        SELP.rcInfo = vec4(0.0, 0.0, omega, pProd);
+                    }
+                }
+            }
+        }
+        // Paths terminate on emitters; persist the RIS chain and stop.
+        wfArena[base + 4u].w = wSum;
+        wfArena[base + 5u].z = uintBitsToFloat(risRng);
+        return;
+    }
+
+    if (pathLen >= maxLen)
+    {
+        wfArena[base + 4u].w = wSum;
+        wfArena[base + 5u].z = uintBitsToFloat(risRng);
+        return;
+    }
+
+    // camshadow reads the shadow-ray origin (this vertex) from slots 0/1,
+    // so they must be current BEFORE any candidate is enqueued - including
+    // when the path dies at the BSDF sample below. slot 1's flag word is
+    // finalized in the persist block.
+    wfArena[base + 0u] = vec4(x, uintBitsToFloat((matId << 24) | (triIdx & 0x00FFFFFFu)));
+    wfArena[base + 1u].xyz = n;
+
+    bool anyPending = false;
+
+    // ---------------------------------------------------------- s = 1 ----
+    if (!isDelta && haveLights)
+    {
+        RngStream(pathLen, RNG_NEE);
+        float pickPdfTrue;
+        uint lightIdx = BdptSampleLightIndex(pickPdfTrue);
+        LightTri lt = lightTris[lightIdx];
+        vec3 lightPos = BdptSampleLightPoint(lightIdx, RandomFloat2());
+
+        vec3 toLight = lightPos - x;
+        float dist2 = dot(toLight, toLight);
+        float dist = sqrt(max(dist2, 1e-12));
+        vec3 L = toLight / dist;
+        float cosAtLight = dot(lt.normalArea.xyz, -L);
+
+        if (cosAtLight > 1e-6 && pickPdfTrue > 0.0)
+        {
+            float invArea = 1.0 / max(lt.normalArea.w, 1e-10);
+            float directPdfWTrue = pickPdfTrue * invArea * dist2 / cosAtLight;
+            float directPdfA, emissionPdfW;
+            RestirLightPdfs(lightIdx, cosAtLight, directPdfA, emissionPdfW);
+            float directPdfW = directPdfA * dist2 / cosAtLight;
+
+            float bsdfDirPdfW, bsdfRevPdfW, cosToLight;
+            vec3 fb = EvalBsdf(mat, n, wi, L, bsdfDirPdfW, bsdfRevPdfW, cosToLight);
+
+            if (fb != vec3(0.0) && directPdfW > 1e-20 && directPdfWTrue > 1e-20)
+            {
+                float wCam = 0.0;
+                float prefactor = emissionPdfW * cosToLight / (directPdfW * cosAtLight);
+                if (connections)
+                    wCam = prefactor * (dVCM + bsdfRevPdfW * dVC);
+                else if (lightTracing)
+                    wCam = prefactor * (pathLen == 1u ? dT1 : bsdfRevPdfW * dT1);
+                float omega = directPdfW / (directPdfW + bsdfDirPdfW + directPdfW * wCam);
+                vec3 fCand = fCur * fb * cosToLight * lt.emissionWeight.rgb;
+                float pCand = pProd * directPdfWTrue;
+                float w = omega * RestirLum(fCand) / pCand;
+
+                if (w > 0.0 && !isnan(w) && !isinf(w))
+                {
+                    // Candidate slot 0; visibility resolved by camshadow,
+                    // absorbed next round.
+                    uint flags = RESTIR_FLAG_RCVALID | (deltaMask << 8);
+                    uint r = rcFound ? rcIdx : pathLen + 1u;
+                    flags |= (r & 0xFu) << 4;
+                    uint cb = base + WF_CAM_CND0;
+                    wfArena[cb + 0u] = vec4(fCand, w);
+                    wfArena[cb + 1u] = vec4(omega,
+                        uintBitsToFloat(RestirPackTech(1u, pathLen + 1u, flags)),
+                        pProd,
+                        uintBitsToFloat(rcFound ? WF_CND_SHARED_RC : WF_CND_NEE_LIGHT));
+                    if (rcFound)
+                    {
+                        if (rcIdx == pathLen)
+                            wfArena[cb + 2u] = vec4(
+                                1.0 + bsdfDirPdfW / directPdfW, prefactor, 0.0, 0.0);
+                        else
+                            wfArena[cb + 2u] = vec4(
+                                1.0 + bsdfDirPdfW / directPdfW
+                                    + (connections
+                                           ? prefactor * (dVCM + bsdfRevPdfW * misK1)
+                                           : 0.0),
+                                prefactor * bsdfRevPdfW * misK2, 0.0, 0.0);
+                    }
+                    else
+                    {
+                        wfArena[cb + 2u] = vec4(0.0, directPdfA, emissionPdfW, 0.0);
+                        wfArena[cb + 4u] = vec4(lightPos, uintBitsToFloat(lightIdx));
+                        wfArena[cb + 5u] = vec4(cosAtLight, dist2, 0.0, 0.0);
+                    }
+                    wfArena[cb + 3u] = vec4(L, dist);
+                    WfAppend(WfCtrlShadow(uWfRound), WfCamShadowQBase(), idx);
+                    anyPending = true;
+                }
+            }
+        }
+    }
+
+    // --------------------------------------------------------- s >= 2 ----
+    uint lvcCount = connections
+        ? min(lightVertCount[0], BdptNumLightPaths() * BDPT_MAX_LIGHT_VERTS) : 0u;
+    if (!isDelta && connections && lvcCount > 0u)
+    {
+        RngStream(pathLen, RNG_CONNECT);
+        uint k = min(uint(RandomFloat() * float(lvcCount)), lvcCount - 1u);
+        LightVertex lv = lightVerts[k];
+        uint lvBits = floatBitsToUint(lv.tputMat.w);
+        uint lightLen = lvBits & 0xFFu;
+        uint lightMat = lvBits >> 8;
+        float pLight = lv.wiLen.w;
+
+        if (pathLen + 1u + lightLen <= maxLen && pLight > 0.0)
+        {
+            vec3 toL = lv.posDvcm.xyz - x;
+            float dist2c = dot(toL, toL);
+            float dist = sqrt(max(dist2c, 1e-12));
+            vec3 dirCtoL = toL / dist;
+
+            float camDirPdfW, camRevPdfW, cosCamera;
+            vec3 fCam = EvalBsdf(mat, n, wi, dirCtoL, camDirPdfW, camRevPdfW, cosCamera);
+            Material lmat = materials[lightMat];
+            float lightDirPdfW, lightRevPdfW, cosLightV;
+            vec3 fLight = EvalBsdf(lmat, lv.normalDvc.xyz, lv.wiLen.xyz, -dirCtoL,
+                                   lightDirPdfW, lightRevPdfW, cosLightV);
+
+            if (dist2c > 1e-12 && fCam != vec3(0.0) && fLight != vec3(0.0))
+            {
+                float geometryTerm = cosCamera * cosLightV / dist2c;
+                float camDirPdfA = camDirPdfW * cosLightV / dist2c;
+                float lightDirPdfA = lightDirPdfW * cosCamera / dist2c;
+                float wLight = camDirPdfA * (lv.posDvcm.w + lv.normalDvc.w * lightRevPdfW);
+                float wCamera = lightDirPdfA * (dVCM + dVC * camRevPdfW);
+                float omega = 1.0 / (wLight + 1.0 + wCamera);
+
+                vec3 fCand = fCur * fCam * geometryTerm * fLight * lv.tputMat.xyz;
+                float pCand = pProd * pLight * (numLightPaths / float(lvcCount));
+                float w = omega * RestirLum(fCand) / pCand;
+
+                if (w > 0.0 && !isnan(w) && !isinf(w))
+                {
+                    uint flags = deltaMask << 8;
+                    uint cb = base + WF_CAM_CND0 + WF_CAM_CND_STRIDE;
+                    if (rcFound)
+                    {
+                        flags |= RESTIR_FLAG_RCVALID | ((rcIdx & 0xFu) << 4);
+                        if (rcIdx == pathLen)
+                            wfArena[cb + 2u] = vec4(wLight + 1.0, lightDirPdfA, 0.0, 0.0);
+                        else
+                            wfArena[cb + 2u] = vec4(
+                                wLight + 1.0
+                                    + lightDirPdfA * (dVCM + camRevPdfW * misK1),
+                                lightDirPdfA * camRevPdfW * misK2, 0.0, 0.0);
+                    }
+                    else
+                    {
+                        flags |= RESTIR_FLAG_LIGHTRC;
+                        vec3 nly = (dot(lv.normalDvc.xyz, lv.wiLen.xyz) >= 0.0)
+                                       ? lv.normalDvc.xyz : -lv.normalDvc.xyz;
+                        // misCache.x = light ratio sum; yzw carry lyTput.
+                        wfArena[cb + 2u] = vec4(
+                            lv.posDvcm.w + lv.normalDvc.w * lightRevPdfW,
+                            fLight * lv.tputMat.xyz);
+                        wfArena[cb + 4u] = vec4(nly, 0.0);
+                        wfArena[cb + 5u] = vec4(lv.posDvcm.xyz, 0.0);
+                    }
+                    wfArena[cb + 0u] = vec4(fCand, w);
+                    wfArena[cb + 1u] = vec4(omega,
+                        uintBitsToFloat(RestirPackTech(lightLen + 1u, pathLen + 1u, flags)),
+                        pProd,
+                        uintBitsToFloat(rcFound ? WF_CND_SHARED_RC : WF_CND_LIGHTRC));
+                    wfArena[cb + 3u] = vec4(dirCtoL, dist);
+                    WfAppend(WfCtrlShadow(uWfRound), WfCamShadowQBase(), idx | 0x80000000u);
+                    anyPending = true;
+                }
+            }
+        }
+    }
+
+    // ----------------------------------------------------- BSDF bounce ---
+    RngStream(pathLen, RNG_BSDF);
+    BsdfSample bs = SampleBsdf(mat, n, wi, false);
+    bool dead = (bs.weight == vec3(0.0)) || (!bs.specular && bs.pdfDir <= 0.0);
+    if (dead)
+    {
+        if (anyPending)
+            WfAppend(WfCtrlShade(uWfRound + 1u), WfCamShadeQBase(uWfRound + 1u),
+                     idx | WF_SHADE_ABSORB_ONLY);
+        wfArena[base + 4u].w = wSum;
+        wfArena[base + 5u].z = uintBitsToFloat(risRng);
+        wfArena[base + 1u].w = uintBitsToFloat(
+            (rcFound ? WF_CAMF_RCFOUND : 0u) | (prevConnectable ? WF_CAMF_PREVCONN : 0u)
+            | (deltaMask << 8) | ((rcIdx & 0xFu) << 16));
+        return;
+    }
+
+    float pdfStep = bs.choicePdf * (bs.specular ? 1.0 : bs.pdfDir);
+    float pdfPrevArrival = pProd;
+    fCur *= bs.weight * pdfStep;
+    pProd *= pdfStep;
+    prevConnectable = !isDelta;
+
+    // MIS recursions (identical to the megakernel; consume the OLD dVCM,
+    // update dVCM last).
+    if (rcFound)
+    {
+        if (pathLen == rcIdx)
+        {
+            misK1 = 0.0;
+            misK2 = bs.specular ? 0.0 : bs.cosOut / bs.pdfDir; // x_r is never delta
+        }
+        else if (bs.specular)
+        {
+            misK1 *= bs.cosOut;
+            misK2 *= bs.cosOut;
+        }
+        else
+        {
+            misK1 = (bs.cosOut / bs.pdfDir) * (dVCM + bs.pdfRev * misK1);
+            misK2 = (bs.cosOut / bs.pdfDir) * (bs.pdfRev * misK2);
+        }
+    }
+    if (bs.specular)
+    {
+        dVC *= bs.cosOut;
+        dT1 = (pathLen == 1u) ? 0.0 : dT1 * bs.cosOut;
+        dVCM = 0.0;
+    }
+    else
+    {
+        dVC = (bs.cosOut / bs.pdfDir) * (dVCM + bs.pdfRev * dVC);
+        dT1 = (bs.cosOut / bs.pdfDir) * (pathLen == 1u ? dT1 : dT1 * bs.pdfRev);
+        dVCM = 1.0 / bs.pdfDir;
+    }
+
+    // Persist state and enqueue the bounce (camtrace) + next shade round.
+    wfArena[base + 1u].w = uintBitsToFloat(
+        (rcFound ? WF_CAMF_RCFOUND : 0u) | (prevConnectable ? WF_CAMF_PREVCONN : 0u)
+        | (deltaMask << 8) | ((rcIdx & 0xFu) << 16));
+    wfArena[base + 2u] = vec4(-bs.dir, pdfPrevArrival);
+    wfArena[base + 3u] = vec4(fCur, pProd);
+    wfArena[base + 4u] = vec4(dVCM, dVC, dT1, wSum);
+    wfArena[base + 5u].x = misK1;
+    wfArena[base + 5u].y = misK2;
+    wfArena[base + 5u].z = uintBitsToFloat(risRng);
+    WfAppend(WfCtrlExtend(uWfRound), WfCamExtendQBase(), idx);
+    WfAppend(WfCtrlShade(uWfRound + 1u), WfCamShadeQBase(uWfRound + 1u), idx);
+}

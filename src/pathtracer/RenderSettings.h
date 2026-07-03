@@ -40,7 +40,7 @@ namespace RoyalGL
         // Pinhole cameras only - lens mode falls back to plain BDPT (the
         // stochastic pupil makes the primary hit a random variable, which
         // is Area-ReSTIR territory).
-        bool enableRestir = false;
+        bool enableRestir = true;
         // 0=off, then G-buffer normals / depth / motion vectors, reservoir
         // W / confidence / technique index (see shaders/restir_debug.comp).
         int restirDebugView = 0;
@@ -48,8 +48,15 @@ namespace RoyalGL
         // unbiasedness baseline).
         bool restirTemporal = true;
         bool restirSpatial = true;
-        int restirSpatialNeighbors = 3;
+        int restirSpatialNeighbors = 1;
         float restirSpatialRadius = 30.0f; // pixels
+        // Confidence (M) cap for all reuse passes (paper uses 20): bounds
+        // the effective temporal sample count a reservoir can claim.
+        // Lower = fresher (outliers and stale history wash out in fewer
+        // frames), higher = smoother but longer-lived correlation. Default
+        // 8: t=1 reuse between spatially distant anchors is heavy-tailed
+        // at grazing incidence, and shorter chains recover faster.
+        float restirConfidenceCap = 8.0f;
         // Phase 2 "lightweight BDPT": t=1 light tracing candidates binned
         // into per-pixel reservoirs through the LRM, with caustic paths in
         // a second reservoir. Off = Phase 1 camera-side techniques only.
@@ -58,17 +65,19 @@ namespace RoyalGL
         // global LVC. Off = lightweight mode; the MIS weights track the
         // active technique set either way.
         bool restirConnections = true;
-        // Phase 5: recompute omega_tau for camera-side (t>=2) and caustic
-        // shifts via the recursive reconnection MIS; off = copy omega
-        // through shifts (paper Sec. 6.4). Default OFF for now: in our
-        // Lambert-only world copied omega is near shift-invariant (no
-        // Fig. 5 corner darkening to fix), and soaks show the recompute's
-        // t=1-competitor terms amplify the t=1 re-anchoring
-        // approximation's darkening under chained reuse (-0.026% ->
-        // -0.048%). Flip the default when GGX materials land - that is
-        // where copied omega actually bites. See RESTIR_BDPT_PLAN.md
-        // Phase 5 status.
-        bool restirRecomputeMis = false;
+        // Phase 5: recompute omega_tau at the destination anchor for every
+        // shift (camera-side, t=1 reverse, caustic replay); off = copy
+        // omega through shifts (paper Sec. 6.4). Default ON: with light
+        // tracing enabled, every technique's omega carries the t=1
+        // competitor seed N_L*d^2/cosIn1, which varies violently with the
+        // anchor at grazing incidence - a stale copied omega under camera
+        // motion breaks the temporal balance-heuristic partition by orders
+        // of magnitude and W blows up on newly-visible sharp-angle
+        // surfaces for ~confidence-cap frames. (The historical reason to
+        // keep this off - the free-landing t=1 re-anchoring approximation
+        // that recompute amplified - is gone since t=1 candidates are
+        // anchored at creation.) See RESTIR_BDPT_PLAN.md.
+        bool restirRecomputeMis = true;
 
         // Global: off = every pipeline overwrites the image with its latest
         // sample instead of averaging, so naive PT / NEE / BDPT / ReSTIR
@@ -96,6 +105,7 @@ namespace RoyalGL
                    restirSpatial == other.restirSpatial &&
                    restirSpatialNeighbors == other.restirSpatialNeighbors &&
                    restirSpatialRadius == other.restirSpatialRadius &&
+                   restirConfidenceCap == other.restirConfidenceCap &&
                    restirLightTracing == other.restirLightTracing &&
                    restirConnections == other.restirConnections &&
                    restirRecomputeMis == other.restirRecomputeMis &&

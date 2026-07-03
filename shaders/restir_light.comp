@@ -50,46 +50,21 @@
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-// V-buffer rejection heuristic (paper's stability fix): a non-caustic t=1
-// candidate must be re-anchorable to its own pixel's primary hit - the
-// exact reconnection every later shift performs (restir_shift.glsl). This
-// rejects candidates in penumbrae whose V-buffer anchor is occluded from
-// y_{s-2} (tiny darkening bias, big reuse-stability win). prevMatId ==
-// NO_MATERIAL marks y_{s-2} = y_0, the emission point.
-bool LrmReconnectionValid(GBufferPixel g, vec3 prevPos, vec3 prevN, vec3 prevWi, uint prevMatId)
-{
-    Material mX1 = materials[GBufMaterial(g)];
-    if (MatIsDelta(mX1)) return false;
-    if (dot(mX1.emissive.rgb, mX1.emissive.rgb) > 0.0) return false;
-
-    vec3 toX1 = g.posDepth.xyz - prevPos;
-    float d2 = dot(toX1, toX1);
-    if (d2 <= 1e-12) return false;
-    float dist = sqrt(d2);
-    vec3 dirTo = toX1 / dist;
-
-    if (prevMatId == NO_MATERIAL)
-    {
-        // Emission point: one-sided emitter.
-        if (dot(prevN, dirTo) <= 1e-6) return false;
-    }
-    else
-    {
-        float pd, pr, co;
-        if (EvalBsdf(materials[prevMatId], prevN, prevWi, dirTo, pd, pr, co) == vec3(0.0))
-            return false;
-    }
-
-    // The anchor must accept light from y_{s-2} on its camera-facing side.
-    vec3 wiCam = normalize(uFrame.camPos.xyz - g.posDepth.xyz);
-    float pd2, pr2, co2;
-    if (EvalBsdf(mX1, g.normalMat.xyz, wiCam, -dirTo, pd2, pr2, co2) == vec3(0.0))
-        return false;
-
-    vec3 nf = (dot(prevN, dirTo) >= 0.0) ? prevN : -prevN;
-    Ray shadowRay = MakeRay(prevPos + nf * 1e-4, dirTo);
-    return !IntersectSceneOccluded(shadowRay, dist * 0.999);
-}
+// Non-caustic t=1 candidates are ANCHORED AT CREATION: the free landing
+// point y_{s-1} is immediately collapsed onto the landing pixel's V-buffer
+// hit by the same reverse-hybrid reconnection every later shift performs
+// (Eq. 56 Jacobian), so the reservoir's target function is consistent from
+// insertion onward. Storing f at the free point (as before) while every
+// shift evaluation re-anchors is a MISMATCHED target function: at grazing
+// incidence f varies by orders of magnitude across one pixel footprint,
+// the temporal MIS partition breaks (the fresh candidate's m uses the
+// free-point pHat, the backward term the anchored one), and exactly the
+// bright candidates get over-counted - W blows up on newly-visible
+// sharp-angle surfaces and decays only over ~confidence-cap frames.
+// Anchoring at creation also subsumes the old V-buffer rejection heuristic
+// (the reconnection IS that test) and makes a static-camera temporal shift
+// an exact identity (J = 1). Caustic candidates remain free-landing: their
+// shifts are pure replay, so their target function was always consistent.
 
 void main()
 {
@@ -143,6 +118,13 @@ void main()
     vec3 prevWi = vec3(0.0);
     uint prevMat = NO_MATERIAL;
     bool prevIsDelta = false;
+    // State at y_{j-1} needed to rebuild the reconnected edge for anchored
+    // t=1 candidates: f up to ARRIVAL at y_{j-1} (the scatter leaving it is
+    // what the reconnection replaces; for y_0 that is Le - the emission
+    // cosine is replaced too), and the MIS recursion values AT y_{j-1}
+    // (post-arrival, pre-scatter).
+    vec3 prevFNum = lt.emissionWeight.rgb;
+    float prevDVCM = 0.0, prevDVC = 0.0, prevDLW = 0.0;
 
     uint deltaMask = 0u;
     uint maxLen = BdptMaxPathLength();
@@ -196,6 +178,9 @@ void main()
         if (!isDelta && lightTracing && pathLength + 1u <= maxLen)
         {
             // --------------------------------------- t=1 candidate -------
+            // The free connection direction only SELECTS the pixel; the
+            // non-caustic candidate itself is built at that pixel's anchor
+            // (see the header comment).
             vec3 toCam = uFrame.camPos.xyz - hitPos;
             float dist2 = dot(toCam, toCam);
             float dist = sqrt(max(dist2, 1e-12));
@@ -204,51 +189,175 @@ void main()
             float cosAtCam;
             if (dist2 > 1e-12 && BdptDirToPixel(-dirToCam, pixel, cosAtCam))
             {
-                float bsdfDirPdfW, bsdfRevPdfW, cosToCam;
-                vec3 fb = EvalBsdf(mat, hit.normal, wi, dirToCam, bsdfDirPdfW, bsdfRevPdfW, cosToCam);
                 uint pixIdx = RestirPixelIndex(pixel);
                 GBufferPixel g = gbuf[GBufCurOffset() + pixIdx];
+                bool caustic = prevIsDelta;
 
                 // Candidates landing on primary-miss pixels are dropped: the
                 // resolve shows the deterministic background there
                 // (consistent with the pixel-center V-buffer baseline).
-                if (fb != vec3(0.0) && g.posDepth.w >= 0.0)
+                if (g.posDepth.w < 0.0)
                 {
-                    float imagePointToCamDist = ipd / cosAtCam;
-                    float imageToSurface = (imagePointToCamDist * imagePointToCamDist) / cosAtCam
-                                           * cosToCam / dist2;
-
-                    float wLight = (imageToSurface / numLightPaths)
-                                 * (connections
-                                        ? (dVCM + bsdfRevPdfW * dVC)
-                                        : (pathLength == 1u ? (dVCM + bsdfRevPdfW * dLW)
-                                                            : (bsdfRevPdfW * dLW)));
-                    float omega = 1.0 / (1.0 + wLight);
-
-                    vec3 fPix = fNum * fb * imageToSurface;
-                    float w = omega * RestirLum(fPix) / (pProd * numLightPaths);
-                    bool caustic = prevIsDelta;
-
-                    if (w > 0.0 && !isnan(w) && !isinf(w))
+                }
+                else if (caustic)
+                {
+                    // Caustic: free landing + pure replay (unchanged).
+                    float bsdfDirPdfW, bsdfRevPdfW, cosToCam;
+                    vec3 fb = EvalBsdf(mat, hit.normal, wi, dirToCam, bsdfDirPdfW, bsdfRevPdfW, cosToCam);
+                    if (fb != vec3(0.0))
                     {
-                        vec3 nf = (dot(hit.normal, dirToCam) >= 0.0) ? hit.normal : -hit.normal;
-                        Ray shadowRay = MakeRay(hitPos + nf * 1e-4, dirToCam);
-                        if (!IntersectSceneOccluded(shadowRay, dist * 0.999))
+                        float imagePointToCamDist = ipd / cosAtCam;
+                        float imageToSurface = (imagePointToCamDist * imagePointToCamDist) / cosAtCam
+                                               * cosToCam / dist2;
+
+                        float wLight = (imageToSurface / numLightPaths)
+                                     * (connections
+                                            ? (dVCM + bsdfRevPdfW * dVC)
+                                            : (pathLength == 1u ? (dVCM + bsdfRevPdfW * dLW)
+                                                                : (bsdfRevPdfW * dLW)));
+                        float omega = 1.0 / (1.0 + wLight);
+
+                        vec3 fPix = fNum * fb * imageToSurface;
+                        float w = omega * RestirLum(fPix) / (pProd * numLightPaths);
+
+                        if (w > 0.0 && !isnan(w) && !isinf(w))
                         {
-                            bool accept = caustic
-                                || LrmReconnectionValid(g, prevPos, prevN, prevWi, prevMat);
-                            if (accept)
+                            vec3 nf = (dot(hit.normal, dirToCam) >= 0.0) ? hit.normal : -hit.normal;
+                            Ray shadowRay = MakeRay(hitPos + nf * 1e-4, dirToCam);
+                            if (!IntersectSceneOccluded(shadowRay, dist * 0.999))
                             {
-                                uint flags = (caustic ? RESTIR_FLAG_CAUSTIC : RESTIR_FLAG_RCVALID)
-                                           | (deltaMask << 8);
+                                uint flags = RESTIR_FLAG_CAUSTIC | (deltaMask << 8);
                                 uint tech = RestirPackTech(pathLength + 1u, 1u, flags);
-                                // Caustic shifts replay everything, so their
+                                // Caustic shifts replay everything: the
                                 // replayed-pdf product is the full arrival
                                 // pdf of y_{s-1}.
-                                float replayPdf = caustic ? pProd : pdfPrevArrival;
                                 LrmAppend(pixIdx, vec4(fPix, w),
-                                          vec4(cosIn, hit.t * hit.t, omega, replayPdf),
+                                          vec4(cosIn, hit.t * hit.t, omega, pProd),
                                           tech, baseSeed, 0u);
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    // Non-caustic: reconnect y_{s-2} to the pixel's anchor
+                    // - creation IS the first reverse-hybrid shift, priced
+                    // by the Eq. 56 Jacobian against the free landing. All
+                    // quantities mirror restir_shift.glsl's
+                    // RestirShiftLightPath and the omega recursion its
+                    // comment documents.
+                    Material mX1 = materials[GBufMaterial(g)];
+                    vec3 anchor = g.posDepth.xyz;
+                    vec3 toA = anchor - prevPos;
+                    float d2A = dot(toA, toA);
+                    if (!MatIsDelta(mX1)
+                        && dot(mX1.emissive.rgb, mX1.emissive.rgb) <= 0.0
+                        && d2A > 1e-12)
+                    {
+                        float distA = sqrt(d2A);
+                        vec3 dirA = toA / distA;
+
+                        // Light-side factor of the reconnected edge + the
+                        // anchored-path MIS state at y_{s-2}.
+                        vec3 fPrev = vec3(0.0);
+                        float pdP = 0.0; // pdf of sampling dirA at y_{s-2}
+                        float nVC = 0.0, nLW = 0.0;
+                        bool prevOk = false;
+                        if (prevMat == NO_MATERIAL)
+                        {
+                            // y_{s-2} = y_0: the emission direction itself
+                            // is replaced (one-sided emitter).
+                            float cosL = dot(prevN, dirA);
+                            if (cosL > 1e-6)
+                            {
+                                float dpA, epWA;
+                                RestirLightPdfs(lightIdx, cosL, dpA, epWA);
+                                if (epWA > 0.0)
+                                {
+                                    fPrev = prevFNum * cosL;
+                                    pdP = cosL / PI;
+                                    nVC = cosL / epWA;
+                                    nLW = nVC;
+                                    prevOk = true;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            float prP, cosOutP;
+                            vec3 fbP = EvalBsdf(materials[prevMat], prevN, prevWi, dirA,
+                                                pdP, prP, cosOutP);
+                            if (fbP != vec3(0.0) && pdP > 0.0)
+                            {
+                                fPrev = prevFNum * fbP * cosOutP;
+                                // Classic recursion across the replaced
+                                // scatter (dLW keeps its dVCM addition only
+                                // at the FIRST scatter, i.e. s = 3).
+                                nVC = (cosOutP / pdP) * (prevDVCM + prP * prevDVC);
+                                nLW = (cosOutP / pdP)
+                                    * ((pathLength == 2u ? prevDVCM : 0.0) + prP * prevDLW);
+                                prevOk = true;
+                            }
+                        }
+
+                        if (prevOk && pdP > 0.0)
+                        {
+                            // Anchor-side factors (exactly the shift's).
+                            vec3 wiCamA = normalize(uFrame.camPos.xyz - anchor);
+                            float pdXA, prXA, cosRcA;
+                            vec3 fbX = EvalBsdf(mX1, g.normalMat.xyz, wiCamA, -dirA,
+                                                pdXA, prXA, cosRcA);
+                            vec3 nfX = (dot(g.normalMat.xyz, wiCamA) >= 0.0)
+                                           ? g.normalMat.xyz : -g.normalMat.xyz;
+                            float cosToCamA = dot(nfX, wiCamA);
+                            float cosAtCamA = dot(uFrame.camForward.xyz, -wiCamA);
+                            if (fbX != vec3(0.0) && cosAtCamA > 1e-3 && cosToCamA > 1e-6)
+                            {
+                                float d2camA = g.posDepth.w * g.posDepth.w;
+                                float iptcdA = ipd / cosAtCamA;
+                                float i2sA = (iptcdA * iptcdA) / cosAtCamA
+                                             * cosToCamA / max(d2camA, 1e-12);
+
+                                // Arrival conversions at the anchor.
+                                float nVCM = (d2A / cosRcA) / pdP;
+                                float nVCa = nVC / cosRcA;
+                                float nLWa = nLW / cosRcA;
+                                float wLightA = (i2sA / numLightPaths)
+                                    * (connections
+                                           ? (nVCM + pdXA * nVCa)
+                                           : (pathLength == 1u ? (nVCM + pdXA * nLWa)
+                                                               : (pdXA * nLWa)));
+                                float omegaA = 1.0 / (1.0 + wLightA);
+
+                                vec3 fA = fPrev * fbX * i2sA;
+                                // Free landing -> anchor Jacobian (Eq. 56):
+                                // endpoint geometry ratio at the moving x_1.
+                                // Same symmetric support restriction as the
+                                // reuse merges: at camera-grazing pixels the
+                                // footprint is huge and the collapse can
+                                // transport extreme densities (cos ratios
+                                // ~1e5) - one such candidate mints a huge-W
+                                // reservoir that then persists ~confidence-
+                                // cap frames. Rejecting it is the grazing
+                                // analog of the paper's stability heuristic.
+                                float J = (cosRcA / cosIn) * ((hit.t * hit.t) / d2A);
+                                float w = RestirJacobianValid(J)
+                                    ? omegaA * RestirLum(fA) * J / (pProd * numLightPaths)
+                                    : 0.0;
+
+                                if (w > 0.0 && !isnan(w) && !isinf(w))
+                                {
+                                    vec3 nf = (dot(prevN, dirA) >= 0.0) ? prevN : -prevN;
+                                    Ray shadowRay = MakeRay(prevPos + nf * 1e-4, dirA);
+                                    if (!IntersectSceneOccluded(shadowRay, distA * 0.999))
+                                    {
+                                        uint flags = RESTIR_FLAG_RCVALID | (deltaMask << 8);
+                                        uint tech = RestirPackTech(pathLength + 1u, 1u, flags);
+                                        LrmAppend(pixIdx, vec4(fA, w),
+                                                  vec4(cosRcA, d2A, omegaA, pdfPrevArrival),
+                                                  tech, baseSeed, 0u);
+                                    }
+                                }
                             }
                         }
                     }
@@ -263,6 +372,14 @@ void main()
         BsdfSample bs = SampleBsdf(mat, hit.normal, wi, true);
         if (bs.weight == vec3(0.0)) break;
         if (!bs.specular && bs.pdfDir <= 0.0) break;
+
+        // Snapshot the post-arrival state at this vertex before the scatter
+        // consumes it - the anchored t=1 candidate at the NEXT vertex
+        // rebuilds the scatter leaving here toward a different endpoint.
+        prevDVCM = dVCM;
+        prevDVC = dVC;
+        prevDLW = dLW;
+        prevFNum = fNum;
 
         // Full classic recursion + the lightweight restriction (its dVCM
         // addition only at the first scatter - the s=1 split; later

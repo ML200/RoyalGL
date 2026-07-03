@@ -1,0 +1,40 @@
+#version 460 core
+#include "common.glsl"
+#include "restir_common.glsl"
+#include "restir_wf_common.glsl"
+
+// Wavefront shift, stage 3: closest-hit for a replayed scatter. Runs on the
+// NEXT step round's queue (a scattered job appends itself once; this kernel
+// and the next shiftstep iterate the same entries, dispatched with uWfRound
+// = r+1 between the two step rounds). Lean by design: one ray, the BVH
+// stack, one hit record.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+uint WfShiftJobBase(uint jobIdx) { return RestirPixelCount() + jobIdx * 12u; }
+
+void main()
+{
+    uint qslot = WfCtrlShade(uWfRound);
+    if (gl_GlobalInvocationID.x >= WfCount(qslot)) return;
+    uint jobIdx = wfQueue[WfShiftStepQBase(uWfRound) + gl_GlobalInvocationID.x];
+    uint jb = WfShiftJobBase(jobIdx);
+
+    vec3 pos = wfArena[jb + 1u].xyz;
+    vec3 n = wfArena[jb + 2u].xyz;
+    vec3 dir = -wfArena[jb + 3u].xyz;
+
+    vec3 offN = (dot(dir, n) >= 0.0) ? n : -n;
+    Ray ray = MakeRay(pos + offN * 1e-4, dir);
+    Hit hit;
+    if (IntersectScene(ray, hit))
+    {
+        wfArena[jb + 6u] = vec4(ray.origin + ray.dir * hit.t, hit.t);
+        wfArena[jb + 7u] = vec4(hit.normal,
+                                PackGBufMatTri(hit.materialIndex, hit.triIndex));
+    }
+    else
+    {
+        wfArena[jb + 6u].w = -1.0;
+    }
+}

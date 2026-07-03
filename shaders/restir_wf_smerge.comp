@@ -1,0 +1,100 @@
+#version 460 core
+#include "common.glsl"
+#include "restir_common.glsl"
+#include "restir_wf_common.glsl"
+#include "restir_wf_shift.glsl"
+
+// Wavefront spatial reuse, stage 3 of neighbor round uWfRound: one chained
+// 2-candidate GRIS merge of the shift-job results into the running
+// aggregate (the tail of restir_spatial.comp's k-th loop iteration,
+// expression for expression). The selection draw continues the header's
+// RNG chain, preserving the megakernel's draw sequence - including that an
+// invalid-neighbor round (header.z == 0) consumes no selection draw.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void main()
+{
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= RestirPixelCount()) return;
+
+    if (floatBitsToUint(wfArena[idx].y) == 0u) return; // primary miss
+    uint nIdxPlus1 = floatBitsToUint(wfArena[idx].z);
+    if (nIdxPlus1 == 0u) return; // megakernel `continue`: no confidence add
+    uint nIdx = nIdxPlus1 - 1u;
+
+    uint outSlot = RestirRegionOffset(RestirFinalRegion()) + idx;
+    uint nSlot = RestirRegionOffset(RESTIR_SCRATCH_REGION) + nIdx;
+
+    vec4 rCore = pixelRes[outSlot].path.core;
+    vec4 nCore = pixelRes[nSlot].path.core;
+    float cN = min(nCore.z, RestirConfidenceCap());
+    float cR = rCore.z;
+
+    // Forward shift result: neighbor sample into this pixel's domain.
+    uint jb0 = WfShiftJobBase(idx * 2u);
+    bool okN = WfJobOk(jb0);
+    float omegaN = WfJobOmega(jb0);
+    float pHatN_cur = okN ? omegaN * RestirLum(WfJobF(jb0)) : 0.0;
+    float JN = WfJobJacobian(jb0);
+
+    // Backward shift result: aggregate into the neighbor's domain.
+    uint jb1 = WfShiftJobBase(idx * 2u + 1u);
+    float pHatR_nbr = 0.0;
+    float JR_back = 0.0;
+    if (WfJobOk(jb1))
+    {
+        pHatR_nbr = WfJobOmega(jb1) * RestirLum(WfJobF(jb1));
+        JR_back = WfJobJacobian(jb1);
+    }
+
+    // Symmetric Jacobian support restriction in both directions
+    // (RestirJacobianValid, restir_common.glsl) - identical to the
+    // megakernel restir_spatial.comp.
+    float w_R = 0.0, w_N = 0.0;
+    if (pHatN_cur > 0.0 && RestirJacobianValid(JN))
+    {
+        float pHatFromN = nCore.y / JN;
+        float mN = cN * pHatFromN / (cN * pHatFromN + cR * pHatN_cur);
+        w_N = mN * pHatN_cur * nCore.x * JN;
+    }
+    if (rCore.y > 0.0)
+    {
+        float pHatFromN_R = RestirJacobianValid(JR_back) ? pHatR_nbr * JR_back : 0.0;
+        float mR = cR * rCore.y / (cR * rCore.y + cN * pHatFromN_R);
+        w_R = mR * rCore.y * rCore.x;
+    }
+    if (isnan(w_R) || isinf(w_R)) w_R = 0.0;
+    if (isnan(w_N) || isinf(w_N)) w_N = 0.0;
+
+    float wSum = w_R + w_N;
+    float cOut = min(cR + cN, RestirConfidenceCap());
+
+    if (wSum <= 0.0)
+    {
+        rCore.x = 0.0;
+        rCore.z = cOut;
+        pixelRes[outSlot].path.core = rCore;
+        return;
+    }
+
+    uint rng = floatBitsToUint(wfArena[idx].x);
+    if (RestirRand(rng) * wSum <= w_N)
+    {
+        // Neighbor wins: adopt its shifted path as the new aggregate.
+        float Wnew = wSum / pHatN_cur;
+        if (isnan(Wnew) || isinf(Wnew)) Wnew = 0.0;
+        pixelRes[outSlot].path = pixelRes[nSlot].path;
+        pixelRes[outSlot].path.core = vec4(Wnew, pHatN_cur, cOut, nCore.w);
+        pixelRes[outSlot].path.fSeed.xyz = WfJobF(jb0);
+        pixelRes[outSlot].path.rcInfo = vec4(WfJobRcCos(jb0), WfJobRcDist2(jb0),
+                                             omegaN, WfJobReplayPdf(jb0));
+    }
+    else
+    {
+        float Wnew = wSum / rCore.y;
+        if (isnan(Wnew) || isinf(Wnew)) Wnew = 0.0;
+        pixelRes[outSlot].path.core = vec4(Wnew, rCore.y, cOut, rCore.w);
+    }
+    wfArena[idx].x = uintBitsToFloat(rng);
+}

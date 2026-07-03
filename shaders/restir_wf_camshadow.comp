@@ -1,0 +1,33 @@
+#version 460 core
+#include "common.glsl"
+#include "restir_common.glsl"
+#include "restir_wf_common.glsl"
+#include "restir_wf_cam.glsl"
+
+// Wavefront camera RIS, stage 4: occlusion test for one NEE / LVC
+// connection candidate. Queue entries encode the candidate slot in the top
+// bit (0 = NEE, 1 = connection). An occluded connection zeroes the slot's
+// RIS weight, which makes the deferred absorb skip it without consuming a
+// reservoir draw - exactly the megakernel's occluded-candidate behavior.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void main()
+{
+    uint qslot = WfCtrlShadow(uWfRound);
+    if (gl_GlobalInvocationID.x >= WfCount(qslot)) return;
+    uint entry = wfQueue[WfCamShadowQBase() + gl_GlobalInvocationID.x];
+    uint idx = entry & 0x7FFFFFFFu;
+    uint cnd = entry >> 31;
+    uint base = WfCamBase(idx);
+    uint cb = base + WF_CAM_CND0 + cnd * WF_CAM_CND_STRIDE;
+
+    vec4 dirDist = wfArena[cb + 3u];
+    vec3 pos = wfArena[base + 0u].xyz;
+    vec3 n = wfArena[base + 1u].xyz;
+
+    vec3 nf = (dot(n, dirDist.xyz) >= 0.0) ? n : -n;
+    Ray shadowRay = MakeRay(pos + nf * 1e-4, dirDist.xyz);
+    if (IntersectSceneOccluded(shadowRay, dirDist.w * 0.999))
+        wfArena[cb].w = 0.0;
+}

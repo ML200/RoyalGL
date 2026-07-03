@@ -1,0 +1,101 @@
+#version 460 core
+#include "common.glsl"
+#include "restir_common.glsl"
+#include "restir_lrm.glsl"
+#include "restir_wf_common.glsl"
+#include "restir_wf_cam.glsl"
+// No light_tree/bdpt_common: nothing here traces or samples lights, and
+// the storage-block budget is tight (restir_wf_common.glsl).
+
+// Wavefront camera RIS, stage 5: per-pixel finalization - the megakernel's
+// tail. Absorbs any still-pending candidate slots (normally none: every
+// candidate's absorb round ran; the guard costs one flag read), merges this
+// pixel's LRM entries (t=1 candidates from restir_light.comp) into the
+// regular / caustic reservoirs, and finalizes W = wSum / pHat with
+// confidence 1. Runs full-frame - every pixel with a primary hit needs its
+// reservoir finalized no matter when its path died.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+#define SELP pixelRes[outSlot].path
+
+void main()
+{
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= RestirPixelCount()) return;
+
+    GBufferPixel g = gbuf[GBufCurOffset() + idx];
+    if (g.posDepth.w < 0.0) return; // caminit already wrote the empty pair
+
+    uint base = WfCamBase(idx);
+    uint outSlot = RestirRegionOffset(RestirCandidateOutRegion()) + idx;
+    uint causticSlot = RestirRegionOffset(RestirFinalRegion()) + idx;
+
+    float wSum = wfArena[base + 4u].w;
+    uint risRng = floatBitsToUint(wfArena[base + 5u].z);
+    WfCamAbsorb(base, 0u, outSlot, wSum, risRng);
+    WfCamAbsorb(base, 1u, outSlot, wSum, risRng);
+
+    bool haveLights = uFrame.lightInfo.x > 0u;
+    bool lightTracing = RestirLightTracingEnabled() && haveLights;
+
+    // ------------------------------------------------------ LRM merge ----
+    // Identical to restir_camera.comp: t=1 candidates already carry
+    // m = 1/N_L and omega_tau; caustic entries feed the caustic reservoir.
+    CausticReservoir cRes = RestirEmptyCaustic();
+    if (lightTracing)
+    {
+        float cWSum = 0.0;
+        LrmEntry cSel;
+        cSel.fW = vec4(0.0);
+        cSel.rcInfo = vec4(0.0);
+        cSel.meta = uvec4(0u);
+        bool haveCaustic = false;
+
+        uint eIdx = lrmHeads[1u + idx];
+        while (eIdx != LRM_SENTINEL)
+        {
+            LrmEntry e = lrmEntries[eIdx];
+            float w = e.fW.w;
+            if (w > 0.0 && !isnan(w) && !isinf(w))
+            {
+                if ((RestirTechFlags(e.meta.x) & RESTIR_FLAG_CAUSTIC) != 0u)
+                {
+                    cWSum += w;
+                    if (RestirRand(risRng) * cWSum <= w) { cSel = e; haveCaustic = true; }
+                }
+                else
+                {
+                    wSum += w;
+                    if (RestirRand(risRng) * wSum <= w)
+                    {
+                        SELP.core.w = uintBitsToFloat(e.meta.x);
+                        SELP.core.y = e.rcInfo.z * RestirLum(e.fW.xyz);
+                        SELP.fSeed = vec4(e.fW.xyz, uintBitsToFloat(e.meta.y));
+                        SELP.rcInfo = e.rcInfo;
+                    }
+                }
+            }
+            eIdx = e.meta.z;
+        }
+
+        if (haveCaustic)
+        {
+            float cPHat = cSel.rcInfo.z * RestirLum(cSel.fW.xyz);
+            if (cPHat > 0.0)
+            {
+                cRes.core = vec4(cWSum / cPHat, cPHat, 1.0, uintBitsToFloat(cSel.meta.x));
+                cRes.fSeed = vec4(cSel.fW.xyz, uintBitsToFloat(cSel.meta.y));
+                cRes.meta = vec4(cSel.rcInfo.z, cSel.rcInfo.w, 0.0, 0.0);
+                if (isnan(cRes.core.x) || isinf(cRes.core.x)) cRes.core.x = 0.0;
+            }
+        }
+    }
+    pixelRes[causticSlot].caustic = cRes;
+
+    float pHatSel = SELP.core.y;
+    float Wsel = (pHatSel > 0.0 && wSum > 0.0) ? wSum / pHatSel : 0.0;
+    if (isnan(Wsel) || isinf(Wsel)) Wsel = 0.0;
+    SELP.core.x = Wsel;
+    SELP.core.z = 1.0; // initial-sampling confidence is always 1 (paper 7.1)
+}

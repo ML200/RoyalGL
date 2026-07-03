@@ -1,0 +1,83 @@
+#version 460 core
+#include "common.glsl"
+#include "restir_common.glsl"
+#include "restir_wf_common.glsl"
+#include "restir_wf_shift.glsl"
+
+// Wavefront spatial reuse, stage 1 of neighbor round uWfRound: neighbor
+// selection + shift-job creation (the head of restir_spatial.comp's k-th
+// loop iteration). Round 0 also initializes the running aggregate in the
+// final-region slot (it lives there, exactly like the megakernel). The
+// neighbor-selection RNG chain is persisted in the per-pixel header so the
+// draw sequence across sinit/smerge rounds is identical to the megakernel's
+// single loop:
+//   header.x = uintBits(rng state)   header.y = uintBits(pixel alive)
+//   header.z = uintBits(neighborIdx + 1; 0 = this round has no valid
+//              neighbor - smerge skips, megakernel `continue`)
+// Neighbor selection uses only sample-independent surface data, as
+// confidence-weight correctness requires.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void main()
+{
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= RestirPixelCount()) return;
+    ivec2 size = ivec2(uFrame.frameInfo.xy);
+    ivec2 pixel = ivec2(int(idx % uFrame.frameInfo.x), int(idx / uFrame.frameInfo.x));
+
+    uint outSlot = RestirRegionOffset(RestirFinalRegion()) + idx;
+    GBufferPixel gCur = gbuf[GBufCurOffset() + idx];
+
+    if (uWfRound == 0u)
+    {
+        pixelRes[outSlot].path = pixelRes[RestirRegionOffset(RESTIR_SCRATCH_REGION) + idx].path;
+        uint rng = WangHash(idx * 26699u + uFrame.restirParams.z * 30323u + 0x8DA6B343u);
+        if (rng == 0u) rng = 0x9E3779B9u;
+        wfArena[idx] = vec4(uintBitsToFloat(rng),
+                            uintBitsToFloat((gCur.posDepth.w < 0.0) ? 0u : 1u),
+                            uintBitsToFloat(0u), 0.0);
+    }
+    if (floatBitsToUint(wfArena[idx].y) == 0u) return;
+
+    uint rng = floatBitsToUint(wfArena[idx].x);
+
+    // Uniform disk offset (megakernel draw order: u1, u2, then validation).
+    float u1 = RestirRand(rng);
+    float u2 = RestirRand(rng);
+    float radius = max(uFrame.prevCameraParams.z, 1.0);
+    float rad = radius * sqrt(u1);
+    float phi = 6.28318530718 * u2;
+    ivec2 nbr = pixel + ivec2(round(rad * cos(phi)), round(rad * sin(phi)));
+
+    wfArena[idx].x = uintBitsToFloat(rng);
+    wfArena[idx].z = uintBitsToFloat(0u); // no valid neighbor yet
+
+    if (nbr == pixel || nbr.x < 0 || nbr.y < 0 || nbr.x >= size.x || nbr.y >= size.y) return;
+
+    uint nIdx = RestirPixelIndex(nbr);
+    GBufferPixel gN = gbuf[GBufCurOffset() + nIdx];
+    if (gN.posDepth.w < 0.0) return;
+    if (GBufMaterial(gN) != GBufMaterial(gCur)) return;
+    // Surface similarity heuristics (domain choice, sample-independent).
+    if (abs(gN.posDepth.w - gCur.posDepth.w) > 0.1 * gCur.posDepth.w) return;
+    if (dot(gN.normalMat.xyz, gCur.normalMat.xyz) < 0.9) return;
+
+    wfArena[idx].z = uintBitsToFloat(nIdx + 1u);
+
+    uint job0 = idx * 2u;
+    uint job1 = idx * 2u + 1u;
+    wfArena[WfShiftJobBase(job0)].z = uintBitsToFloat(WF_JOB_FAIL);
+    wfArena[WfShiftJobBase(job1)].z = uintBitsToFloat(WF_JOB_FAIL);
+
+    // Forward: neighbor sample into this pixel's domain.
+    uint nSlot = RestirRegionOffset(RESTIR_SCRATCH_REGION) + nIdx;
+    vec4 nCore = pixelRes[nSlot].path.core;
+    if (nCore.x > 0.0 && nCore.y > 0.0)
+        WfShiftCreateJob(job0, nSlot, idx, false);
+
+    // Backward: the running aggregate into the neighbor's domain.
+    vec4 rCore = pixelRes[outSlot].path.core;
+    if (rCore.x > 0.0 && rCore.y > 0.0)
+        WfShiftCreateJob(job1, outSlot, nIdx, false);
+}

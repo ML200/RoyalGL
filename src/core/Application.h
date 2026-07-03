@@ -72,10 +72,16 @@ namespace RoyalGL
         // raw accumulation buffer - the tool for chasing fireflies.
         bool m_statsEnabled = false;
         uint32_t m_lastStatsSample = 0;
+        uint32_t m_statsFrame = 0;
         int m_statsInterval = 256; // ROYALGL_STATS_INTERVAL: samples between stat logs
         // ROYALGL_LOCK_CAMERA: ignore camera input so scripted soak tests
         // stay deterministic even if the window gets focus/mouse events.
         bool m_cameraLocked = false;
+        // ROYALGL_ORBIT=<deg/s>: scripted continuous yaw rotation - brings
+        // surfaces into view at grazing angles every frame, the repro case
+        // for temporal-reuse transients that locked-camera soaks can't see.
+        float m_orbitSpeed = 0.0f;
+        float m_orbitPhase = 0.0f;
 
         double m_lastMouseX = 0.0;
         double m_lastMouseY = 0.0;

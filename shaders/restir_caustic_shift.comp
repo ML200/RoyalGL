@@ -22,8 +22,6 @@
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-const float RESTIR_CONFIDENCE_CAP = 20.0;
-
 void main()
 {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
@@ -52,10 +50,17 @@ void main()
     uint dstIdx = RestirPixelIndex(res.pixel);
     if (gbuf[GBufCurOffset() + dstIdx].posDepth.w < 0.0) return;
 
-    // Pure-replay Jacobian (Eq. 53): base pdf product over shifted's.
+    // Pure-replay Jacobian (Eq. 53): base pdf product over shifted's. The
+    // symmetric support restriction matters here more than anywhere: the
+    // light-tree descent is anchored at the CAMERA, so while the camera
+    // moves the same seed can descend to a different light - a completely
+    // different path priced by an arbitrary pdf ratio. Unbounded, those
+    // ratios mint huge-W caustic reservoirs that persist ~confidence-cap
+    // frames (the "bright blotch on newly-visible surfaces" transient).
+    // restir_caustic_merge.comp applies the same test to the backward map.
     float baseReplayPdf = pixelRes[hSlot].caustic.meta.y;
     float J = baseReplayPdf / res.replayPdf;
-    if (isnan(J) || isinf(J) || J <= 0.0) return;
+    if (isnan(J) || isinf(J) || !RestirJacobianValid(J)) return;
 
     // omega of the shifted path: recomputed in the current domain (Phase 5)
     // or copied from the base.
@@ -65,5 +70,5 @@ void main()
               vec4(res.f, hCore.x),                        // shifted f, base W
               vec4(hCore.y, J, omega, res.replayPdf),      // base pHat, J, omega, new replayPdf
               tech, seed,
-              floatBitsToUint(min(hCore.z, RESTIR_CONFIDENCE_CAP)));
+              floatBitsToUint(min(hCore.z, RestirConfidenceCap())));
 }

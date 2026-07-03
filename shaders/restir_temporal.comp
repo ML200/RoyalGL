@@ -16,8 +16,6 @@
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-const float RESTIR_CONFIDENCE_CAP = 20.0;
-
 void main()
 {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
@@ -49,6 +47,7 @@ void main()
     vec2 prevPixF;
     ivec2 prevPix = ivec2(-1);
     bool histValid = false;
+    float histFade = 0.0;
     GBufferPixel gPrev;
     if (RestirPrevProject(gCur.posDepth.xyz, prevPixF))
     {
@@ -56,10 +55,32 @@ void main()
         if (prevPix.x >= 0 && prevPix.y >= 0 && prevPix.x < size.x && prevPix.y < size.y)
         {
             gPrev = gbuf[GBufPrevOffset() + RestirPixelIndex(prevPix)];
-            if (gPrev.posDepth.w >= 0.0 && GBufMaterial(gPrev) == GBufMaterial(gCur))
+            // Normal agreement mirrors the spatial pass: without it, a
+            // same-material surface at a very different orientation
+            // (silhouettes, grazing walls entering view) passes the
+            // position test and injects junk history.
+            if (gPrev.posDepth.w >= 0.0 && GBufMaterial(gPrev) == GBufMaterial(gCur)
+                && dot(gPrev.normalMat.xyz, gCur.normalMat.xyz) >= 0.9)
             {
                 float depthScale = max(gCur.posDepth.w, 1e-3);
-                histValid = length(gPrev.posDepth.xyz - gCur.posDepth.xyz) < 0.02 * depthScale;
+                // Depth-level test (the spatial pass's 10% relative-depth
+                // heuristic, made camera-motion-aware): gPrev.w is the ray
+                // t from the PREVIOUS camera, so compare it against the
+                // current point's distance to that camera - a naive
+                // |dPrev - dCur| would reject all history during a dolly.
+                float expPrevDepth = max(length(gCur.posDepth.xyz - uFrame.prevCamPos.xyz), 1e-3);
+                float sep = length(gPrev.posDepth.xyz - gCur.posDepth.xyz);
+                histValid = sep < 0.02 * depthScale
+                         && abs(gPrev.posDepth.w - expPrevDepth) < 0.1 * expPrevDepth;
+                // Anchor-distance confidence fade: the t=1 target function
+                // varies rapidly ALONG a grazing surface, so history from a
+                // spatially distant (but accepted) anchor gets
+                // proportionally less confidence - chained merges between
+                // far-apart anchors otherwise random-walk W into a bright
+                // transient. Sample-independent (G-buffer only) => the MIS
+                // partition stays exact; identical anchors => fade 1 (a
+                // static camera reproduces the old behavior bit-for-bit).
+                histFade = clamp(1.0 - sep / (0.02 * depthScale), 0.0, 1.0);
             }
         }
     }
@@ -77,7 +98,7 @@ void main()
     // sample survived - a NULL history (W=0) still weights the MIS terms,
     // otherwise paths reachable from the previous frame get double-counted.
     vec4 bCore = pixelRes[bSlot].path.core;
-    float cB = min(bCore.z, RESTIR_CONFIDENCE_CAP);
+    float cB = min(bCore.z, RestirConfidenceCap()) * histFade;
     float cA = aCore.z;
 
     // ------------------------------------- forward shift: B -> current ---
@@ -114,8 +135,10 @@ void main()
     // --------------------------------------------- balance heuristic -----
     // Candidate B evaluated at its shifted position y_B:
     //   pHat_from_B(y_B) = pHat_B(X_B) / J_B
+    // Both directions apply the SAME symmetric Jacobian support
+    // restriction (RestirJacobianValid) - see restir_common.glsl.
     float w_A = 0.0, w_B = 0.0;
-    if (pHatB_cur > 0.0 && SB.jacobian > 0.0)
+    if (pHatB_cur > 0.0 && RestirJacobianValid(SB.jacobian))
     {
         float pHatFromB = bCore.y / SB.jacobian;
         float mB = cB * pHatFromB / (cB * pHatFromB + cA * pHatB_cur);
@@ -123,7 +146,8 @@ void main()
     }
     if (aCore.y > 0.0)
     {
-        float pHatFromPrevA = pHatA_prev * JA_back; // pHat_prev(T^-1 A) |dT^-1/dA|
+        // pHat_prev(T^-1 A) |dT^-1/dA|
+        float pHatFromPrevA = RestirJacobianValid(JA_back) ? pHatA_prev * JA_back : 0.0;
         float mA = cA * aCore.y / (cA * aCore.y + cB * pHatFromPrevA);
         w_A = mA * aCore.y * aCore.x;
     }
@@ -131,7 +155,7 @@ void main()
     if (isnan(w_B) || isinf(w_B)) w_B = 0.0;
 
     float wSum = w_A + w_B;
-    float cOut = min(cA + cB, RESTIR_CONFIDENCE_CAP);
+    float cOut = min(cA + cB, RestirConfidenceCap());
 
     uint selRng = WangHash(idx * 9781u + uFrame.restirParams.z * 6151u + 0x3779FBB5u);
     if (selRng == 0u) selRng = 0x9E3779B9u;

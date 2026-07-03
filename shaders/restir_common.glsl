@@ -167,6 +167,26 @@ void RestirLightPdfs(uint lightIdx, float cosTheta, out float directPdfA, out fl
     emissionPdfW = directPdfA * max(cosTheta, 0.0) / PI;
 }
 
+// Confidence (M) cap for every reuse pass, user-adjustable (RenderSettings
+// ::restirConfidenceCap, uploaded in prevCamPos.w - the prev-camera vec4 w
+// components are otherwise unused). Bounds how many frames a temporal
+// chain effectively accumulates: higher = more reuse but longer-lived
+// correlation (a stale/outlier sample needs ~cap frames to wash out).
+float RestirConfidenceCap() { return max(uFrame.prevCamPos.w, 1.0); }
+
+// Symmetric support restriction on shift Jacobians: a shift whose |dT/dX|
+// falls outside [1/K, K] is treated as undefined. Unbiased - the forward
+// and inverse Jacobians are reciprocals, so both evaluations of a merge
+// (candidate weight and MIS backward term) restrict the SAME shift map
+// consistently. This kills the grazing-angle explosions where the
+// reconnection ratio (cos'/cos)*(d^2/d'^2) produces rare huge resampling
+// weights that then persist for ~confidence-cap frames as bright blotches.
+const float RESTIR_MAX_SHIFT_JACOBIAN = 10.0;
+bool RestirJacobianValid(float J)
+{
+    return J > (1.0 / RESTIR_MAX_SHIFT_JACOBIAN) && J < RESTIR_MAX_SHIFT_JACOBIAN;
+}
+
 uint RestirRegionOffset(uint region) { return region * RestirPixelCount(); }
 uint RestirFinalRegion() { return uFrame.restirParams.w; }        // parity
 uint RestirHistoryRegion() { return 1u - uFrame.restirParams.w; } // prev frame's final

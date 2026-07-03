@@ -26,6 +26,10 @@ namespace RoyalGL
 
         void Use() const;
         void Dispatch(GLuint groupsX, GLuint groupsY, GLuint groupsZ = 1) const;
+        // GPU-driven dispatch: reads (groupsX, groupsY, groupsZ) from the
+        // buffer bound to GL_DISPATCH_INDIRECT_BUFFER at the given byte
+        // offset (wavefront ReSTIR, see shaders/restir_wf_common.glsl).
+        void DispatchIndirect(GLintptr offset) const;
 
         void SetInt(const char* name, int value) const;
         void SetUint(const char* name, unsigned int value) const;

@@ -1,0 +1,84 @@
+#version 460 core
+#include "common.glsl"
+#include "restir_common.glsl"
+#include "restir_wf_common.glsl"
+#include "restir_wf_cam.glsl"
+// No light_tree/bdpt_common: this kernel neither traces nor samples lights,
+// and the storage-block budget (see restir_wf_common.glsl) is tight. The
+// two bdpt_common helpers it would use are inlined below (pinhole-only).
+
+// Wavefront camera RIS, stage 1: per-pixel setup (see restir_wf_cam.glsl).
+// Seeds the path state at the deterministic V-buffer hit (the megakernel's
+// pre-loop code), empties the output reservoir, and enqueues shade round 1
+// for every pixel with a valid primary hit - streaming compaction starts
+// here: primary misses never enter the pipeline.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void main()
+{
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= RestirPixelCount()) return;
+    ivec2 pixel = ivec2(int(idx % uFrame.frameInfo.x), int(idx / uFrame.frameInfo.x));
+
+    uint outSlot = RestirRegionOffset(RestirCandidateOutRegion()) + idx;
+    uint causticSlot = RestirRegionOffset(RestirFinalRegion()) + idx;
+
+    GBufferPixel g = gbuf[GBufCurOffset() + idx];
+    if (g.posDepth.w < 0.0)
+    {
+        // Primary miss: the resolve pass adds the background directly.
+        pixelRes[outSlot].path = RestirEmptyReservoir();
+        pixelRes[causticSlot].caustic = RestirEmptyCaustic();
+        return;
+    }
+
+    // Seeding identical to restir_camera.comp.
+    uint frameC = uFrame.restirParams.z;
+    uint camSeed = WangHash(uint(pixel.x) * 1973u + uint(pixel.y) * 9277u + frameC * 26699u + 7u);
+    uint risRng = WangHash(camSeed ^ 0x5f356495u);
+    if (risRng == 0u) risRng = 0x9E3779B9u;
+
+    pixelRes[outSlot].path = RestirEmptyReservoir();
+
+    vec3 x = g.posDepth.xyz;
+    vec3 n = g.normalMat.xyz;
+    vec3 wi = -RestirPrimaryRay(pixel).dir;
+
+    // Eye-side MIS seeds (t=1 pdf ratio at x_1) - megakernel's pre-loop.
+    bool haveLights = uFrame.lightInfo.x > 0u;
+    bool lightTracing = RestirLightTracingEnabled() && haveLights;
+    bool connections = RestirConnectionsEnabled() && haveLights;
+    float dT1 = 0.0, dVCM = 0.0;
+    if (lightTracing || connections)
+    {
+        vec3 v = x - uFrame.camPos.xyz;
+        float d2v = dot(v, v);
+        float cosAtCam = dot(v * inversesqrt(max(d2v, 1e-12)), uFrame.camForward.xyz);
+        float cosIn1 = abs(dot(n, wi));
+        if (cosAtCam > 1e-3 && cosIn1 > 1e-6 && lightTracing)
+        {
+            // = BdptImagePlaneDist() / BdptNumLightPaths(), pinhole branch.
+            float ipd = (float(uFrame.frameInfo.y) * 0.5) / uFrame.cameraParams.x;
+            float imagePointToCamDist = ipd / cosAtCam;
+            float cameraPdfW = (imagePointToCamDist * imagePointToCamDist) / cosAtCam;
+            dT1 = (float(uFrame.lightInfo.z) / cameraPdfW) * (d2v / cosIn1);
+            dVCM = dT1;
+        }
+    }
+
+    uint base = WfCamBase(idx);
+    wfArena[base + 0u] = vec4(x, g.normalMat.w);
+    wfArena[base + 1u] = vec4(n, uintBitsToFloat(0u));
+    wfArena[base + 2u] = vec4(wi, 1.0);
+    wfArena[base + 3u] = vec4(1.0, 1.0, 1.0, 1.0);
+    wfArena[base + 4u] = vec4(dVCM, 0.0, dT1, 0.0);
+    wfArena[base + 5u] = vec4(0.0, 0.0, uintBitsToFloat(risRng), uintBitsToFloat(camSeed));
+    // rc block (6..9) is only read once rcFound is set, which always
+    // rewrites it first; the candidate slots only need their weights
+    // cleared.
+    wfArena[base + WF_CAM_CND0].w = 0.0;
+    wfArena[base + WF_CAM_CND0 + WF_CAM_CND_STRIDE].w = 0.0;
+
+    WfAppend(WfCtrlShade(1u), WfCamShadeQBase(1u), idx);
+}

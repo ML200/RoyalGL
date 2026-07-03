@@ -1,0 +1,91 @@
+#version 460 core
+#include "common.glsl"
+#include "restir_common.glsl"
+#include "restir_wf_common.glsl"
+#include "restir_wf_shift.glsl"
+
+// Wavefront temporal reuse, stage 1: per-pixel setup (the megakernel
+// restir_temporal.comp's head). Reprojects the current primary hit,
+// validates the history surface, and creates the two shift jobs the
+// 2-candidate balance heuristic needs:
+//   job idx*2+0  forward:  history reservoir -> current pixel's domain
+//   job idx*2+1  backward: this frame's candidate -> previous pixel's domain
+// Pixels without a usable history write their pass-through result here and
+// never enter the shift pipeline (compaction). The per-pixel header
+// (wfArena[idx]) carries (prevPix, valid) to tmerge.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void main()
+{
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= RestirPixelCount()) return;
+    ivec2 size = ivec2(uFrame.frameInfo.xy);
+
+    uint inSlot = RestirRegionOffset(RESTIR_SCRATCH_REGION) + idx;
+    uint outSlot = RestirRegionOffset(RestirTemporalOutRegion()) + idx;
+
+    wfArena[idx] = vec4(0.0); // header: invalid until proven otherwise
+
+    GBufferPixel gCur = gbuf[GBufCurOffset() + idx];
+    if (gCur.posDepth.w < 0.0)
+    {
+        if (outSlot != inSlot) pixelRes[outSlot].path = pixelRes[inSlot].path;
+        return;
+    }
+
+    // ---------------------------------------------- history lookup -------
+    vec2 prevPixF;
+    ivec2 prevPix = ivec2(-1);
+    bool histValid = false;
+    float histFade = 0.0;
+    if (RestirPrevProject(gCur.posDepth.xyz, prevPixF))
+    {
+        prevPix = ivec2(prevPixF);
+        if (prevPix.x >= 0 && prevPix.y >= 0 && prevPix.x < size.x && prevPix.y < size.y)
+        {
+            GBufferPixel gPrev = gbuf[GBufPrevOffset() + RestirPixelIndex(prevPix)];
+            // Normal agreement mirrors the spatial pass (and the temporal
+            // megakernel) - rejects same-material different-orientation
+            // history at silhouettes / grazing surfaces.
+            if (gPrev.posDepth.w >= 0.0 && GBufMaterial(gPrev) == GBufMaterial(gCur)
+                && dot(gPrev.normalMat.xyz, gCur.normalMat.xyz) >= 0.9)
+            {
+                float depthScale = max(gCur.posDepth.w, 1e-3);
+                // Camera-motion-aware depth-level test + anchor-distance
+                // confidence fade - identical to the temporal megakernel
+                // (see the comments there).
+                float expPrevDepth = max(length(gCur.posDepth.xyz - uFrame.prevCamPos.xyz), 1e-3);
+                float sep = length(gPrev.posDepth.xyz - gCur.posDepth.xyz);
+                histValid = sep < 0.02 * depthScale
+                         && abs(gPrev.posDepth.w - expPrevDepth) < 0.1 * expPrevDepth;
+                histFade = clamp(1.0 - sep / (0.02 * depthScale), 0.0, 1.0);
+            }
+        }
+    }
+
+    if (!histValid)
+    {
+        // Disocclusion / off-screen: the candidate stands alone, m_A = 1.
+        if (outSlot != inSlot) pixelRes[outSlot].path = pixelRes[inSlot].path;
+        return;
+    }
+
+    uint prevIdx = RestirPixelIndex(prevPix);
+    wfArena[idx] = vec4(uintBitsToFloat(prevIdx), uintBitsToFloat(1u), histFade, 0.0);
+
+    uint bSlot = RestirRegionOffset(RestirHistoryRegion()) + prevIdx;
+    vec4 bCore = pixelRes[bSlot].path.core;
+    vec4 aCore = pixelRes[inSlot].path.core;
+
+    // Both jobs default to FAIL inside WfShiftCreateJob's meta write; jobs
+    // for null reservoirs are created failed so tmerge sees w = 0.
+    uint job0 = idx * 2u;
+    uint job1 = idx * 2u + 1u;
+    wfArena[WfShiftJobBase(job0)].z = uintBitsToFloat(WF_JOB_FAIL);
+    wfArena[WfShiftJobBase(job1)].z = uintBitsToFloat(WF_JOB_FAIL);
+    if (bCore.x > 0.0 && bCore.y > 0.0)
+        WfShiftCreateJob(job0, bSlot, idx, false);
+    if (aCore.x > 0.0 && aCore.y > 0.0)
+        WfShiftCreateJob(job1, inSlot, prevIdx, true);
+}

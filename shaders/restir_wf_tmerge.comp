@@ -1,0 +1,94 @@
+#version 460 core
+#include "common.glsl"
+#include "restir_common.glsl"
+#include "restir_wf_common.glsl"
+#include "restir_wf_shift.glsl"
+
+// Wavefront temporal reuse, stage 3: the 2-candidate generalized balance
+// heuristic merge (the megakernel restir_temporal.comp's tail), consuming
+// the two shift-job results. No rays. Pixels whose header is invalid were
+// finished by tinit (pass-through) and are skipped.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void main()
+{
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= RestirPixelCount()) return;
+
+    vec4 header = wfArena[idx];
+    if (floatBitsToUint(header.y) != 1u) return;
+    uint prevIdx = floatBitsToUint(header.x);
+
+    uint inSlot = RestirRegionOffset(RESTIR_SCRATCH_REGION) + idx;
+    uint outSlot = RestirRegionOffset(RestirTemporalOutRegion()) + idx;
+    uint bSlot = RestirRegionOffset(RestirHistoryRegion()) + prevIdx;
+
+    vec4 aCore = pixelRes[inSlot].path.core;
+    vec4 bCore = pixelRes[bSlot].path.core;
+    // header.z = anchor-distance confidence fade (see restir_wf_tinit.comp).
+    float cB = min(bCore.z, RestirConfidenceCap()) * header.z;
+    float cA = aCore.z;
+
+    // Forward shift result: history -> current domain.
+    uint jb0 = WfShiftJobBase(idx * 2u);
+    bool okB = WfJobOk(jb0);
+    float omegaB = WfJobOmega(jb0);
+    float pHatB_cur = okB ? omegaB * RestirLum(WfJobF(jb0)) : 0.0;
+    float JB = WfJobJacobian(jb0);
+
+    // Backward shift result: candidate -> previous domain.
+    uint jb1 = WfShiftJobBase(idx * 2u + 1u);
+    float pHatA_prev = 0.0;
+    float JA_back = 0.0;
+    if (WfJobOk(jb1))
+    {
+        pHatA_prev = WfJobOmega(jb1) * RestirLum(WfJobF(jb1));
+        JA_back = WfJobJacobian(jb1);
+    }
+
+    // --------------------------------------------- balance heuristic -----
+    // Symmetric Jacobian support restriction in both directions
+    // (RestirJacobianValid, restir_common.glsl) - identical to the
+    // megakernel restir_temporal.comp.
+    float w_A = 0.0, w_B = 0.0;
+    if (pHatB_cur > 0.0 && RestirJacobianValid(JB))
+    {
+        float pHatFromB = bCore.y / JB;
+        float mB = cB * pHatFromB / (cB * pHatFromB + cA * pHatB_cur);
+        w_B = mB * pHatB_cur * bCore.x * JB;
+    }
+    if (aCore.y > 0.0)
+    {
+        float pHatFromPrevA = RestirJacobianValid(JA_back) ? pHatA_prev * JA_back : 0.0;
+        float mA = cA * aCore.y / (cA * aCore.y + cB * pHatFromPrevA);
+        w_A = mA * aCore.y * aCore.x;
+    }
+    if (isnan(w_A) || isinf(w_A)) w_A = 0.0;
+    if (isnan(w_B) || isinf(w_B)) w_B = 0.0;
+
+    float wSum = w_A + w_B;
+    float cOut = min(cA + cB, RestirConfidenceCap());
+
+    uint selRng = WangHash(idx * 9781u + uFrame.restirParams.z * 6151u + 0x3779FBB5u);
+    if (selRng == 0u) selRng = 0x9E3779B9u;
+
+    if (wSum > 0.0 && RestirRand(selRng) * wSum <= w_B)
+    {
+        // History wins: adopt the shifted path in the current domain.
+        float Wnew = wSum / pHatB_cur;
+        if (isnan(Wnew) || isinf(Wnew)) Wnew = 0.0;
+        pixelRes[outSlot].path = pixelRes[bSlot].path;
+        pixelRes[outSlot].path.core = vec4(Wnew, pHatB_cur, cOut, bCore.w);
+        pixelRes[outSlot].path.fSeed.xyz = WfJobF(jb0);
+        pixelRes[outSlot].path.rcInfo = vec4(WfJobRcCos(jb0), WfJobRcDist2(jb0),
+                                             omegaB, WfJobReplayPdf(jb0));
+    }
+    else
+    {
+        float Wnew = (wSum > 0.0) ? wSum / aCore.y : 0.0;
+        if (isnan(Wnew) || isinf(Wnew)) Wnew = 0.0;
+        if (outSlot != inSlot) pixelRes[outSlot].path = pixelRes[inSlot].path;
+        pixelRes[outSlot].path.core = vec4(Wnew, aCore.y, cOut, aCore.w);
+    }
+}

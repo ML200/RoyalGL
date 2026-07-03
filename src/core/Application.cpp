@@ -95,6 +95,7 @@ namespace RoyalGL
         // Ignore all camera input - keeps scripted soak tests deterministic
         // even if the window is focused or the mouse passes over it.
         m_cameraLocked = (std::getenv("ROYALGL_LOCK_CAMERA") != nullptr);
+        if (const char* v = std::getenv("ROYALGL_ORBIT")) m_orbitSpeed = static_cast<float>(std::atof(v));
         if (const char* v = std::getenv("ROYALGL_LENS")) m_settings.cameraMode = (v[0] != '0') ? CameraMode::Lens : CameraMode::Pinhole;
         m_statsEnabled = (std::getenv("ROYALGL_STATS") != nullptr);
         if (const char* v = std::getenv("ROYALGL_STATS_INTERVAL")) m_statsInterval = std::max(std::atoi(v), 1);
@@ -246,10 +247,13 @@ namespace RoyalGL
         for (float v : lum) mean += v;
         mean /= static_cast<double>(lum.size());
         double relNoise = (noiseCount && mean > 0.0) ? (noiseSum / noiseCount) / mean : 0.0;
+        // Pixels brighter than any directly visible emitter (25): reservoir
+        // W blow-ups, not scene content.
+        size_t hot = lum.end() - std::upper_bound(lum.begin(), lum.end(), 30.0f);
 
         ROYALGL_LOG_INFO("Stats @", n, " samples: mean=", mean, " relNoise=", relNoise,
                          " p50=", pct(0.5), " p99=", pct(0.99), " p99.9=", pct(0.999),
-                         " p99.99=", pct(0.9999), " max=", lum.back());
+                         " p99.99=", pct(0.9999), " max=", lum.back(), " hot=", hot);
     }
 
     void Application::RunDenoiser()
@@ -302,6 +306,16 @@ namespace RoyalGL
 
             m_window->PollEvents();
             HandleCameraInput(dt);
+            // Scripted rocking yaw (works with LOCK_CAMERA - that only mutes
+            // input): direction flips every 2s, so scene walls repeatedly
+            // enter the frame edges at grazing angles - the repro case for
+            // temporal-reuse transients.
+            if (m_orbitSpeed != 0.0f)
+            {
+                m_orbitPhase += dt;
+                float sign = (std::fmod(m_orbitPhase, 4.0f) < 2.0f) ? 1.0f : -1.0f;
+                m_scene->camera.Look(m_orbitSpeed * dt * sign, 0.0f);
+            }
 
             bool materialsDirty = (m_scene->materials != m_lastMaterials);
             if (m_scene->camera != m_lastCamera || m_settings != m_lastSettings || materialsDirty)
@@ -339,7 +353,14 @@ namespace RoyalGL
             if (m_statsEnabled)
             {
                 uint32_t n = m_pathTracer->SampleCount();
-                if (n > 0 && n % m_statsInterval == 0 && n != m_lastStatsSample)
+                // Under a scripted orbit the camera change resets the sample
+                // count every frame, so trigger on the wall-clock frame
+                // counter instead (per-frame estimate statistics).
+                ++m_statsFrame;
+                bool fire = (m_orbitSpeed != 0.0f)
+                                ? (m_statsFrame % static_cast<uint32_t>(m_statsInterval) == 0)
+                                : (n > 0 && n % m_statsInterval == 0 && n != m_lastStatsSample);
+                if (fire)
                 {
                     m_lastStatsSample = n;
                     LogAccumulationStats();

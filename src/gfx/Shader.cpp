@@ -155,6 +155,11 @@ namespace RoyalGL
         GL_CALL(glDispatchCompute(groupsX, groupsY, groupsZ));
     }
 
+    void Shader::DispatchIndirect(GLintptr offset) const
+    {
+        GL_CALL(glDispatchComputeIndirect(offset));
+    }
+
     int Shader::UniformLocation(const char* name) const
     {
         return glGetUniformLocation(m_program, name);

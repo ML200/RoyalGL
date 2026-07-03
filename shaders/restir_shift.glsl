@@ -259,20 +259,40 @@ RestirShiftResult RestirShiftLightPath(uint baseSlot, GBufferPixel dstG, vec3 ds
                            * cosToCam / max(d2cam, 1e-12);
     f *= fbX * imageToSurface;
 
-    // omega_tau: COPIED, deliberately, even in Phase 5's recompute mode.
-    // The t=1 reverse shift re-anchors the free landing point x_1 onto the
-    // destination V-buffer hit - an approximation (paper Appendix A's pixel
-    // redistribution argument); soaks show that evaluating omega at the
-    // anchor AMPLIFIES that approximation's darkening under
-    // confidence-weighted chained reuse (temporal+spatial: -0.03% ->
-    // -0.06%), while copied omega partially cancels it. Camera-side (t>=2)
-    // and caustic (pure replay, exact identity) shifts do recompute.
-    // Revisit together with a proper pixel-filter (h_i) treatment of t=1
-    // candidates. The recursion state maintained above (mVCM/mVC/mLW) is
-    // what a recompute would consume - kept for that future fix:
-    //   nVCM = (d2/cosRc)/pd; nVC = (cosOut/pd)(mVCM + pr*mVC)/cosRc; ...
-    //   wL = (imageToSurface/N_L) * (nVCM + pdX*nVC); omega = 1/(1+wL)
+    // omega_tau: recomputed at the destination anchor when the Phase 5
+    // toggle is on (the recursion state mVCM/mVC/mLW maintained above is
+    // exactly what this consumes). Since t=1 candidates are ANCHORED AT
+    // CREATION, this recompute is the exact omega of the shifted path and
+    // agrees with candidate creation - the historical rationale for
+    // copying (the free-landing re-anchoring approximation) is gone.
+    // Copied omega is actively DANGEROUS under camera motion: with light
+    // tracing on, every technique's omega contains the t=1 competitor
+    // seed N_L*d^2/cosIn1, which varies violently with the anchor at
+    // grazing incidence - a stale omega then breaks the temporal balance-
+    // heuristic partition by orders of magnitude and W blows up on
+    // newly-visible sharp-angle surfaces for ~confidence-cap frames.
     res.omega = RS_BASE.rcInfo.z;
+    if (misRecompute)
+    {
+        float nVCM = (d2 / cosRc) / pd;
+        float nVC, nLW;
+        if (prevIsLight)
+        {
+            nVC = mVC / cosRc;
+            nLW = nVC;
+        }
+        else
+        {
+            nVC = (cosOut / pd) * (mVCM + pr * mVC) / cosRc;
+            nLW = (cosOut / pd) * ((s == 3u ? mVCM : 0.0) + pr * mLW) / cosRc;
+        }
+        float wL = (imageToSurface / float(BdptNumLightPaths()))
+            * (RestirConnectionsEnabled()
+                   ? (nVCM + pdX * nVC)
+                   : (s == 2u ? (nVCM + pdX * nLW) : (pdX * nLW)));
+        if (isnan(wL) || isinf(wL) || wL < 0.0) return res;
+        res.omega = 1.0 / (1.0 + wL);
+    }
 
     // Jacobians: reverse reconnection (Eq. 56, i=2) + random replay (Eq. 53).
     if (RS_BASE.rcInfo.x <= 0.0 || RS_BASE.rcInfo.y <= 0.0 || replayPdf <= 0.0) return res;
