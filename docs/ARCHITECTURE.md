@@ -17,11 +17,35 @@ src/
                FullscreenPass (tonemap blit). GPUTypes.h is the shared
                CPU/GPU data contract (see below).
   scene/       Camera, Material, Mesh (Vertex/Triangle), Scene (flattened
-               world-space triangle soup + materials + camera), GLTFLoader
-               (cgltf-based .gltf/.glb -> Scene).
-  bvh/         BVHBuilder: builds a tinybvh::BVH over Scene::triangles and
-               uploads everything the compute shader's leaf code needs
-               (nodes, triangle index permutation, triangle data, materials).
+               world-space triangle soup + materials + camera, grouped into
+               movable SceneInstances with UI-editable TRS transforms),
+               GLTFLoader (cgltf-based .gltf/.glb -> Scene).
+  bvh/         BVHBuilder: two-level acceleration structure - one cached
+               tinybvh BLAS per SceneInstance plus a small TLAS over the
+               instance AABBs, flattened into the single-level Wald BVH2
+               layout the GPU traversal consumes (TLAS leaves are copies of
+               the BLAS root nodes with offset pointers, so shaders needed
+               no changes). Moving an instance rebuilds only its BLAS + the
+               TLAS, ASYNCHRONOUSLY on a worker thread (the build is CPU-
+               side); the main thread applies the finished result and
+               re-uploads (nodes, triangle index permutation, triangle
+               data, materials). Frame-persistent ReSTIR surface data -
+               both G-buffer halves, reservoir reconnection vertices,
+               cached light-subpath ends, NEE light points - is stored in
+               instance OBJECT SPACE plus an instance id and converted
+               with the CURRENT matrices on load (RestirLoadGBuf /
+               RestirObjToWorld* in restir_common.glsl; matrices uploaded
+               per frame from the BVH builder's effective transforms, up
+               to 16 instances). Stored surfaces therefore TRACK moving
+               objects: reconnections target the vertex on the moved
+               instance instead of a phantom at its old placement (the
+               cause of the moving-object brightening transient), and
+               temporal anchors follow the geometry. Static scenes
+               round-trip exactly. Residual staleness (cached suffix
+               radiance from the old configuration) is bounded and washes
+               out within ~confidence-cap frames. See the "Instances" UI
+               window; ROYALGL_MOVE=<rad/s> exercises the pipeline
+               headlessly.
   pathtracer/  RenderSettings (UI-tunable knobs), PathTracer (compute shader
                dispatch + progressive accumulation image + per-frame UBO +
                the BDPT pass buffers), LightTree (4-wide SAOH light BVH over

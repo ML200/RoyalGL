@@ -32,7 +32,7 @@ void main()
     // When spatial reuse is enabled, outSlot == inSlot (both scratch), so
     // the pass-through copies are guarded.
     vec4 aCore = pixelRes[inSlot].path.core; // this frame's initial candidate
-    GBufferPixel gCur = gbuf[GBufCurOffset() + idx];
+    GBufferPixel gCur = RestirLoadGBuf(GBufCurOffset() + idx);
 
     if (gCur.posDepth.w < 0.0)
     {
@@ -54,7 +54,7 @@ void main()
         prevPix = ivec2(prevPixF);
         if (prevPix.x >= 0 && prevPix.y >= 0 && prevPix.x < size.x && prevPix.y < size.y)
         {
-            gPrev = gbuf[GBufPrevOffset() + RestirPixelIndex(prevPix)];
+            gPrev = RestirLoadGBuf(GBufPrevOffset() + RestirPixelIndex(prevPix));
             // Normal agreement mirrors the spatial pass: without it, a
             // same-material surface at a very different orientation
             // (silhouettes, grazing walls entering view) passes the

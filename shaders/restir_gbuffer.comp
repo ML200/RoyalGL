@@ -22,8 +22,15 @@ void main()
     Hit hit;
     if (IntersectScene(ray, hit))
     {
-        g.posDepth = vec4(ray.origin + ray.dir * hit.t, hit.t);
-        g.normalMat = vec4(hit.normal, PackGBufMatTri(hit.materialIndex, hit.triIndex));
+        // Stored in the hit instance's OBJECT SPACE (see RestirLoadGBuf in
+        // restir_common.glsl): the previous half read next frame then
+        // reconstructs the surface point wherever its instance is by then,
+        // so temporal anchors track moving objects.
+        uint inst = InstanceOfTriangle(hit.triIndex);
+        vec3 pos = ray.origin + ray.dir * hit.t;
+        g.posDepth = vec4(RestirWorldToObjPoint(inst, pos), hit.t);
+        g.normalMat = vec4(RestirWorldToObjNormal(inst, hit.normal),
+                           PackGBufMatTri(hit.materialIndex, hit.triIndex));
     }
     else
     {

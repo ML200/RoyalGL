@@ -212,7 +212,10 @@ namespace RoyalGL
                     glm::vec3 normal = (len > 1e-20f) ? cr / len : glm::vec3(0, 0, 1);
 
                     GPULightTriangle g{};
-                    g.p0 = glm::vec4(st.v0.position, 0.0f);
+                    // p0.w = source scene-triangle index (exact float for
+                    // <16.7M tris): lets ReSTIR map a sampled light point to
+                    // its instance for object-space reservoir storage.
+                    g.p0 = glm::vec4(st.v0.position, static_cast<float>(tmp[i].sceneTri));
                     g.p1 = glm::vec4(st.v1.position, 0.0f);
                     g.p2 = glm::vec4(st.v2.position, 0.0f);
                     g.normalArea = glm::vec4(normal, area);

@@ -27,7 +27,7 @@ void main()
     ivec2 pixel = ivec2(int(idx % uFrame.frameInfo.x), int(idx / uFrame.frameInfo.x));
 
     uint outSlot = RestirRegionOffset(RestirFinalRegion()) + idx;
-    GBufferPixel gCur = gbuf[GBufCurOffset() + idx];
+    GBufferPixel gCur = RestirLoadGBuf(GBufCurOffset() + idx);
 
     if (uWfRound == 0u)
     {
@@ -56,7 +56,7 @@ void main()
     if (nbr == pixel || nbr.x < 0 || nbr.y < 0 || nbr.x >= size.x || nbr.y >= size.y) return;
 
     uint nIdx = RestirPixelIndex(nbr);
-    GBufferPixel gN = gbuf[GBufCurOffset() + nIdx];
+    GBufferPixel gN = RestirLoadGBuf(GBufCurOffset() + nIdx);
     if (gN.posDepth.w < 0.0) return;
     if (GBufMaterial(gN) != GBufMaterial(gCur)) return;
     // Surface similarity heuristics (domain choice, sample-independent).

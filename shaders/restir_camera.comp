@@ -81,7 +81,7 @@ void main()
 
     uint causticSlot = RestirRegionOffset(RestirFinalRegion()) + idx;
 
-    GBufferPixel g = gbuf[GBufCurOffset() + idx];
+    GBufferPixel g = RestirLoadGBuf(GBufCurOffset() + idx);
     if (g.posDepth.w < 0.0)
     {
         // Primary miss: the resolve pass adds the background directly.
@@ -161,8 +161,9 @@ void main()
     // predecessor pair (x_{r-1}, x_r) is both-connectable.
     bool rcFound = false;
     uint rcIdx = 0u;
-    vec3 rcPos = vec3(0.0), rcNrm = vec3(0.0);
+    vec3 rcPos = vec3(0.0), rcNrm = vec3(0.0); // OBJECT space (see restir_common.glsl)
     uint rcMat = NO_MATERIAL;
+    uint rcInst = 0u;
     float rcBaseCos = 0.0, rcBaseDist2 = 0.0;
     float replayPdfBase = 1.0;  // pdf product over scatters at vertices 1..r-2
     vec3 fArriveRc = vec3(1.0); // f at arrival of x_r (prefix incl. scatter at x_{r-1})
@@ -184,10 +185,13 @@ void main()
         {
             rcFound = true;
             rcIdx = pathLen;
-            rcPos = x;
             rcMat = matId;
-            // Oriented toward the base predecessor's side.
-            rcNrm = (dot(n, wi) >= 0.0) ? n : -n;
+            // Stored in the vertex's instance object space so the
+            // reconnection target tracks a moving instance; oriented
+            // toward the base predecessor's side.
+            rcInst = InstanceOfTriangle(triIdx);
+            rcPos = RestirWorldToObjPoint(rcInst, x);
+            rcNrm = RestirWorldToObjNormal(rcInst, (dot(n, wi) >= 0.0) ? n : -n);
             rcBaseCos = abs(dot(n, wi));
             rcBaseDist2 = lastEdgeDist2;
             // replayPdfBase = scatters 1..r-2 = pProd at arrival of x_{r-1}.
@@ -243,7 +247,7 @@ void main()
                         {
                             SEL.rcInfo = vec4(rcBaseCos, rcBaseDist2, omega, replayPdfBase);
                             SEL.rcPosMat = vec4(rcPos, uintBitsToFloat(rcMat));
-                            SEL.rcNormal = vec4(rcNrm, 0.0);
+                            SEL.rcNormal = vec4(rcNrm, uintBitsToFloat(rcInst));
                             SEL.rcLsuf = vec4(SafeDiv(fCand, fArriveRc), 0.0);
                             // MIS cache (restir_common.glsl): no competitors
                             // -> constant denominator 1; rc at the emitter
@@ -342,7 +346,7 @@ void main()
                                 {
                                     SEL.rcInfo = vec4(rcBaseCos, rcBaseDist2, omega, replayPdfBase);
                                     SEL.rcPosMat = vec4(rcPos, uintBitsToFloat(rcMat));
-                                    SEL.rcNormal = vec4(rcNrm, 0.0);
+                                    SEL.rcNormal = vec4(rcNrm, uintBitsToFloat(rcInst));
                                     SEL.rcLsuf = vec4(SafeDiv(fCand, fArriveRc), 0.0);
                                     // MIS cache: split at the NEE vertex
                                     // itself (rc == x_b) or fold the suffix.
@@ -359,9 +363,15 @@ void main()
                                 }
                                 else
                                 {
+                                    // Light point stored in ITS instance's
+                                    // object space (movable emitters).
+                                    uint liInst = InstanceOfTriangle(uint(lt.p0.w + 0.5));
                                     SEL.rcInfo = vec4(cosAtLight, dist2, omega, pProd);
-                                    SEL.rcPosMat = vec4(lightPos, uintBitsToFloat(NO_MATERIAL));
-                                    SEL.rcNormal = vec4(lt.normalArea.xyz, 0.0); // emitting side
+                                    SEL.rcPosMat = vec4(RestirWorldToObjPoint(liInst, lightPos),
+                                                        uintBitsToFloat(NO_MATERIAL));
+                                    SEL.rcNormal = vec4( // emitting side
+                                        RestirWorldToObjNormal(liInst, lt.normalArea.xyz),
+                                        uintBitsToFloat(liInst));
                                     SEL.rcLsuf = vec4(lt.emissionWeight.rgb, 0.0);
                                     // Light-point rc: the shift recomputes
                                     // the whole split-vertex weight; cache
@@ -389,7 +399,8 @@ void main()
             uint k = min(uint(RandomFloat() * float(lvcCount)), lvcCount - 1u);
             LightVertex lv = lightVerts[k];
             uint lvBits = floatBitsToUint(lv.tputMat.w);
-            uint lightLen = lvBits & 0xFFu; // light subpath segments (y_0..y_{s-1})
+            uint lightLen = lvBits & 0xFu;        // matId(8)|inst(4)|len(4)
+            uint lightInst = (lvBits >> 4) & 0xFu;
             uint lightMat = lvBits >> 8;
             float pLight = lv.wiLen.w;
 
@@ -441,7 +452,7 @@ void main()
                                     flags |= RESTIR_FLAG_RCVALID | ((rcIdx & 0xFu) << 4);
                                     SEL.rcInfo = vec4(rcBaseCos, rcBaseDist2, omega, replayPdfBase);
                                     SEL.rcPosMat = vec4(rcPos, uintBitsToFloat(rcMat));
-                                    SEL.rcNormal = vec4(rcNrm, 0.0);
+                                    SEL.rcNormal = vec4(rcNrm, uintBitsToFloat(rcInst));
                                     SEL.rcLsuf = vec4(SafeDiv(fCand, fArriveRc), 0.0);
                                     // MIS cache: split at the connection
                                     // vertex (rc == z_{t-1}) or fold the
@@ -464,8 +475,12 @@ void main()
                                     SEL.rcInfo = vec4(0.0, 0.0, omega, pProd);
                                     vec3 nly = (dot(lv.normalDvc.xyz, lv.wiLen.xyz) >= 0.0)
                                                    ? lv.normalDvc.xyz : -lv.normalDvc.xyz;
-                                    SEL.lyPosMat = vec4(lv.posDvcm.xyz, 0.0);
-                                    SEL.lyNormal = vec4(nly, 0.0);
+                                    // Object space + instance id (movable).
+                                    SEL.lyPosMat = vec4(
+                                        RestirWorldToObjPoint(lightInst, lv.posDvcm.xyz), 0.0);
+                                    SEL.lyNormal = vec4(
+                                        RestirWorldToObjNormal(lightInst, nly),
+                                        uintBitsToFloat(lightInst));
                                     SEL.lyTput = vec4(fLight * lv.tputMat.xyz, 0.0);
                                     // MIS cache: the light side's fixed
                                     // ratio sum (wLight = camDirPdfA'*this).
@@ -558,7 +573,7 @@ void main()
                     {
                         SEL.rcInfo = vec4(rcBaseCos, rcBaseDist2, 1.0, replayPdfBase);
                         SEL.rcPosMat = vec4(rcPos, uintBitsToFloat(rcMat));
-                        SEL.rcNormal = vec4(rcNrm, 0.0);
+                        SEL.rcNormal = vec4(rcNrm, uintBitsToFloat(rcInst));
                         SEL.rcLsuf = vec4(SafeDiv(fCand, fArriveRc), 0.0);
                         SEL.misCache = vec4(1.0, 0.0, 0.0, 0.0); // env: no competitors
                     }

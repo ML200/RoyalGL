@@ -51,20 +51,25 @@ struct PathReservoir
                   // by shifts) and x/y describe the edge (y_{s-2}, y_{s-1});
                   // w covers the replayed light samplers (pick*area for s=2,
                   // everything up to the arrival of y_{s-2} otherwise).
-    vec4 rcPosMat;// xyz=reconnection vertex x_r world position, w=materialIndex
+    vec4 rcPosMat;// xyz=reconnection vertex x_r position in its instance's
+                  // OBJECT SPACE (converted with the current matrices on
+                  // load, so it tracks a moving instance), w=materialIndex
                   // (uint bits; NO_MATERIAL for an NEE light point)
-    vec4 rcNormal;// xyz=shading normal at x_r, oriented toward the valid
-                  // (observer) side: a shifted predecessor x'_{r-1} must have
-                  // dot(rcNormal, dirToPrev) > 0, w unused
+    vec4 rcNormal;// xyz=OBJECT-SPACE shading normal at x_r, oriented toward
+                  // the valid (observer) side: a shifted predecessor
+                  // x'_{r-1} must have dot(worldNormal, dirToPrev) > 0,
+                  // w=uintBits(instance id; >= instInfo.x = static)
     vec4 rcLsuf;  // xyz=L_suf: radiance leaving x_r toward x_{r-1} (direction-
                   // independent for Lambertian x_r / one-sided emitters),
                   // w unused. For s>=2 paths with an interior reconnection
                   // vertex this transparently covers the connection edge
                   // and the whole light subpath (the suffix is fixed).
     vec4 lyPosMat;// s>=2 LIGHTRC paths (camera prefix has no connectable
-                  // pair): xyz = light subpath end y_{s-1} position, w unused
-    vec4 lyNormal;// xyz = shading normal at y_{s-1}, oriented toward the
-                  // camera-side vertex (valid observers), w unused
+                  // pair): xyz = light subpath end y_{s-1} position in its
+                  // instance's OBJECT SPACE, w unused
+    vec4 lyNormal;// xyz = OBJECT-SPACE shading normal at y_{s-1}, oriented
+                  // toward the camera-side vertex (valid observers),
+                  // w=uintBits(instance id)
     vec4 lyTput;  // xyz = rho_y * fLightNum: every light-side factor of f
                   // except the connection geometry term, w unused
     vec4 misCache;// Recursive reconnection MIS cache (Phase 5): the shifted
@@ -124,6 +129,56 @@ layout(std430, binding = 0) restrict buffer GBufferSSBO { GBufferPixel gbuf[]; }
 uint GBufMaterial(GBufferPixel g) { return floatBitsToUint(g.normalMat.w) >> 24; }
 uint GBufTriangle(GBufferPixel g) { return floatBitsToUint(g.normalMat.w) & 0x00FFFFFFu; }
 float PackGBufMatTri(uint matId, uint triIdx) { return uintBitsToFloat((matId << 24) | (triIdx & 0x00FFFFFFu)); }
+
+// ------------------------------------- object-space surface storage ------
+// Frame-persistent surface data (both G-buffer halves, reservoir
+// reconnection vertices, cached light-subpath ends, NEE light points) is
+// stored in instance OBJECT SPACE and converted with the CURRENT instance
+// matrices on load. The same stored bytes therefore track a moving object:
+// the previous G-buffer half read next frame reconstructs the surface
+// point where the object is NOW, and reconnections target the vertex ON
+// the moved instance instead of a phantom at its old placement (the
+// "giga-brightening" transient). Static scenes round-trip exactly
+// (identity matrices are uploaded until something moves). Instance ids >=
+// instInfo.x are treated as static world space (also the >16-instance
+// fallback: the host uploads count 0).
+vec3 RestirObjToWorldPoint(uint inst, vec3 p)
+{
+    if (inst >= uFrame.instInfo.x) return p;
+    return vec3(uFrame.instToWorld[inst] * vec4(p, 1.0));
+}
+vec3 RestirObjToWorldNormal(uint inst, vec3 n)
+{
+    if (inst >= uFrame.instInfo.x) return n;
+    // Rigid + uniform scale (SceneInstance TRS): normalize instead of the
+    // inverse transpose.
+    return normalize(mat3(uFrame.instToWorld[inst]) * n);
+}
+vec3 RestirWorldToObjPoint(uint inst, vec3 p)
+{
+    if (inst >= uFrame.instInfo.x) return p;
+    return vec3(uFrame.instToObject[inst] * vec4(p, 1.0));
+}
+vec3 RestirWorldToObjNormal(uint inst, vec3 n)
+{
+    if (inst >= uFrame.instInfo.x) return n;
+    return normalize(mat3(uFrame.instToObject[inst]) * n);
+}
+
+// G-buffer load: positions/normals are STORED in object space
+// (restir_gbuffer.comp) and converted here with the current matrices -
+// use this instead of raw gbuf[] indexing everywhere.
+GBufferPixel RestirLoadGBuf(uint slot)
+{
+    GBufferPixel g = gbuf[slot];
+    if (g.posDepth.w >= 0.0)
+    {
+        uint inst = InstanceOfTriangle(GBufTriangle(g));
+        g.posDepth.xyz = RestirObjToWorldPoint(inst, g.posDepth.xyz);
+        g.normalMat.xyz = RestirObjToWorldNormal(inst, g.normalMat.xyz);
+    }
+    return g;
+}
 
 uint RestirPixelIndex(ivec2 p) { return uint(p.y) * uFrame.frameInfo.x + uint(p.x); }
 uint RestirPixelCount() { return uFrame.frameInfo.x * uFrame.frameInfo.y; }

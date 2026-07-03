@@ -76,7 +76,7 @@ float WfDstIpd(bool isPrev)
 }
 GBufferPixel WfDstG(uint dstIdx, bool isPrev)
 {
-    return gbuf[(isPrev ? GBufPrevOffset() : GBufCurOffset()) + dstIdx];
+    return RestirLoadGBuf((isPrev ? GBufPrevOffset() : GBufCurOffset()) + dstIdx);
 }
 
 void WfJobFail(uint jb)

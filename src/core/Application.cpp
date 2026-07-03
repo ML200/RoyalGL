@@ -96,6 +96,7 @@ namespace RoyalGL
         // even if the window is focused or the mouse passes over it.
         m_cameraLocked = (std::getenv("ROYALGL_LOCK_CAMERA") != nullptr);
         if (const char* v = std::getenv("ROYALGL_ORBIT")) m_orbitSpeed = static_cast<float>(std::atof(v));
+        if (const char* v = std::getenv("ROYALGL_MOVE")) m_moveTestSpeed = static_cast<float>(std::atof(v));
         if (const char* v = std::getenv("ROYALGL_LENS")) m_settings.cameraMode = (v[0] != '0') ? CameraMode::Lens : CameraMode::Pinhole;
         m_statsEnabled = (std::getenv("ROYALGL_STATS") != nullptr);
         if (const char* v = std::getenv("ROYALGL_STATS_INTERVAL")) m_statsInterval = std::max(std::atoi(v), 1);
@@ -124,6 +125,9 @@ namespace RoyalGL
             if (GLTFLoader::Load(path, loadedScene))
             {
                 *m_scene = std::move(loadedScene);
+                // glTF scenes arrive flattened; register the whole file as
+                // one movable instance.
+                m_scene->RegisterInstance(std::filesystem::path(path).filename().string(), 0);
                 loaded = true;
             }
             else
@@ -146,13 +150,14 @@ namespace RoyalGL
                 glass.baseColor = glm::vec3(0.98f, 0.98f, 0.98f);
                 glass.type = MaterialType::Glass;
                 glass.ior = 1.5f;
-                m_scene->MergeInstance(duck, glm::vec3(0.4f, 0.0f, 0.2f), 1.0f, glass);
+                m_scene->MergeInstance(duck, glm::vec3(0.4f, 0.0f, 0.2f), 1.0f, glass, "Glass duck");
             }
             else
             {
                 ROYALGL_LOG_WARN("Application: Duck.glb not found, fallback scene has no glass object.");
             }
         }
+        m_instanceDirty.assign(m_scene->instances.size(), false);
     }
 
     void Application::OnFramebufferResize(int width, int height)
@@ -316,6 +321,15 @@ namespace RoyalGL
                 float sign = (std::fmod(m_orbitPhase, 4.0f) < 2.0f) ? 1.0f : -1.0f;
                 m_scene->camera.Look(m_orbitSpeed * dt * sign, 0.0f);
             }
+            // Scripted instance move (ROYALGL_MOVE=<rad/s>): oscillates the
+            // last instance's X position - exercises the async BLAS/TLAS
+            // rebuild pipeline exactly like UI transform edits do.
+            if (m_moveTestSpeed != 0.0f && !m_scene->instances.empty())
+            {
+                m_movePhase += dt * m_moveTestSpeed;
+                m_scene->instances.back().position.x = 0.5f * std::sin(m_movePhase);
+                if (!m_instanceDirty.empty()) m_instanceDirty.back() = true;
+            }
 
             bool materialsDirty = (m_scene->materials != m_lastMaterials);
             if (m_scene->camera != m_lastCamera || m_settings != m_lastSettings || materialsDirty)
@@ -357,7 +371,7 @@ namespace RoyalGL
                 // count every frame, so trigger on the wall-clock frame
                 // counter instead (per-frame estimate statistics).
                 ++m_statsFrame;
-                bool fire = (m_orbitSpeed != 0.0f)
+                bool fire = (m_orbitSpeed != 0.0f || m_moveTestSpeed != 0.0f)
                                 ? (m_statsFrame % static_cast<uint32_t>(m_statsInterval) == 0)
                                 : (n > 0 && n % m_statsInterval == 0 && n != m_lastStatsSample);
                 if (fire)
@@ -380,6 +394,41 @@ namespace RoyalGL
             if (result.denoiseRequested) RunDenoiser();
             if (result.exportRequested) ExportPNG(result.exportPath);
             m_ui->EndFrame();
+
+            // ----------------------- async instance-move BVH rebuilds -----
+            // UI edits only touch the instance TRS; the world triangles +
+            // BLAS + TLAS are rebuilt on a worker thread (the build is CPU-
+            // side), so dragging never hitches the render loop. Rendering
+            // keeps using the previous consistent BVH until PumpAsync lands
+            // the new one; edits arriving mid-build are coalesced through
+            // the dirty flags and picked up by the next job.
+            if (result.instanceMoved >= 0 &&
+                result.instanceMoved < static_cast<int>(m_instanceDirty.size()))
+                m_instanceDirty[result.instanceMoved] = true;
+            if (m_bvh->PumpAsync(*m_scene))
+            {
+                // New geometry landed: emissive triangles may have moved
+                // (the light tree is cheap) and accumulation restarts. The
+                // ReSTIR reservoirs are kept: shifts re-trace prefixes in
+                // the new scene and their bijectivity/occlusion checks
+                // reject most stale reuse; residual staleness (cached
+                // suffix data referencing the old placement) washes out
+                // within ~confidence-cap frames - the accepted speed/
+                // correctness tradeoff (the paper-faithful full re-trace
+                // was measured too slow).
+                m_lightTree->Build(*m_scene);
+                m_pathTracer->Reset();
+            }
+            if (!m_bvh->AsyncBusy())
+            {
+                for (size_t i = 0; i < m_instanceDirty.size(); ++i)
+                {
+                    if (!m_instanceDirty[i]) continue;
+                    if (m_bvh->RequestInstanceRebuild(*m_scene, i))
+                        m_instanceDirty[i] = false;
+                    break;
+                }
+            }
 
             m_window->SwapBuffers();
         }

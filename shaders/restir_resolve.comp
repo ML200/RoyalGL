@@ -21,7 +21,7 @@ void main()
     if (pixel.x >= size.x || pixel.y >= size.y) return;
 
     uint idx = RestirPixelIndex(pixel);
-    GBufferPixel g = gbuf[GBufCurOffset() + idx];
+    GBufferPixel g = RestirLoadGBuf(GBufCurOffset() + idx);
 
     vec3 color;
     if (g.posDepth.w < 0.0)

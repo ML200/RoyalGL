@@ -37,7 +37,7 @@ void main()
     // mirrored in registers.
     pixelRes[outSlot].path = pixelRes[RestirRegionOffset(RESTIR_SCRATCH_REGION) + idx].path;
     vec4 rCore = pixelRes[outSlot].path.core;
-    GBufferPixel gCur = gbuf[GBufCurOffset() + idx];
+    GBufferPixel gCur = RestirLoadGBuf(GBufCurOffset() + idx);
 
     if (gCur.posDepth.w < 0.0) return;
 
@@ -61,7 +61,7 @@ void main()
         if (nbr == pixel || nbr.x < 0 || nbr.y < 0 || nbr.x >= size.x || nbr.y >= size.y) continue;
 
         uint nIdx = RestirPixelIndex(nbr);
-        GBufferPixel gN = gbuf[GBufCurOffset() + nIdx];
+        GBufferPixel gN = RestirLoadGBuf(GBufCurOffset() + nIdx);
         if (gN.posDepth.w < 0.0) continue;
         if (GBufMaterial(gN) != GBufMaterial(gCur)) continue;
         // Surface similarity heuristics (domain choice, sample-independent).

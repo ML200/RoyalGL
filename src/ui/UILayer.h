@@ -16,6 +16,10 @@ namespace RoyalGL
         bool materialsChanged = false;
         bool denoiseRequested = false;
         bool exportRequested = false;
+        // Index of a scene instance whose transform the user edited this
+        // frame (-1 = none). Application coalesces these into async BVH
+        // rebuilds.
+        int instanceMoved = -1;
         std::string exportPath;
     };
 

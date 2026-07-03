@@ -42,7 +42,7 @@ void main()
     uint idx = RestirPixelIndex(pixel);
     uint slot = RestirRegionOffset(RestirFinalRegion()) + idx;
 
-    GBufferPixel gCur = gbuf[GBufCurOffset() + idx];
+    GBufferPixel gCur = RestirLoadGBuf(GBufCurOffset() + idx);
     if (gCur.posDepth.w < 0.0) return; // canonical (empty) stands
 
     // OCCUPANCY: field-wise reads by slot (see restir_caustic_shift.comp).
@@ -146,7 +146,7 @@ void main()
         if (prevPix.x >= 0 && prevPix.y >= 0 && prevPix.x < size.x && prevPix.y < size.y)
         {
             uint pIdx = RestirPixelIndex(prevPix);
-            GBufferPixel gPrev = gbuf[GBufPrevOffset() + pIdx];
+            GBufferPixel gPrev = RestirLoadGBuf(GBufPrevOffset() + pIdx);
             // Same surface validation as the regular temporal pass,
             // including the normal-agreement and depth-level tests.
             float expPrevDepth = max(length(gCur.posDepth.xyz - uFrame.prevCamPos.xyz), 1e-3);

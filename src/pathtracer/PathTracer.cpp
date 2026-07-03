@@ -248,6 +248,26 @@ namespace RoyalGL
         frame.restirParams = glm::uvec4(static_cast<uint32_t>(settings.restirDebugView),
                                         restirFlags, m_frameCounter, m_restirParity);
 
+        // Instance transforms for object-space surface storage (see
+        // GPUTypes.h): the EFFECTIVE matrices track the geometry actually
+        // in the buffers (async rebuilds lag the UI value), so stored
+        // object-space anchors always convert back onto the traced
+        // geometry. Scenes with more instances than the table disable the
+        // machinery (count 0 -> everything treated as static world space).
+        const std::vector<glm::mat4>& instMats = bvh.EffectiveInstanceMatrices();
+        const std::vector<uint32_t>& instFirst = bvh.InstanceFirstTriangles();
+        size_t nInst = (instMats.size() <= static_cast<size_t>(GPUFrameUBO::kMaxRestirInstances))
+                           ? instMats.size() : 0;
+        frame.instInfo = glm::uvec4(static_cast<uint32_t>(nInst), 0u, 0u, 0u);
+        for (size_t i = 0; i < 16; ++i)
+            frame.instTable[i / 4][i % 4] =
+                (i < nInst) ? instFirst[i] : 0xFFFFFFFFu;
+        for (size_t i = 0; i < static_cast<size_t>(GPUFrameUBO::kMaxRestirInstances); ++i)
+        {
+            frame.instToWorld[i] = (i < nInst) ? instMats[i] : glm::mat4(1.0f);
+            frame.instToObject[i] = (i < nInst) ? glm::inverse(instMats[i]) : glm::mat4(1.0f);
+        }
+
         m_frameUBO.Upload(&frame, sizeof(GPUFrameUBO), GL_DYNAMIC_DRAW);
         m_frameUBO.BindBase();
 

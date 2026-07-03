@@ -169,7 +169,12 @@ void main()
                 LightVertex v;
                 v.posDvcm = vec4(hitPos, dVCM);
                 v.normalDvc = vec4(hit.normal, dVC);
-                v.tputMat = vec4(fNum, uintBitsToFloat((hit.materialIndex << 8) | pathLength));
+                // matId(8) | instance(4) | pathLength(4): the instance id
+                // lets s>=2 reservoirs cache y_{s-1} in object space.
+                v.tputMat = vec4(fNum, uintBitsToFloat(
+                    (hit.materialIndex << 8)
+                    | (min(InstanceOfTriangle(hit.triIndex), 15u) << 4)
+                    | (pathLength & 0xFu)));
                 v.wiLen = vec4(wi, pProd);
                 lightVerts[slot] = v;
             }
@@ -190,7 +195,7 @@ void main()
             if (dist2 > 1e-12 && BdptDirToPixel(-dirToCam, pixel, cosAtCam))
             {
                 uint pixIdx = RestirPixelIndex(pixel);
-                GBufferPixel g = gbuf[GBufCurOffset() + pixIdx];
+                GBufferPixel g = RestirLoadGBuf(GBufCurOffset() + pixIdx);
                 bool caustic = prevIsDelta;
 
                 // Candidates landing on primary-miss pixels are dropped: the

@@ -419,13 +419,17 @@ RestirShiftResult RestirShiftPath(uint baseSlot, GBufferPixel dstG, vec3 dstWi,
             // (geometry term) but contributes NO Jacobian, unlike the
             // camera-side reconnection below.
             if (isDelta) return res; // guaranteed by mask, kept for clarity
-            vec3 toY = RS_BASE.lyPosMat.xyz - x;
+            // Object-space cached light end (tracks a moving instance).
+            uint lyInst = floatBitsToUint(RS_BASE.lyNormal.w);
+            vec3 lyPosW = RestirObjToWorldPoint(lyInst, RS_BASE.lyPosMat.xyz);
+            vec3 lyNrmW = RestirObjToWorldNormal(lyInst, RS_BASE.lyNormal.xyz);
+            vec3 toY = lyPosW - x;
             float d2y = dot(toY, toY);
             if (d2y <= 1e-12) return res;
             float distY = sqrt(d2y);
             vec3 dirY = toY / distY;
 
-            float cosY = dot(RS_BASE.lyNormal.xyz, -dirY);
+            float cosY = dot(lyNrmW, -dirY);
             if (cosY <= 1e-6) return res; // wrong side of y_{s-1}
 
             float pdfDirY, pdfRevY, cosOutY;
@@ -463,7 +467,14 @@ RestirShiftResult RestirShiftPath(uint baseSlot, GBufferPixel dstG, vec3 dstWi,
         {
             // ------------------------------------------ reconnection -----
             if (isDelta) return res; // guaranteed by mask, kept for clarity
-            vec3 toRc = RS_BASE.rcPosMat.xyz - x;
+            // The rc vertex is stored in its instance's object space:
+            // converting with the CURRENT matrices makes the reconnection
+            // target track a moving instance instead of ghosting at its
+            // old placement.
+            uint rcInst = floatBitsToUint(RS_BASE.rcNormal.w);
+            vec3 rcPosW = RestirObjToWorldPoint(rcInst, RS_BASE.rcPosMat.xyz);
+            vec3 rcNrmW = RestirObjToWorldNormal(rcInst, RS_BASE.rcNormal.xyz);
+            vec3 toRc = rcPosW - x;
             float d2 = dot(toRc, toRc);
             if (d2 <= 1e-12) return res;
             float dist = sqrt(d2);
@@ -472,7 +483,7 @@ RestirShiftResult RestirShiftPath(uint baseSlot, GBufferPixel dstG, vec3 dstWi,
             // The stored normal is oriented toward valid observers; the new
             // predecessor must be on that side (Lambertian hemisphere /
             // emitter one-sidedness).
-            float cosRc = dot(RS_BASE.rcNormal.xyz, -dir);
+            float cosRc = dot(rcNrmW, -dir);
             if (cosRc <= 1e-6) return res;
 
             float pdfDir, pdfRev, cosOut;

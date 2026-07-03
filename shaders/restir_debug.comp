@@ -30,7 +30,7 @@ void main()
     if (pixel.x >= size.x || pixel.y >= size.y) return;
 
     uint pixIdx = RestirPixelIndex(pixel);
-    GBufferPixel g = gbuf[GBufCurOffset() + pixIdx];
+    GBufferPixel g = RestirLoadGBuf(GBufCurOffset() + pixIdx);
     uint resIdx = RestirRegionOffset(RestirFinalRegion()) + pixIdx;
     bool hit = g.posDepth.w >= 0.0;
 

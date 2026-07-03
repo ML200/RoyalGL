@@ -24,7 +24,7 @@ void main()
     uint outSlot = RestirRegionOffset(RestirCandidateOutRegion()) + idx;
     uint causticSlot = RestirRegionOffset(RestirFinalRegion()) + idx;
 
-    GBufferPixel g = gbuf[GBufCurOffset() + idx];
+    GBufferPixel g = RestirLoadGBuf(GBufCurOffset() + idx);
     if (g.posDepth.w < 0.0)
     {
         // Primary miss: the resolve pass adds the background directly.

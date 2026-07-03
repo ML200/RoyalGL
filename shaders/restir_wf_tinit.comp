@@ -27,7 +27,7 @@ void main()
 
     wfArena[idx] = vec4(0.0); // header: invalid until proven otherwise
 
-    GBufferPixel gCur = gbuf[GBufCurOffset() + idx];
+    GBufferPixel gCur = RestirLoadGBuf(GBufCurOffset() + idx);
     if (gCur.posDepth.w < 0.0)
     {
         if (outSlot != inSlot) pixelRes[outSlot].path = pixelRes[inSlot].path;
@@ -44,7 +44,7 @@ void main()
         prevPix = ivec2(prevPixF);
         if (prevPix.x >= 0 && prevPix.y >= 0 && prevPix.x < size.x && prevPix.y < size.y)
         {
-            GBufferPixel gPrev = gbuf[GBufPrevOffset() + RestirPixelIndex(prevPix)];
+            GBufferPixel gPrev = RestirLoadGBuf(GBufPrevOffset() + RestirPixelIndex(prevPix));
             // Normal agreement mirrors the spatial pass (and the temporal
             // megakernel) - rejects same-material different-orientation
             // history at silhouettes / grazing surfaces.

@@ -65,6 +65,7 @@ void main()
     float replayPdfBase = wfArena[base + 7u].w; // valid iff rcFound
     float rcBaseCos = wfArena[base + 8u].w;
     float rcBaseDist2 = wfArena[base + 9u].x;
+    uint rcInstBits = floatBitsToUint(wfArena[base + 9u].y); // valid iff rcFound
 
     vec3 x, n, wi;
     uint matId, triIdx;
@@ -109,7 +110,7 @@ void main()
                     {
                         SELP.rcInfo = vec4(rcBaseCos, rcBaseDist2, 1.0, replayPdfBase);
                         SELP.rcPosMat = wfArena[base + 6u];
-                        SELP.rcNormal = vec4(wfArena[base + 7u].xyz, 0.0);
+                        SELP.rcNormal = vec4(wfArena[base + 7u].xyz, uintBitsToFloat(rcInstBits));
                         SELP.rcLsuf = vec4(SafeDiv(fCand, wfArena[base + 8u].xyz), 0.0);
                         SELP.misCache = vec4(1.0, 0.0, 0.0, 0.0); // env: no competitors
                     }
@@ -162,10 +163,15 @@ void main()
         rcBaseCos = abs(dot(n, wi));
         rcBaseDist2 = lastEdgeDist2;
         replayPdfBase = wfArena[base + 2u].w; // pdfPrevArrival
-        wfArena[base + 6u] = vec4(x, uintBitsToFloat(matId));
-        wfArena[base + 7u] = vec4((dot(n, wi) >= 0.0) ? n : -n, replayPdfBase);
+        // rc vertex stored in its instance's OBJECT space + id (slot 9.y)
+        // so the reconnection target tracks moving instances.
+        uint rcInstNew = InstanceOfTriangle(triIdx);
+        wfArena[base + 6u] = vec4(RestirWorldToObjPoint(rcInstNew, x), uintBitsToFloat(matId));
+        wfArena[base + 7u] = vec4(
+            RestirWorldToObjNormal(rcInstNew, (dot(n, wi) >= 0.0) ? n : -n), replayPdfBase);
         wfArena[base + 8u] = vec4(fCur, rcBaseCos); // fArriveRc
-        wfArena[base + 9u].x = rcBaseDist2;
+        wfArena[base + 9u] = vec4(rcBaseDist2, uintBitsToFloat(rcInstNew), 0.0, 0.0);
+        rcInstBits = rcInstNew;
     }
 
     // ---------------------------------------------------------- s = 0 ----
@@ -203,7 +209,7 @@ void main()
                     {
                         SELP.rcInfo = vec4(rcBaseCos, rcBaseDist2, omega, replayPdfBase);
                         SELP.rcPosMat = wfArena[base + 6u];
-                        SELP.rcNormal = vec4(wfArena[base + 7u].xyz, 0.0);
+                        SELP.rcNormal = vec4(wfArena[base + 7u].xyz, uintBitsToFloat(rcInstBits));
                         SELP.rcLsuf = vec4(SafeDiv(fCand, wfArena[base + 8u].xyz), 0.0);
                         if (!hasCompetitors)
                             SELP.misCache = vec4(1.0, 0.0, 0.0, 0.0);
@@ -311,8 +317,12 @@ void main()
                     }
                     else
                     {
+                        // Light point in ITS instance's object space
+                        // (movable emitters).
+                        uint liInst = InstanceOfTriangle(uint(lt.p0.w + 0.5));
                         wfArena[cb + 2u] = vec4(0.0, directPdfA, emissionPdfW, 0.0);
-                        wfArena[cb + 4u] = vec4(lightPos, uintBitsToFloat(lightIdx));
+                        wfArena[cb + 4u] = vec4(RestirWorldToObjPoint(liInst, lightPos),
+                                                uintBitsToFloat(lightIdx));
                         wfArena[cb + 5u] = vec4(cosAtLight, dist2, 0.0, 0.0);
                     }
                     wfArena[cb + 3u] = vec4(L, dist);
@@ -332,7 +342,8 @@ void main()
         uint k = min(uint(RandomFloat() * float(lvcCount)), lvcCount - 1u);
         LightVertex lv = lightVerts[k];
         uint lvBits = floatBitsToUint(lv.tputMat.w);
-        uint lightLen = lvBits & 0xFFu;
+        uint lightLen = lvBits & 0xFu;        // matId(8)|inst(4)|len(4)
+        uint lightInst = (lvBits >> 4) & 0xFu;
         uint lightMat = lvBits >> 8;
         float pLight = lv.wiLen.w;
 
@@ -384,11 +395,13 @@ void main()
                         vec3 nly = (dot(lv.normalDvc.xyz, lv.wiLen.xyz) >= 0.0)
                                        ? lv.normalDvc.xyz : -lv.normalDvc.xyz;
                         // misCache.x = light ratio sum; yzw carry lyTput.
+                        // Light end in object space + instance id (+4.w).
                         wfArena[cb + 2u] = vec4(
                             lv.posDvcm.w + lv.normalDvc.w * lightRevPdfW,
                             fLight * lv.tputMat.xyz);
-                        wfArena[cb + 4u] = vec4(nly, 0.0);
-                        wfArena[cb + 5u] = vec4(lv.posDvcm.xyz, 0.0);
+                        wfArena[cb + 4u] = vec4(RestirWorldToObjNormal(lightInst, nly),
+                                                uintBitsToFloat(lightInst));
+                        wfArena[cb + 5u] = vec4(RestirWorldToObjPoint(lightInst, lv.posDvcm.xyz), 0.0);
                     }
                     wfArena[cb + 0u] = vec4(fCand, w);
                     wfArena[cb + 1u] = vec4(omega,

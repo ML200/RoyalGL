@@ -1,7 +1,9 @@
 #include "scene/Scene.h"
 #include "core/Log.h"
 
+#include <algorithm>
 #include <cmath>
+#include <glm/gtc/matrix_transform.hpp>
 
 namespace RoyalGL
 {
@@ -74,10 +76,75 @@ namespace RoyalGL
         }
     }
 
+    glm::mat4 SceneInstance::Matrix() const
+    {
+        glm::mat4 m = glm::translate(glm::mat4(1.0f), pivot + position);
+        m = glm::rotate(m, glm::radians(rotationDeg.y), glm::vec3(0.0f, 1.0f, 0.0f));
+        m = glm::rotate(m, glm::radians(rotationDeg.x), glm::vec3(1.0f, 0.0f, 0.0f));
+        m = glm::rotate(m, glm::radians(rotationDeg.z), glm::vec3(0.0f, 0.0f, 1.0f));
+        m = glm::scale(m, glm::vec3(scale));
+        return glm::translate(m, -pivot);
+    }
+
+    std::vector<Triangle> SceneInstance::TransformedTriangles() const
+    {
+        glm::mat4 m = Matrix();
+        // Uniform scale: normals only rotate. Extract the rotation by
+        // normalizing the upper-left basis.
+        glm::mat3 nrm(m);
+        nrm[0] = glm::normalize(nrm[0]);
+        nrm[1] = glm::normalize(nrm[1]);
+        nrm[2] = glm::normalize(nrm[2]);
+
+        std::vector<Triangle> out;
+        out.reserve(restTriangles.size());
+        for (const Triangle& t : restTriangles)
+        {
+            Triangle nt = t;
+            for (Vertex* v : {&nt.v0, &nt.v1, &nt.v2})
+            {
+                v->position = glm::vec3(m * glm::vec4(v->position, 1.0f));
+                v->normal = glm::normalize(nrm * v->normal);
+            }
+            out.push_back(nt);
+        }
+        return out;
+    }
+
+    void Scene::RegisterInstance(const std::string& name, uint32_t firstTriangle)
+    {
+        if (firstTriangle >= triangles.size()) return;
+        SceneInstance inst;
+        inst.name = name;
+        inst.firstTriangle = firstTriangle;
+        inst.triangleCount = static_cast<uint32_t>(triangles.size()) - firstTriangle;
+        inst.restTriangles.assign(triangles.begin() + firstTriangle, triangles.end());
+
+        glm::vec3 mn = inst.restTriangles[0].v0.position;
+        glm::vec3 mx = mn;
+        for (const Triangle& t : inst.restTriangles)
+            for (const Vertex* v : {&t.v0, &t.v1, &t.v2})
+            {
+                mn = glm::min(mn, v->position);
+                mx = glm::max(mx, v->position);
+            }
+        inst.pivot = 0.5f * (mn + mx);
+        instances.push_back(std::move(inst));
+    }
+
+    void Scene::ApplyInstanceTransform(size_t index)
+    {
+        if (index >= instances.size()) return;
+        const SceneInstance& inst = instances[index];
+        std::vector<Triangle> world = inst.TransformedTriangles();
+        std::copy(world.begin(), world.end(), triangles.begin() + inst.firstTriangle);
+    }
+
     void Scene::LoadFallbackScene()
     {
         triangles.clear();
         materials.clear();
+        instances.clear();
         sourcePath.clear();
 
         materials.push_back(Material{glm::vec3(0.73f, 0.73f, 0.73f), glm::vec3(0.0f), 0.0f, 1.0f}); // 0: floor
@@ -183,6 +250,8 @@ namespace RoyalGL
         camera.target = glm::vec3(0.0f, 1.5f, 0.0f);
         camera.position = glm::vec3(0.0f, 1.8f, 6.5f);
 
+        RegisterInstance("Cornell box", 0);
+
         ROYALGL_LOG_INFO("Scene: loaded fallback Cornell-box scene - ", triangles.size(), " triangles, ",
                           materials.size(), " materials.");
     }
@@ -234,9 +303,10 @@ namespace RoyalGL
     }
 
     void Scene::MergeInstance(const Scene& other, const glm::vec3& floorCenter, float targetHeight,
-                               const Material& material)
+                               const Material& material, const std::string& name)
     {
         if (other.triangles.empty()) return;
+        uint32_t firstTriangle = static_cast<uint32_t>(triangles.size());
 
         glm::vec3 mn = other.BoundsMin();
         glm::vec3 mx = other.BoundsMax();
@@ -265,7 +335,9 @@ namespace RoyalGL
             triangles.push_back(nt);
         }
 
-        ROYALGL_LOG_INFO("Scene: merged instance with ", other.triangles.size(),
+        RegisterInstance(name, firstTriangle);
+
+        ROYALGL_LOG_INFO("Scene: merged instance '", name, "' with ", other.triangles.size(),
                          " triangles at scale ", scale, ".");
     }
 

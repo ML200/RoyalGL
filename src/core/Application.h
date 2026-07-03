@@ -73,6 +73,10 @@ namespace RoyalGL
         bool m_statsEnabled = false;
         uint32_t m_lastStatsSample = 0;
         uint32_t m_statsFrame = 0;
+        // One dirty flag per scene instance: set when the UI edits its
+        // transform, cleared when the async BVH rebuild for it is kicked
+        // (coalesces edits that arrive while a build is in flight).
+        std::vector<bool> m_instanceDirty;
         int m_statsInterval = 256; // ROYALGL_STATS_INTERVAL: samples between stat logs
         // ROYALGL_LOCK_CAMERA: ignore camera input so scripted soak tests
         // stay deterministic even if the window gets focus/mouse events.
@@ -82,6 +86,10 @@ namespace RoyalGL
         // for temporal-reuse transients that locked-camera soaks can't see.
         float m_orbitSpeed = 0.0f;
         float m_orbitPhase = 0.0f;
+        // ROYALGL_MOVE=<rad/s>: scripted oscillation of the last instance -
+        // headless exercise of the async BLAS/TLAS rebuild path.
+        float m_moveTestSpeed = 0.0f;
+        float m_movePhase = 0.0f;
 
         double m_lastMouseX = 0.0;
         double m_lastMouseY = 0.0;

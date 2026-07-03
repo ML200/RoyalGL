@@ -231,6 +231,47 @@ namespace RoyalGL
 
         result.materialsChanged = (scene.materials != materialsBefore);
 
+        // ----------------------------------------------- instances -------
+        // Transform editor per scene instance. Edits only mutate the
+        // instance's TRS here; the world triangles + BVH are rebuilt
+        // asynchronously by Application/BVHBuilder (the image lags a frame
+        // or two behind the sliders while the CPU rebuild runs).
+        ImGui::Begin("Instances");
+        if (scene.instances.empty())
+        {
+            ImGui::TextDisabled("No instances in the current scene.");
+        }
+        static int selectedInstance = 0;
+        if (selectedInstance >= static_cast<int>(scene.instances.size()))
+            selectedInstance = 0;
+        for (size_t i = 0; i < scene.instances.size(); ++i)
+        {
+            ImGui::PushID(static_cast<int>(i));
+            if (ImGui::Selectable(scene.instances[i].name.c_str(), selectedInstance == static_cast<int>(i)))
+                selectedInstance = static_cast<int>(i);
+            ImGui::PopID();
+        }
+        if (!scene.instances.empty())
+        {
+            SceneInstance& inst = scene.instances[selectedInstance];
+            ImGui::Separator();
+            ImGui::Text("%s (%u triangles)", inst.name.c_str(), inst.triangleCount);
+            bool moved = false;
+            moved |= ImGui::DragFloat3("Position", &inst.position.x, 0.01f);
+            moved |= ImGui::DragFloat3("Rotation (deg)", &inst.rotationDeg.x, 0.5f);
+            moved |= ImGui::DragFloat("Scale", &inst.scale, 0.01f, 0.01f, 100.0f);
+            if (ImGui::Button("Reset transform") && !inst.IsIdentity())
+            {
+                inst.position = glm::vec3(0.0f);
+                inst.rotationDeg = glm::vec3(0.0f);
+                inst.scale = 1.0f;
+                moved = true;
+            }
+            if (moved)
+                result.instanceMoved = selectedInstance;
+        }
+        ImGui::End();
+
         return result;
     }
 }

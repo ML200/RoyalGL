@@ -105,23 +105,29 @@ void WfCamAbsorb(uint base, uint cnd, uint outSlot, inout float wSum, inout uint
 
     if (kind == WF_CND_SHARED_RC)
     {
+        // rc vertex is stored in OBJECT space + instance id (state slots
+        // 6/7/9.y, see restir_common.glsl's object-space storage notes).
         vec4 rcPos = wfArena[base + 6u];
         vec4 rcNrm = wfArena[base + 7u];
         vec4 fArr = wfArena[base + 8u];
         pixelRes[outSlot].path.rcInfo = vec4(fArr.w, wfArena[base + 9u].x, omega, rcNrm.w);
         pixelRes[outSlot].path.rcPosMat = rcPos;
-        pixelRes[outSlot].path.rcNormal = vec4(rcNrm.xyz, 0.0);
+        pixelRes[outSlot].path.rcNormal = vec4(rcNrm.xyz, wfArena[base + 9u].y);
         pixelRes[outSlot].path.rcLsuf = vec4(SafeDiv(fCand, fArr.xyz), 0.0);
         pixelRes[outSlot].path.misCache = wfArena[cb + 2u];
     }
     else if (kind == WF_CND_NEE_LIGHT)
     {
+        // Light point stored in object space; normal converted here.
         vec4 lp = wfArena[cb + 4u];
         vec4 ex = wfArena[cb + 5u];
         uint lightIdx = floatBitsToUint(lp.w);
+        uint liInst = InstanceOfTriangle(uint(lightTris[lightIdx].p0.w + 0.5));
         pixelRes[outSlot].path.rcInfo = vec4(ex.x, ex.y, omega, meta.z);
         pixelRes[outSlot].path.rcPosMat = vec4(lp.xyz, uintBitsToFloat(NO_MATERIAL));
-        pixelRes[outSlot].path.rcNormal = vec4(lightTris[lightIdx].normalArea.xyz, 0.0);
+        pixelRes[outSlot].path.rcNormal = vec4(
+            RestirWorldToObjNormal(liInst, lightTris[lightIdx].normalArea.xyz),
+            uintBitsToFloat(liInst));
         pixelRes[outSlot].path.rcLsuf = vec4(lightTris[lightIdx].emissionWeight.rgb, 0.0);
         pixelRes[outSlot].path.misCache = wfArena[cb + 2u];
     }
@@ -130,7 +136,7 @@ void WfCamAbsorb(uint base, uint cnd, uint outSlot, inout float wSum, inout uint
         vec4 mc = wfArena[cb + 2u];
         pixelRes[outSlot].path.rcInfo = vec4(0.0, 0.0, omega, meta.z);
         pixelRes[outSlot].path.lyPosMat = vec4(wfArena[cb + 5u].xyz, 0.0);
-        pixelRes[outSlot].path.lyNormal = vec4(wfArena[cb + 4u].xyz, 0.0);
+        pixelRes[outSlot].path.lyNormal = wfArena[cb + 4u]; // obj normal + inst id
         pixelRes[outSlot].path.lyTput = vec4(mc.yzw, 0.0);
         pixelRes[outSlot].path.misCache = vec4(mc.x, 0.0, 0.0, 0.0);
     }

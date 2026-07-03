@@ -53,7 +53,28 @@ layout(std140, binding = 0) uniform FrameUBO
     vec4 prevCameraParams; // x=tanHalfFovY, y=aspect
     uvec4 restirParams;    // x=debug view, y=flags (bit0 restir, bit1 temporal, bit2 spatial,
                            //   bit3 accumulate frames), z=frame counter, w=ping-pong parity
+    // Instance transforms for object-space surface storage (see
+    // GPUTypes.h): frame-persistent positions (G-buffer, reservoir
+    // reconnection data) are stored in instance object space and converted
+    // with the CURRENT matrices on load, so they track moving objects.
+    // instInfo.x = instance count (0 = machinery disabled).
+    uvec4 instInfo;
+    uvec4 instTable[4]; // firstTriangle per instance, 16 entries
+    mat4 instToWorld[16];
+    mat4 instToObject[16];
 } uFrame;
+
+// Maps a scene-triangle index to its instance (instances tile the triangle
+// array in ascending order; linear scan over <= 16 entries). Returns the
+// instance count when the table is empty (callers treat as static).
+uint InstanceOfTriangle(uint triIdx)
+{
+    uint n = uFrame.instInfo.x;
+    uint inst = n;
+    for (uint i = 0u; i < n; ++i)
+        if (triIdx >= uFrame.instTable[i >> 2][i & 3u]) inst = i;
+    return inst;
+}
 
 // Global accumulation toggle: off = every pipeline overwrites the image
 // with its latest sample instead of averaging, for live per-frame quality
@@ -71,7 +92,8 @@ layout(std430, binding = 4) readonly buffer MaterialsSSBO  { Material materials[
 // kernels (power-CDF sampling, shaders/bdpt_common.glsl).
 struct LightTri
 {
-    vec4 p0, p1, p2;     // world-space position, .w unused
+    vec4 p0, p1, p2;     // world-space position; p0.w = source scene-triangle
+                         // index (exact float), p1.w/p2.w unused
     vec4 normalArea;     // xyz=geometric normal, w=area
     vec4 emissionWeight; // rgb=emitted radiance, w=selection weight (area * luminance)
 };

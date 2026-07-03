@@ -357,13 +357,17 @@ void main()
     if (lightRc && i == t - 1u)
     {
         // ---------------------- connection-edge reconnection -------------
-        vec3 toY = RS_BASE.lyPosMat.xyz - x;
+        // Object-space cached light end (tracks a moving instance).
+        uint lyInst = floatBitsToUint(RS_BASE.lyNormal.w);
+        vec3 lyPosW = RestirObjToWorldPoint(lyInst, RS_BASE.lyPosMat.xyz);
+        vec3 lyNrmW = RestirObjToWorldNormal(lyInst, RS_BASE.lyNormal.xyz);
+        vec3 toY = lyPosW - x;
         float d2y = dot(toY, toY);
         if (d2y <= 1e-12) { WfJobFail(jb); return; }
         float distY = sqrt(d2y);
         vec3 dirY = toY / distY;
 
-        float cosY = dot(RS_BASE.lyNormal.xyz, -dirY);
+        float cosY = dot(lyNrmW, -dirY);
         if (cosY <= 1e-6) { WfJobFail(jb); return; } // wrong side of y_{s-1}
 
         float pdfDirY, pdfRevY, cosOutY;
@@ -400,13 +404,19 @@ void main()
     if (rcValid && i == r - 1u)
     {
         // ------------------------------------------ reconnection ---------
-        vec3 toRc = RS_BASE.rcPosMat.xyz - x;
+        // Object-space rc vertex converted with the CURRENT instance
+        // matrices - the reconnection target tracks moving instances
+        // (identical to the megakernel restir_shift.glsl).
+        uint rcInst = floatBitsToUint(RS_BASE.rcNormal.w);
+        vec3 rcPosW = RestirObjToWorldPoint(rcInst, RS_BASE.rcPosMat.xyz);
+        vec3 rcNrmW = RestirObjToWorldNormal(rcInst, RS_BASE.rcNormal.xyz);
+        vec3 toRc = rcPosW - x;
         float d2 = dot(toRc, toRc);
         if (d2 <= 1e-12) { WfJobFail(jb); return; }
         float dist = sqrt(d2);
         vec3 dir = toRc / dist;
 
-        float cosRc = dot(RS_BASE.rcNormal.xyz, -dir);
+        float cosRc = dot(rcNrmW, -dir);
         if (cosRc <= 1e-6) { WfJobFail(jb); return; }
 
         float pdfDir, pdfRev, cosOut;

@@ -62,6 +62,21 @@ namespace RoyalGL
         glm::uvec4 restirParams;   // x=debug view index, y=flags (bit0 active, bit1 temporal,
                                    // bit2 spatial, bit3 accumulate, bit4 light tracing),
                                    // z=frame counter (never reset), w=ping-pong parity
+
+        // Instance transforms for OBJECT-SPACE reservoir / G-buffer surface
+        // storage: positions that persist across frames (G-buffer halves,
+        // reservoir reconnection vertices, cached light-subpath ends, NEE
+        // light points) are stored in instance object space and converted
+        // with the CURRENT matrices on load - so stored surfaces track
+        // moving objects automatically instead of ghosting at their old
+        // placement. instInfo.x = instance count (0 disables the machinery,
+        // also the >kMaxRestirInstances fallback); instTable = first
+        // triangle index per instance (hit triangle -> instance lookup).
+        static constexpr int kMaxRestirInstances = 16;
+        glm::uvec4 instInfo;
+        glm::uvec4 instTable[4];
+        glm::mat4 instToWorld[kMaxRestirInstances];
+        glm::mat4 instToObject[kMaxRestirInstances];
     };
 
     // One lens surface in walk order (rear -> front), uploaded to SSBO
@@ -97,7 +112,8 @@ namespace RoyalGL
     // directly, and an interior node's range test is a simple interval check).
     struct GPULightTriangle
     {
-        glm::vec4 p0, p1, p2;       // world-space position, .w unused
+        glm::vec4 p0, p1, p2;       // world-space position; p0.w = source scene-triangle
+                                    // index (exact float), p1.w/p2.w unused
         glm::vec4 normalArea;       // xyz=geometric normal, w=triangle area
         glm::vec4 emissionWeight;   // rgb=emitted radiance, w=selection weight (area * luminance)
     };

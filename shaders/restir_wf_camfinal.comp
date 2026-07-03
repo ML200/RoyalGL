@@ -24,7 +24,7 @@ void main()
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= RestirPixelCount()) return;
 
-    GBufferPixel g = gbuf[GBufCurOffset() + idx];
+    GBufferPixel g = RestirLoadGBuf(GBufCurOffset() + idx);
     if (g.posDepth.w < 0.0) return; // caminit already wrote the empty pair
 
     uint base = WfCamBase(idx);
