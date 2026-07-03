@@ -148,6 +148,15 @@ namespace RoyalGL
             GL_CALL(glClearNamedBufferData(m_splatBuffer.Id(), GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr));
     }
 
+    void PathTracer::ClearRestirHistory()
+    {
+        // Zeroed reservoirs == RestirEmptyReservoir (all-zero struct):
+        // confidence/W/pHat 0, so the next temporal pass sees no history.
+        if (m_reservoirBuffer.IsValid())
+            GL_CALL(glClearNamedBufferData(m_reservoirBuffer.Id(), GL_R32UI, GL_RED_INTEGER,
+                                           GL_UNSIGNED_INT, nullptr));
+    }
+
     void PathTracer::EnsureRestirBuffers()
     {
         if (m_restirWidth == m_width && m_restirHeight == m_height) return;

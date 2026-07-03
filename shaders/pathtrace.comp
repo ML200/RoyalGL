@@ -86,7 +86,7 @@ vec3 TracePath(Ray ray)
                 if (cosSurf > 1e-6)
                 {
                     Ray shadowRay = MakeRay(hitPos + normal * 1e-4, L);
-                    if (!IntersectSceneOccluded(shadowRay, dist * 0.999))
+                    if (!IntersectSceneOccluded(shadowRay, ShadowTMax(dist)))
                     {
                         // Balance heuristic against the BSDF strategy, both
                         // pdfs in solid-angle measure at this vertex. The
@@ -98,10 +98,10 @@ vec3 TracePath(Ray ray)
                         // one shared function guarantees that even where it
                         // deviates from the true sampling density. The
                         // contribution itself still divides by the true pdf.
-                        float bsdfPdf = cosSurf / PI;
+                        float bsdfPdf, bsdfPdfRev, cosOut;
+                        vec3 brdf = EvalBsdf(mat, hit.normal, wi, L, bsdfPdf, bsdfPdfRev, cosOut);
                         float lightPdfEvalSA = LT_PdfSolidAngle(hitPos, normal, ls.triIdx, L, dist);
                         float misWeight = lightPdfEvalSA / max(lightPdfEvalSA + bsdfPdf, 1e-20);
-                        vec3 brdf = mat.baseColor.rgb / PI;
                         radiance += throughput * ls.emission * brdf * cosSurf
                                     * misWeight / ls.pdfSolidAngle;
                     }

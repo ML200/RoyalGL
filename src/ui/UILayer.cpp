@@ -212,17 +212,35 @@ namespace RoyalGL
                 ImGui::ColorEdit3("Base color", &mat.baseColor.x);
                 ImGui::ColorEdit3("Emissive", &mat.emissive.x, ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR);
                 int typeIdx = static_cast<int>(mat.type);
-                const char* typeNames[] = {"Diffuse", "Glass"};
-                if (ImGui::Combo("Type", &typeIdx, typeNames, 2))
+                const char* typeNames[] = {"Diffuse", "Glass", "Conductor", "Rough dielectric", "Layered"};
+                if (ImGui::Combo("Type", &typeIdx, typeNames, 5))
                     mat.type = static_cast<MaterialType>(typeIdx);
-                if (mat.type == MaterialType::Glass)
+                switch (mat.type)
                 {
+                case MaterialType::Glass:
                     ImGui::SliderFloat("IOR", &mat.ior, 1.01f, 2.5f);
-                }
-                else
-                {
+                    break;
+                case MaterialType::Conductor:
+                    ImGui::SliderFloat("Roughness", &mat.roughness, 0.0f, 1.0f);
+                    break;
+                case MaterialType::RoughDielectric:
+                    ImGui::SliderFloat("Roughness", &mat.roughness, 0.0f, 1.0f);
+                    ImGui::SliderFloat("IOR", &mat.ior, 1.01f, 2.5f);
+                    break;
+                case MaterialType::Layered:
+                    ImGui::SliderFloat("Metallic", &mat.metallic, 0.0f, 1.0f);
+                    ImGui::SliderFloat("Base roughness", &mat.roughness, 0.0f, 1.0f);
+                    ImGui::SeparatorText("Coat");
+                    ImGui::SliderFloat("Coat roughness", &mat.coatRoughness, 0.0f, 1.0f);
+                    ImGui::SliderFloat("Coat IOR", &mat.coatIor, 1.01f, 2.5f);
+                    ImGui::SliderFloat("Optical depth", &mat.coatDepth, 0.0f, 8.0f);
+                    ImGui::SliderFloat("HG g", &mat.coatG, -0.95f, 0.95f);
+                    ImGui::ColorEdit3("Medium albedo", &mat.coatAlbedo.x);
+                    break;
+                default:
                     ImGui::SliderFloat("Metallic", &mat.metallic, 0.0f, 1.0f);
                     ImGui::SliderFloat("Roughness", &mat.roughness, 0.0f, 1.0f);
+                    break;
                 }
             }
             ImGui::PopID();

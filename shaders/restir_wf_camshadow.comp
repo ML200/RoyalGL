@@ -28,6 +28,6 @@ void main()
 
     vec3 nf = (dot(n, dirDist.xyz) >= 0.0) ? n : -n;
     Ray shadowRay = MakeRay(pos + nf * 1e-4, dirDist.xyz);
-    if (IntersectSceneOccluded(shadowRay, dirDist.w * 0.999))
+    if (IntersectSceneOccluded(shadowRay, ShadowTMax(dirDist.w)))
         wfArena[cb].w = 0.0;
 }

@@ -165,12 +165,12 @@ class that would need to change.
 
 ## Shading model
 
-Two material models, shared by all kernels through common.glsl's
+Five material models, shared by all kernels through common.glsl's
 `SampleBsdf`/`EvalBsdf` (`Material::type`, `GPUMaterial::params.w`):
 
-- **Diffuse**: two-sided Lambertian with cosine-weighted hemisphere
+- **Diffuse** (0): two-sided Lambertian with cosine-weighted hemisphere
   sampling. Emissive materials double as area lights.
-- **Glass** (delta dielectric): perfect Fresnel reflection/refraction
+- **Glass** (1, delta dielectric): perfect Fresnel reflection/refraction
   (exact unpolarized dielectric Fresnel, `params.z` = IOR), the
   reflect/refract choice made proportional to the reflectance so the
   discrete probability cancels out of the throughput. Delta vertices
@@ -179,15 +179,52 @@ Two material models, shared by all kernels through common.glsl's
   is non-symmetric under transport (Veach 5.3.2): the (etaI/etaT)^2
   solid-angle-compression factor applies to radiance (eye paths) only,
   never to importance (light paths) - `SampleBsdf`'s `isLightPath` flag.
+- **Conductor** (2): isotropic GGX microfacet (Heitz VNDF sampling,
+  height-correlated Smith), Schlick Fresnel with F0 = baseColor,
+  `params.y` = perceptual roughness (alpha = r^2, clamped >= 1e-3 so
+  rough lobes are never delta).
+- **Rough dielectric** (3): Walter 2007 GGX reflection + transmission
+  (baseColor tint, `params.z` = IOR), same adjoint eta^2 convention as
+  glass. `EvalBsdf` covers the reflection lobe only - transmission is
+  carried by sampled paths, whose connection-technique partner reports
+  pdf 0 (same MIS treatment as delta glass).
+- **Layered** (4): position-free layered slab (Guo, Hasan, Zhao,
+  SIGGRAPH Asia 2018): rough dielectric coat (`coat.xy` = roughness/IOR)
+  over a homogeneous Henyey-Greenstein medium (`coat.z` = optical depth,
+  `coat.w` = g, `coatTint.rgb` = single-scattering albedo) over a
+  metallic-blended conductor/diffuse base (`params.x/y`, baseColor).
+  Sampling = stochastic forward walk through the slab (standard path
+  tracing in slab coordinates: exponential free flights along the ray,
+  eta-free VNDF weights at interfaces - all refraction eta^2 factors
+  cancel over enter/exit pairs - and albedo at volume scatters). `EvalBsdf`
+  = analytic coat-reflection lobe + a stochastic internal walk from the
+  wo side with NEE across the coat (backward-refracting wi through a
+  VNDF-sampled microfacet; full support => unbiased without the paper's
+  local-MIS partner, which was dropped for shader-size reasons). Reported
+  pdfs are a deterministic analytic approximation (paper 5.3.2: coat lobe
+  + roughened base lobe + 0.1 Lambertian floor) - valid because every
+  estimator ratio pairs the same reported pdf in the f- and p-products.
+  Stochastic evals draw from the ACTIVE RngStream, so ReSTIR shifts
+  reproduce realizations; the s=1 candidate eval runs under a dedicated
+  RNG_EVAL stream and the s>=2 connection evals re-seed RNG_CONNECT so
+  identity shifts replay creation's draws exactly (realization mismatches
+  otherwise compound geometrically through the temporal<->spatial loop).
+
+ReSTIR reconnection with glossy lobes: cached suffix radiance excludes
+the reconnection vertex's BSDF value, which shifts re-evaluate live
+against an octahedrally-cached suffix direction; the technique-MIS cache
+keeps the rc vertex's forward/reverse pdfs symbolic (restir_common.glsl's
+misCache doc). Layered vertices are excluded from rc pairs entirely
+(`MatRcCacheable`) - their sampled scatters mix stochastic weights with
+approximate pdfs that a shift's re-evaluation cannot reproduce - and
+paths through them fall back to light-point rc / LIGHTRC / pure replay,
+which are all evaluation-based and realization-aligned.
 
 The fallback scene includes a small glass duck (assets/scenes/Duck.glb,
 merged via `Scene::MergeInstance`) in the middle of the Cornell box as a
-standing test case for the delta paths and their caustics.
-
-`GPUMaterial::params` still carries `metallic`/`roughness`, so the
-extension point for a full metallic-roughness GGX BRDF is the shared
-`SampleBsdf`/`EvalBsdf` pair - every kernel picks the change up from
-there (BDPT additionally relies on `pdfRev` being filled in correctly).
+standing test case for the delta paths and their caustics. `ROYALGL_MAT=
+conductor|roughglass|layered|layeredmed` overrides the duck's material
+for headless cross-integrator soaks.
 
 ## Direct lighting: light tree NEE + MIS
 

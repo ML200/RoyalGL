@@ -26,9 +26,12 @@ namespace RoyalGL
 
     struct GPUMaterial
     {
-        glm::vec4 baseColor; // .rgb albedo (Diffuse) / tint (Glass), .a unused
+        glm::vec4 baseColor; // .rgb albedo (Diffuse/Layered base) / tint (Glass/RoughDielectric) / F0 (Conductor)
         glm::vec4 emissive;  // .rgb emissive radiance, .a unused
-        glm::vec4 params;    // x=metallic, y=roughness, z=ior, w=type (0=diffuse, 1=glass)
+        glm::vec4 params;    // x=metallic (Layered base blend), y=roughness, z=ior,
+                             // w=type (0=diffuse 1=glass 2=conductor 3=rough dielectric 4=layered)
+        glm::vec4 coat;      // Layered: x=coat roughness, y=coat IOR, z=optical depth tau, w=HG g
+        glm::vec4 coatTint;  // Layered: .rgb medium single-scattering albedo, .a unused
     };
 
     // Uniform buffer uploaded once per PathTracer::Render() call (binding 0).

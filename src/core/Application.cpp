@@ -102,6 +102,18 @@ namespace RoyalGL
         if (const char* v = std::getenv("ROYALGL_STATS_INTERVAL")) m_statsInterval = std::max(std::atoi(v), 1);
         if (const char* v = std::getenv("ROYALGL_ACCUM")) m_settings.accumulate = (v[0] != '0');
 
+        // Scripted camera pose for headless artifact repros:
+        // ROYALGL_CAM="px,py,pz,tx,ty,tz"
+        if (const char* v = std::getenv("ROYALGL_CAM"))
+        {
+            float c[6];
+            if (sscanf(v, "%f,%f,%f,%f,%f,%f", &c[0], &c[1], &c[2], &c[3], &c[4], &c[5]) == 6)
+            {
+                m_scene->camera.position = glm::vec3(c[0], c[1], c[2]);
+                m_scene->camera.target = glm::vec3(c[3], c[4], c[5]);
+            }
+        }
+
         m_lastCamera = m_scene->camera;
         m_lastSettings = m_settings;
         m_dirty = true;
@@ -150,6 +162,54 @@ namespace RoyalGL
                 glass.baseColor = glm::vec3(0.98f, 0.98f, 0.98f);
                 glass.type = MaterialType::Glass;
                 glass.ior = 1.5f;
+
+                // Headless BSDF test hook: ROYALGL_MAT overrides the duck's
+                // material so soak tests can exercise the new lobes
+                // (integrator cross-checks - all integrators must agree).
+                if (const char* v = std::getenv("ROYALGL_MAT"))
+                {
+                    std::string m = v;
+                    if (m == "conductor")
+                    {
+                        glass = Material{};
+                        glass.type = MaterialType::Conductor;
+                        glass.baseColor = glm::vec3(0.95f, 0.64f, 0.54f); // copper-ish F0
+                        glass.roughness = 0.3f;
+                    }
+                    else if (m == "roughglass")
+                    {
+                        glass = Material{};
+                        glass.type = MaterialType::RoughDielectric;
+                        glass.baseColor = glm::vec3(0.98f);
+                        glass.roughness = 0.2f;
+                        glass.ior = 1.5f;
+                    }
+                    else if (m == "layered")
+                    {
+                        glass = Material{}; // clear coat over rough copper
+                        glass.type = MaterialType::Layered;
+                        glass.baseColor = glm::vec3(0.95f, 0.64f, 0.54f);
+                        glass.metallic = 1.0f;
+                        glass.roughness = 0.4f;
+                        glass.coatRoughness = 0.1f;
+                        glass.coatIor = 1.5f;
+                        glass.coatDepth = 0.0f;
+                    }
+                    else if (m == "layeredmed")
+                    {
+                        glass = Material{}; // coat + blue-tinted scattering medium over diffuse
+                        glass.type = MaterialType::Layered;
+                        glass.baseColor = glm::vec3(0.8f);
+                        glass.metallic = 0.0f;
+                        glass.roughness = 0.5f;
+                        glass.coatRoughness = 0.15f;
+                        glass.coatIor = 1.5f;
+                        glass.coatDepth = 1.0f;
+                        glass.coatG = 0.4f;
+                        glass.coatAlbedo = glm::vec3(0.4f, 0.6f, 0.9f);
+                    }
+                    ROYALGL_LOG_INFO("Application: ROYALGL_MAT=", m, " overrides the duck material.");
+                }
                 m_scene->MergeInstance(duck, glm::vec3(0.4f, 0.0f, 0.2f), 1.0f, glass, "Glass duck");
             }
             else
@@ -381,6 +441,22 @@ namespace RoyalGL
                 }
             }
 
+            // Headless render dump: ROYALGL_EXPORT=<path> exports the frame
+            // once ROYALGL_EXPORT_AT samples accumulated (default 256).
+            static const char* exportEnv = std::getenv("ROYALGL_EXPORT");
+            static bool exported = false;
+            if (exportEnv && !exported)
+            {
+                uint32_t at = 256;
+                if (const char* v = std::getenv("ROYALGL_EXPORT_AT"))
+                    at = static_cast<uint32_t>(std::max(std::atoi(v), 1));
+                if (m_pathTracer->SampleCount() >= at)
+                {
+                    ExportPNG(exportEnv);
+                    exported = true;
+                }
+            }
+
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
             glm::ivec2 fbSize = m_window->GetFramebufferSize();
             glViewport(0, 0, fbSize.x, fbSize.y);
@@ -418,6 +494,21 @@ namespace RoyalGL
                 // was measured too slow).
                 m_lightTree->Build(*m_scene);
                 m_pathTracer->Reset();
+
+                // End-of-burst history clear: DURING a drag (another rebuild
+                // already pending) history is kept - reuse keeps motion
+                // cheap and the transient staleness is invisible while
+                // things move. But when the LAST rebuild of an edit lands,
+                // the restarted accumulation would bake the ~confidence-cap
+                // frames of stale-history transient into the converged
+                // image as a persistent shadow-like blotch near the moved
+                // geometry. One reservoir clear on the settle frame costs a
+                // single frame of reuse and removes the bake-in.
+                bool morePending = m_bvh->AsyncBusy();
+                for (size_t i = 0; i < m_instanceDirty.size() && !morePending; ++i)
+                    morePending = m_instanceDirty[i];
+                if (!morePending)
+                    m_pathTracer->ClearRestirHistory();
             }
             if (!m_bvh->AsyncBusy())
             {

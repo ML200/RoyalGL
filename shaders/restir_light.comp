@@ -229,7 +229,7 @@ void main()
                         {
                             vec3 nf = (dot(hit.normal, dirToCam) >= 0.0) ? hit.normal : -hit.normal;
                             Ray shadowRay = MakeRay(hitPos + nf * 1e-4, dirToCam);
-                            if (!IntersectSceneOccluded(shadowRay, dist * 0.999))
+                            if (!IntersectSceneOccluded(shadowRay, ShadowTMax(dist)))
                             {
                                 uint flags = RESTIR_FLAG_CAUSTIC | (deltaMask << 8);
                                 uint tech = RestirPackTech(pathLength + 1u, 1u, flags);
@@ -255,15 +255,30 @@ void main()
                     vec3 anchor = g.posDepth.xyz;
                     vec3 toA = anchor - prevPos;
                     float d2A = dot(toA, toA);
+                    // The landing must lie ON the pixel's visible surface:
+                    // the free direction only selects the bin, and the
+                    // image-to-surface normalization assumes the pixel's
+                    // footprint maps to the ANCHOR's surface alone. Without
+                    // this depth gate, landings on geometry HIDDEN behind
+                    // the visible surface (e.g. the wall behind the duck)
+                    // bin to pixels whose anchor accepts them, and the
+                    // pixel sums landing populations from several surfaces
+                    // - a systematic t=1 overcount. (Delta anchors used to
+                    // mask this: they rejected all anchored candidates.)
                     if (!MatIsDelta(mX1)
                         && dot(mX1.emissive.rgb, mX1.emissive.rgb) <= 0.0
-                        && d2A > 1e-12)
+                        && d2A > 1e-12
+                        && abs(dist - g.posDepth.w) <= 0.02 * g.posDepth.w)
                     {
                         float distA = sqrt(d2A);
                         vec3 dirA = toA / distA;
 
                         // Light-side factor of the reconnected edge + the
-                        // anchored-path MIS state at y_{s-2}.
+                        // anchored-path MIS state at y_{s-2}. The evals run
+                        // under a dedicated stream so temporal shifts
+                        // (RestirShiftLightPath) reproduce stochastic-eval
+                        // (layered) realizations exactly.
+                        RngStream(pathLength, RNG_EVAL);
                         vec3 fPrev = vec3(0.0);
                         float pdP = 0.0; // pdf of sampling dirA at y_{s-2}
                         float nVC = 0.0, nLW = 0.0;
@@ -354,7 +369,7 @@ void main()
                                 {
                                     vec3 nf = (dot(prevN, dirA) >= 0.0) ? prevN : -prevN;
                                     Ray shadowRay = MakeRay(prevPos + nf * 1e-4, dirA);
-                                    if (!IntersectSceneOccluded(shadowRay, distA * 0.999))
+                                    if (!IntersectSceneOccluded(shadowRay, ShadowTMax(distA)))
                                     {
                                         uint flags = RESTIR_FLAG_RCVALID | (deltaMask << 8);
                                         uint tech = RestirPackTech(pathLength + 1u, 1u, flags);

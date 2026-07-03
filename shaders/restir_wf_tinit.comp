@@ -72,6 +72,7 @@ void main()
     }
 
     uint prevIdx = RestirPixelIndex(prevPix);
+    histFade *= RestirReuseRoughFade(GBufMaterial(gCur));
     wfArena[idx] = vec4(uintBitsToFloat(prevIdx), uintBitsToFloat(1u), histFade, 0.0);
 
     uint bSlot = RestirRegionOffset(RestirHistoryRegion()) + prevIdx;

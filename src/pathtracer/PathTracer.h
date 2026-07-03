@@ -30,6 +30,11 @@ namespace RoyalGL
 
         void Resize(int width, int height);
         void Reset();
+
+        // Zeroes the ReSTIR reservoir regions (temporal history included).
+        // Called when an instance-edit rebuild burst settles so the stale-
+        // history transient can't bake into the restarted accumulation.
+        void ClearRestirHistory();
         void Render(const Camera& camera, const BVHBuilder& bvh, const LightTree& lightTree,
                     const LensSystem& lensSystem, const RenderSettings& settings);
 

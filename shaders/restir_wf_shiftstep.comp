@@ -42,7 +42,9 @@ void WfLightReconnect(uint jobIdx, uint jb, uint baseSlot, uint dstIdx, bool isP
     float dist = sqrt(d2);
     vec3 dirTo = toX1 / dist;
 
-    // Light-side factor + MIS state across the reconnected edge.
+    // Light-side factor + MIS state across the reconnected edge. Eval
+    // draws aligned with creation's RNG_EVAL stream (see restir_shift.glsl).
+    RngStream(s - 1u, RNG_EVAL);
     float pd = 0.0, pr = 0.0, cosOut = 0.0;
     float mVCM, mVC, mLW;
     if (prevIsLight)
@@ -370,19 +372,35 @@ void main()
         float cosY = dot(lyNrmW, -dirY);
         if (cosY <= 1e-6) { WfJobFail(jb); return; } // wrong side of y_{s-1}
 
+        // Stochastic-eval determinism (see restir_shift.glsl): align the
+        // draw stream with creation's RNG_CONNECT sequence.
+        RngStream(i, RNG_CONNECT);
+        RandomFloat();
         float pdfDirY, pdfRevY, cosOutY;
         vec3 fbY = EvalBsdf(mat, n, wi, dirY, pdfDirY, pdfRevY, cosOutY);
         if (fbY == vec3(0.0)) { WfJobFail(jb); return; }
 
+        // Re-evaluate the ly BSDF toward the new camera vertex (identical
+        // to restir_shift.glsl: lyTput excludes it; true pdfs feed omega).
+        Material lmat = materials[floatBitsToUint(RS_BASE.lyPosMat.w)];
+        vec3 lyWiW = RestirObjToWorldNormal(lyInst, OctaDecode(RS_BASE.lyTput.w));
+        float lightDirPdfW, lightRevPdfW, cosLyOut;
+        vec3 fLight = EvalBsdf(lmat, lyNrmW, lyWiW, -dirY,
+                               lightDirPdfW, lightRevPdfW, cosLyOut);
+        if (fLight == vec3(0.0)) { WfJobFail(jb); return; }
+
         f *= fbY * (cosOutY * cosY / d2y); // fCam * geometry term
-        f *= RS_BASE.lyTput.xyz;           // rho_y * light prefix numerator
+        f *= fLight;                       // rho_y at the new direction
+        f *= RS_BASE.lyTput.xyz;           // light prefix numerator
 
         float omega = RS_BASE.rcInfo.z;
         if (misRecompute)
         {
             float camDirPdfA = pdfDirY * cosY / d2y;
-            float lightDirPdfA = (cosY / PI) * cosOutY / d2y;
-            float denom = camDirPdfA * RS_BASE.misCache.x + 1.0
+            float lightDirPdfA = lightDirPdfW * cosOutY / d2y;
+            float denom = camDirPdfA
+                              * (RS_BASE.misCache.x + RS_BASE.misCache.y * lightRevPdfW)
+                        + 1.0
                         + lightDirPdfA * (dVCM + pdfRevY * dVC);
             if (isnan(denom) || isinf(denom)) { WfJobFail(jb); return; }
             omega = 1.0 / max(denom, 1.0);
@@ -419,14 +437,32 @@ void main()
         float cosRc = dot(rcNrmW, -dir);
         if (cosRc <= 1e-6) { WfJobFail(jb); return; }
 
+        uint rcMatBits = floatBitsToUint(RS_BASE.rcPosMat.w);
+        // s=1 light-point rc: align eval draws with creation's RNG_EVAL
+        // stream (see restir_shift.glsl).
+        if (rcMatBits == NO_MATERIAL) RngStream(i, RNG_EVAL);
         float pdfDir, pdfRev, cosOut;
         vec3 fb = EvalBsdf(mat, n, wi, dir, pdfDir, pdfRev, cosOut);
         if (fb == vec3(0.0)) { WfJobFail(jb); return; }
 
         if (RS_BASE.rcInfo.x <= 0.0 || RS_BASE.rcInfo.y <= 0.0) { WfJobFail(jb); return; }
 
+        // Re-evaluate the rc vertex's BSDF between the new arrival dir and
+        // the cached suffix dir (identical to restir_shift.glsl).
+        bool emitterRc = (s == 0u && r == t - 1u);
+        float pFwdRc = 0.0, pRevRc = 0.0;
+        if (rcMatBits != NO_MATERIAL && !emitterRc)
+        {
+            vec3 suffixDirW = RestirObjToWorldNormal(rcInst, OctaDecode(RS_BASE.rcLsuf.w));
+            float cosSufRc;
+            vec3 rhoRc = EvalBsdf(materials[rcMatBits], rcNrmW, -dir, suffixDirW,
+                                  pFwdRc, pRevRc, cosSufRc);
+            if (rhoRc == vec3(0.0) || pFwdRc <= 0.0) { WfJobFail(jb); return; }
+            f *= rhoRc;
+        }
+
         f *= fb * cosOut;          // rho*cos at x'_{r-1}
-        f *= RS_BASE.rcLsuf.xyz;   // cached suffix radiance
+        f *= RS_BASE.rcLsuf.xyz;   // cached suffix radiance (sans rho_r)
         J *= (cosRc / RS_BASE.rcInfo.x) * (RS_BASE.rcInfo.y / d2); // Eq. 55
 
         float omega = RS_BASE.rcInfo.z;
@@ -436,7 +472,7 @@ void main()
             float dVCr = (cosOut / pdfDir) * (dVCM + pdfRev * dVC) / cosRc;
             float dT1r = (cosOut / pdfDir) * (i == 1u ? dT1 : pdfRev * dT1) / cosRc;
             float denom;
-            if (floatBitsToUint(RS_BASE.rcPosMat.w) == NO_MATERIAL)
+            if (rcMatBits == NO_MATERIAL)
             {
                 // s=1 with the sampled light point as rc vertex.
                 float directPdfW = RS_BASE.misCache.y * d2 / cosRc;
@@ -446,7 +482,7 @@ void main()
                                   : prefac * (i == 1u ? dT1 : pdfRev * dT1);
                 denom = 1.0 + pdfDir / directPdfW + wCam;
             }
-            else if (s == 0u && r == t - 1u)
+            else if (emitterRc)
             {
                 // rc vertex IS the terminal emitter.
                 denom = RS_BASE.misCache.x + RS_BASE.misCache.y * dVCMr
@@ -454,9 +490,14 @@ void main()
             }
             else
             {
-                float X = conn ? (dVCMr + (cosRc / PI) * dVCr)
-                               : ((cosRc / PI) * dT1r);
-                denom = RS_BASE.misCache.x + RS_BASE.misCache.y * X;
+                float X = conn ? (dVCMr + pRevRc * dVCr)
+                               : (pRevRc * dT1r);
+                denom = (r == t - 1u)
+                    ? RS_BASE.misCache.x + RS_BASE.misCache.y * pFwdRc
+                          + RS_BASE.misCache.z * X
+                    : RS_BASE.misCache.x
+                          + (RS_BASE.misCache.y + RS_BASE.misCache.z * X)
+                                / max(pFwdRc, 1e-20);
             }
             if (isnan(denom) || isinf(denom)) { WfJobFail(jb); return; }
             omega = 1.0 / max(denom, 1.0);

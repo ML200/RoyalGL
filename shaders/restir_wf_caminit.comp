@@ -74,9 +74,11 @@ void main()
     wfArena[base + 3u] = vec4(1.0, 1.0, 1.0, 1.0);
     wfArena[base + 4u] = vec4(dVCM, 0.0, dT1, 0.0);
     wfArena[base + 5u] = vec4(0.0, 0.0, uintBitsToFloat(risRng), uintBitsToFloat(camSeed));
-    // rc block (6..9) is only read once rcFound is set, which always
-    // rewrites it first; the candidate slots only need their weights
-    // cleared.
+    // rc block (6..8) is only read once rcFound is set, which always
+    // rewrites it first; slot 9 carries the misKC/dvcmB chains that persist
+    // every round, so clear it against NaN poisoning. The candidate slots
+    // only need their weights cleared.
+    wfArena[base + 9u] = vec4(0.0);
     wfArena[base + WF_CAM_CND0].w = 0.0;
     wfArena[base + WF_CAM_CND0 + WF_CAM_CND_STRIDE].w = 0.0;
 

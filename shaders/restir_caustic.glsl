@@ -117,7 +117,7 @@ RestirCausticReplayResult RestirCausticReplay(uint seed, uint s, uint deltaMask,
 
             vec3 nf = (dot(hit.normal, dirToCam) >= 0.0) ? hit.normal : -hit.normal;
             Ray shadowRay = MakeRay(hitPos + nf * 1e-4, dirToCam);
-            if (IntersectSceneOccluded(shadowRay, dist * 0.999)) return res;
+            if (IntersectSceneOccluded(shadowRay, ShadowTMax(dist))) return res;
 
             float ipd = (float(uFrame.frameInfo.y) * 0.5) / tanFovY;
             float imagePointToCamDist = ipd / cosAtCam;

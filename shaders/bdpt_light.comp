@@ -44,7 +44,7 @@ void ConnectLightToLens(vec3 pos, vec3 lightN, vec3 Le, float pdfA)
     float cosQ = -dLocal.z;
 
     Ray shadowRay = MakeRay(pos + lightN * 1e-4, dir);
-    if (IntersectSceneOccluded(shadowRay, d * 0.999)) return;
+    if (IntersectSceneOccluded(shadowRay, ShadowTMax(d))) return;
 
     float aFront = PI * (frontSemi * 1e-3) * (frontSemi * 1e-3);
     float zP = uFrame.lensParams.w * 1e-3;
@@ -111,7 +111,7 @@ void ConnectToCamera(vec3 pos, vec3 n, vec3 wi, Material mat, vec3 throughput,
 
         vec3 nf = (dot(n, dirToCam) >= 0.0) ? n : -n;
         Ray shadowRay = MakeRay(pos + nf * 1e-4, dirToCam);
-        if (IntersectSceneOccluded(shadowRay, dist * 0.999)) return;
+        if (IntersectSceneOccluded(shadowRay, ShadowTMax(dist))) return;
 
         vec3 contrib = misWeight * throughput * f * imageToSurface / numLightPaths;
         if (any(isnan(contrib)) || any(isinf(contrib))) return;
@@ -163,7 +163,7 @@ void ConnectToCamera(vec3 pos, vec3 n, vec3 wi, Material mat, vec3 throughput,
 
     vec3 nf = (dot(n, dirToQ) >= 0.0) ? n : -n;
     Ray shadowRay = MakeRay(pos + nf * 1e-4, dirToQ);
-    if (IntersectSceneOccluded(shadowRay, dQ * 0.999)) return;
+    if (IntersectSceneOccluded(shadowRay, ShadowTMax(dQ))) return;
 
     // Flux through the sampled front-element area, normalized to the eye
     // estimator's per-pixel irradiance measurement: pixel = K * flux /

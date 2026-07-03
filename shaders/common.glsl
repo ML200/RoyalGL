@@ -27,9 +27,12 @@ struct Triangle
 
 struct Material
 {
-    vec4 baseColor; // .rgb albedo (diffuse) / tint (glass)
+    vec4 baseColor; // .rgb albedo (diffuse/layered base) / tint (glass/rough dielectric) / F0 (conductor)
     vec4 emissive;  // .rgb emissive radiance
-    vec4 params;    // x=metallic, y=roughness, z=ior, w=type (0=diffuse, 1=glass)
+    vec4 params;    // x=metallic (layered base blend), y=roughness, z=ior,
+                    // w=type (0=diffuse 1=glass 2=conductor 3=rough dielectric 4=layered)
+    vec4 coat;      // layered: x=coat roughness, y=coat IOR, z=optical depth tau, w=HG g
+    vec4 coatTint;  // layered: .rgb medium single-scattering albedo
 };
 
 layout(std140, binding = 0) uniform FrameUBO
@@ -150,6 +153,13 @@ const uint RNG_CONNECT = 4u; // s>=2 light-vertex pick
 const uint RNG_CAMCONN = 5u; // t=1 lens-connection sampling (pupil point + lambdas)
 const uint RNG_RIS     = 6u; // ReSTIR reservoir selection draws
 const uint RNG_REUSE   = 7u; // ReSTIR neighbor-pixel selection draws
+const uint RNG_EVAL    = 8u; // stochastic BSDF *evaluation* draws at the s=1
+                             // NEE candidate (layered walk). A dedicated
+                             // purpose lets shift mappings re-seed and
+                             // reproduce creation's realization exactly -
+                             // the light sampling that precedes the eval
+                             // consumes a variable number of RNG_NEE draws
+                             // (tree descent) that shifts don't replay.
 
 void RngStream(uint vertex, uint purpose)
 {
@@ -177,15 +187,48 @@ vec3 CosineSampleHemisphere(vec3 normal)
 
 // -------------------------------------------------------------- BSDF -----
 // Shared by the unidirectional kernel and both bidirectional subpath
-// kernels. Two material models: two-sided Lambertian diffuse, and a delta
-// dielectric ("glass") with exact Fresnel reflection/refraction.
+// kernels. Material models:
+//   0 diffuse          two-sided Lambertian
+//   1 glass            delta dielectric, exact Fresnel reflect/refract
+//   2 conductor        GGX microfacet conductor (VNDF sampling), F0 = baseColor
+//   3 rough dielectric GGX dielectric (Walter 2007), reflection + transmission
+//   4 layered          position-free layered slab (Guo, Hasan, Zhao 2018):
+//                      rough dielectric coat over an HG-scattering medium over
+//                      a metallic-blended conductor/diffuse base. Sampling is
+//                      a stochastic forward walk through the slab; evaluation
+//                      is an analytic top-reflection lobe plus a stochastic
+//                      internal walk with NEE across the coat interface,
+//                      locally MIS-combined with continuation (paper Fig 7ab).
+//                      Reported pdfs for layered are a deterministic analytic
+//                      APPROXIMATION (paper 5.3.2) - valid for MIS weighting
+//                      because every estimator ratio in this codebase pairs
+//                      the same reported pdf in the f- and p-products, so the
+//                      nominal factors cancel and true throughput remains.
 //
 // Direction convention: `wi` points from the surface toward the previous
 // path vertex, `wo` toward the next one; `n` is the interpolated shading
-// normal with its true geometric orientation (NOT pre-flipped - glass needs
-// the sign to tell entering from exiting).
+// normal with its true geometric orientation (NOT pre-flipped - glass and
+// rough dielectric need the sign to tell entering from exiting).
+//
+// Stochastic eval/sampling (layered) draws from the ACTIVE RNG stream, so
+// ReSTIR replays reproduce realizations exactly (RngStream re-seeds per
+// vertex/purpose); unbiasedness holds in the extended space of path x
+// eval-noise, same as the random-replay treatment.
 
-bool MatIsDelta(Material m) { return m.params.w > 0.5; }
+bool MatIsDelta(Material m) { return m.params.w > 0.5 && m.params.w < 1.5; }
+
+// Eligible as an INTERIOR ReSTIR reconnection vertex. Layered is excluded:
+// its sampled scatters carry a stochastic-weight/approx-pdf factor that a
+// shift's raw re-evaluation cannot reproduce, so caching its outgoing
+// suffix would drift under temporal reuse. Paths through layered vertices
+// instead use light-point rc / LIGHTRC / pure replay - no candidate or
+// MIS technique is lost. (Evaluation-based caches are fine for layered:
+// both sides use EvalBsdf realizations.)
+bool MatRcCacheable(Material m)
+{
+    int t = int(m.params.w + 0.5);
+    return t != 1 && t != 4;
+}
 
 // Exact unpolarized dielectric Fresnel reflectance; returns 1 on total
 // internal reflection.
@@ -200,10 +243,481 @@ float FresnelDielectric(float cosI, float etaI, float etaT)
     return 0.5 * (rs * rs + rp * rp);
 }
 
+vec3 FresnelSchlick3(vec3 f0, float cosI)
+{
+    float m = clamp(1.0 - cosI, 0.0, 1.0);
+    float m2 = m * m;
+    return f0 + (vec3(1.0) - f0) * (m2 * m2 * m);
+}
+
+// ------------------------------------------------- GGX microfacet core ---
+// All lobe math runs in a local frame with the oriented normal at +z.
+// Perceptual roughness -> alpha; the clamp keeps every rough lobe non-delta
+// (true deltas remain the exclusive business of the glass material).
+float BsdfAlpha(float rough) { return clamp(rough * rough, 1.0e-3, 1.0); }
+
+mat3 BsdfBasis(vec3 n)
+{
+    vec3 up = (abs(n.z) < 0.999) ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    vec3 t = normalize(cross(up, n));
+    vec3 b = cross(n, t);
+    return mat3(t, b, n); // world = M * local, local = transpose(M) * world
+}
+
+float GgxD(vec3 m, float a)
+{
+    if (m.z <= 0.0) return 0.0;
+    float a2 = a * a;
+    float t = (m.x * m.x + m.y * m.y) / a2 + m.z * m.z;
+    return 1.0 / (PI * a2 * t * t);
+}
+
+float GgxLambda(vec3 w, float a)
+{
+    float c2 = w.z * w.z;
+    float s2 = max(1.0 - c2, 0.0);
+    if (c2 <= 1.0e-9) return 1.0e9;
+    return 0.5 * (sqrt(1.0 + a * a * s2 / c2) - 1.0);
+}
+float GgxG1(vec3 w, float a) { return 1.0 / (1.0 + GgxLambda(w, a)); }
+float GgxG2(vec3 wi, vec3 wo, float a) { return 1.0 / (1.0 + GgxLambda(wi, a) + GgxLambda(wo, a)); }
+
+// Heitz 2018 VNDF sampling; requires w.z > 0, returns m with m.z > 0.
+vec3 GgxSampleVndf(vec3 w, float a, vec2 u)
+{
+    vec3 vh = normalize(vec3(a * w.x, a * w.y, w.z));
+    float lensq = vh.x * vh.x + vh.y * vh.y;
+    vec3 T1 = (lensq > 1.0e-9) ? vec3(-vh.y, vh.x, 0.0) / sqrt(lensq) : vec3(1.0, 0.0, 0.0);
+    vec3 T2 = cross(vh, T1);
+    float r = sqrt(u.x);
+    float phi = 2.0 * PI * u.y;
+    float t1 = r * cos(phi);
+    float t2 = r * sin(phi);
+    float s = 0.5 * (1.0 + vh.z);
+    t2 = (1.0 - s) * sqrt(max(0.0, 1.0 - t1 * t1)) + s * t2;
+    vec3 nh = t1 * T1 + t2 * T2 + sqrt(max(0.0, 1.0 - t1 * t1 - t2 * t2)) * vh;
+    return normalize(vec3(a * nh.x, a * nh.y, max(nh.z, 1.0e-6)));
+}
+
+// pdf of a VNDF-sampled microfacet normal m given view w (both .z > 0).
+float GgxVndfPdf(vec3 w, vec3 m, float a)
+{
+    return GgxG1(w, a) * max(dot(w, m), 0.0) * GgxD(m, a) / max(w.z, 1.0e-6);
+}
+
+// --------------------------------------------- rough dielectric interface -
+// Local frame, +z side has etaA, -z side etaB. Directions point AWAY from
+// the interface ("view" convention). Used by the rough dielectric material
+// and as the layered slab's coat interface.
+
+// Scatter: given incident view wV (either side), samples reflection or
+// transmission by Fresnel choice. Returns the outgoing view direction,
+// the throughput multiplier (eta-free G2/G1 - the Fresnel choice cancels;
+// radiance-compression eta^2 is the CALLER's business because it cancels
+// over enter/exit pairs inside the layered slab), the full sampling pdf
+// (choice * VNDF * jacobian) and whether the sample crossed the interface.
+bool DielScatter(vec3 wV, float a, float etaA, float etaB,
+                 out vec3 wOut, out float weight, out float pdf, out bool crossed)
+{
+    wOut = vec3(0.0); weight = 0.0; pdf = 0.0; crossed = false;
+    bool below = wV.z < 0.0;
+    vec3 wl = below ? vec3(wV.xy, -wV.z) : wV; // mirror so wl.z > 0
+    float etaI = below ? etaB : etaA;
+    float etaT = below ? etaA : etaB;
+    if (wl.z <= 1.0e-6) return false;
+
+    vec3 m = GgxSampleVndf(wl, a, RandomFloat2());
+    float dotWM = dot(wl, m);
+    if (dotWM <= 1.0e-6) return false;
+    float F = FresnelDielectric(dotWM, etaI, etaT);
+    if (RandomFloat() < F)
+    {
+        vec3 wo = normalize(2.0 * dotWM * m - wl);
+        if (wo.z <= 1.0e-6) return false; // below-horizon reflection: absorbed
+        weight = GgxG2(wl, wo, a) / GgxG1(wl, a);
+        pdf = F * GgxVndfPdf(wl, m, a) / (4.0 * dotWM);
+        wOut = below ? vec3(wo.xy, -wo.z) : wo;
+    }
+    else
+    {
+        float etaRel = etaI / etaT;
+        vec3 wt = refract(-wl, m, etaRel);
+        if (dot(wt, wt) < 1.0e-9 || wt.z >= -1.0e-6) return false;
+        wt = normalize(wt);
+        float dotTM = dot(wt, m);
+        float denom = etaI * dotWM + etaT * dotTM;
+        denom *= denom;
+        float J = etaT * etaT * abs(dotTM) / max(denom, 1.0e-9);
+        weight = GgxG2(wl, wt, a) / GgxG1(wl, a);
+        pdf = (1.0 - F) * GgxVndfPdf(wl, m, a) * J;
+        crossed = true;
+        wOut = below ? vec3(wt.xy, -wt.z) : wt; // wt.z < 0 in mirrored frame
+    }
+    return weight > 0.0 && pdf > 0.0;
+}
+
+// Reflection eval at the interface, both views on the +z(etaA) side or both
+// mirrored by the caller. Colorless. pdf matches DielScatter's convention.
+float DielEvalR(vec3 wi, vec3 wo, float a, float etaI, float etaT, out float pdf)
+{
+    pdf = 0.0;
+    if (wi.z <= 1.0e-6 || wo.z <= 1.0e-6) return 0.0;
+    vec3 m = normalize(wi + wo);
+    float dotWiM = dot(wi, m);
+    if (dotWiM <= 1.0e-6) return 0.0;
+    float D = GgxD(m, a);
+    if (D <= 0.0) return 0.0;
+    float F = FresnelDielectric(dotWiM, etaI, etaT);
+    pdf = F * GgxVndfPdf(wi, m, a) / (4.0 * dotWiM);
+    return F * D * GgxG2(wi, wo, a) / (4.0 * wi.z * wo.z);
+}
+
+// Transmission eval (Walter 2007 eq. 21, radiance form - includes the
+// etaT^2 compression): wi.z > 0 (etaI side), wo.z < 0 (etaT side). Also
+// returns the pdf of sampling wo from wi via DielScatter (choice*VNDF*J).
+float DielEvalT(vec3 wi, vec3 wo, float a, float etaI, float etaT, out float pdf)
+{
+    pdf = 0.0;
+    if (wi.z <= 1.0e-6 || wo.z >= -1.0e-6) return 0.0;
+    vec3 m = etaI * wi + etaT * wo;
+    if (dot(m, m) < 1.0e-12) return 0.0;
+    m = normalize(m);
+    if (m.z < 0.0) m = -m;
+    float dotWiM = dot(wi, m);
+    float dotWoM = dot(wo, m);
+    if (dotWiM <= 1.0e-6 || dotWoM >= 0.0) return 0.0;
+    float D = GgxD(m, a);
+    if (D <= 0.0) return 0.0;
+    float F = FresnelDielectric(dotWiM, etaI, etaT);
+    if (F >= 1.0) return 0.0;
+    float G = GgxG2(wi, wo, a);
+    float denom = etaI * dotWiM + etaT * dotWoM;
+    denom *= denom;
+    float J = etaT * etaT * abs(dotWoM) / max(denom, 1.0e-9);
+    pdf = (1.0 - F) * GgxVndfPdf(wi, m, a) * J;
+    return dotWiM * J / (abs(wi.z) * abs(wo.z)) * (1.0 - F) * D * G;
+}
+
+// ------------------------------------------------- Henyey-Greenstein -----
+float HgPhase(float cosT, float g)
+{
+    float d = 1.0 + g * g - 2.0 * g * cosT;
+    return (1.0 - g * g) / (4.0 * PI * d * sqrt(max(d, 1.0e-9)));
+}
+
+vec3 HgSample(vec3 w, float g)
+{
+    vec2 u = RandomFloat2();
+    float cosT;
+    if (abs(g) < 1.0e-3) cosT = 1.0 - 2.0 * u.x;
+    else
+    {
+        float s = (1.0 - g * g) / (1.0 + g - 2.0 * g * u.x);
+        cosT = clamp((1.0 + g * g - s * s) / (2.0 * g), -1.0, 1.0);
+    }
+    float sinT = sqrt(max(1.0 - cosT * cosT, 0.0));
+    float phi = 2.0 * PI * u.y;
+    mat3 B = BsdfBasis(w);
+    return normalize(B * vec3(sinT * cos(phi), sinT * sin(phi), cosT));
+}
+
+// ------------------------------------------------------ conductor lobe ---
+// Local frame, wi.z > 0 and wo.z > 0 required.
+vec3 CondEval(vec3 f0, float a, vec3 wi, vec3 wo, out float pdfDir, out float pdfRev)
+{
+    pdfDir = 0.0; pdfRev = 0.0;
+    if (wi.z <= 1.0e-6 || wo.z <= 1.0e-6) return vec3(0.0);
+    vec3 m = normalize(wi + wo);
+    float dotWiM = max(dot(wi, m), 1.0e-6);
+    float D = GgxD(m, a);
+    if (D <= 0.0) return vec3(0.0);
+    pdfDir = GgxVndfPdf(wi, m, a) / (4.0 * dotWiM);
+    pdfRev = GgxVndfPdf(wo, m, a) / (4.0 * dotWiM);
+    return FresnelSchlick3(f0, dotWiM) * (D * GgxG2(wi, wo, a) / (4.0 * wi.z * wo.z));
+}
+
+// ------------------------------------------- layered base (bottom) lobe --
+// Metallic-blended conductor/diffuse mixture sharing baseColor. Local
+// frame, both views .z > 0. Returns f; pdf is the mixture pdf.
+vec3 LayerBaseEval(Material mt, vec3 wi, vec3 wo, out float pdf)
+{
+    pdf = 0.0;
+    if (wi.z <= 1.0e-6 || wo.z <= 1.0e-6) return vec3(0.0);
+    float metal = clamp(mt.params.x, 0.0, 1.0);
+    float pdfC = 0.0, pdfCRev;
+    vec3 fC = (metal > 0.0)
+        ? CondEval(mt.baseColor.rgb, BsdfAlpha(mt.params.y), wi, wo, pdfC, pdfCRev)
+        : vec3(0.0);
+    vec3 fD = mt.baseColor.rgb / PI;
+    float pdfD = wo.z / PI;
+    pdf = mix(pdfD, pdfC, metal);
+    return mix(fD, fC, metal);
+}
+
+// Sample the base mixture; returns f of the FULL mixture and its pdf so the
+// walk can apply f * cos / pdf.
+vec3 LayerBaseSample(Material mt, vec3 wi, out vec3 wo, out float pdf)
+{
+    float metal = clamp(mt.params.x, 0.0, 1.0);
+    if (RandomFloat() < metal)
+    {
+        vec3 m = GgxSampleVndf(wi, BsdfAlpha(mt.params.y), RandomFloat2());
+        wo = normalize(2.0 * dot(wi, m) * m - wi);
+    }
+    else
+    {
+        wo = CosineSampleHemisphere(vec3(0.0, 0.0, 1.0));
+    }
+    if (wo.z <= 1.0e-6) { pdf = 0.0; return vec3(0.0); }
+    return LayerBaseEval(mt, wi, wo, pdf);
+}
+
+// --------------------------------------------------- layered slab walk ---
+// Guo et al. 2018 position-free simulation. Local frame: +z = outside on
+// the query side (the slab is treated two-sided, mirrored onto whichever
+// side the query hits). Depth zeta runs from 1 (coat interface) down to 0
+// (opaque base interface). The walk IS standard path tracing in slab
+// coordinates - free-flight distances are sampled along the ray, so no
+// geometry terms and no cosine bookkeeping appear in continuation weights:
+// interfaces multiply eta-free VNDF weights (G2/G1), volume scatters
+// multiply the single-scattering albedo. All refraction eta^2 factors
+// cancel over the enter/exit pair (air both sides), so the walk never
+// tracks transport mode.
+// Runtime-opaque bounce cap: always 16, but phrased so the compiler cannot
+// prove it constant - a fully unrolled walk at every inlined EvalBsdf call
+// site overflows the NVIDIA assembler's instruction limit in the big
+// megakernels ("too many instructions").
+int LayerMaxBounces() { return int(min(16u, 16u + uFrame.frameInfo.z)); }
+
+// Backward NEE connection through the coat: given the external direction
+// wiL (.z>0), force-sample the refraction branch, producing the internal
+// light propagation direction dIn (.z<0), the connection factor
+// fT(wi->dIn) (Walter radiance form, includes the (1-F)), and the pdf of
+// dIn in solid angle (for local MIS). Returns false on a failed sample.
+bool LayerConnSample(vec3 wiL, float a, float etaC, out vec3 dIn, out float fT, out float pdfConn)
+{
+    dIn = vec3(0.0); fT = 0.0; pdfConn = 0.0;
+    vec3 m = GgxSampleVndf(wiL, a, RandomFloat2());
+    float dotWM = dot(wiL, m);
+    if (dotWM <= 1.0e-6) return false;
+    vec3 wt = refract(-wiL, m, 1.0 / etaC);
+    if (dot(wt, wt) < 1.0e-9 || wt.z >= -1.0e-6) return false;
+    dIn = normalize(wt);
+    float pdfT;
+    fT = DielEvalT(wiL, dIn, a, 1.0, etaC, pdfT);
+    pdfConn = pdfT; // full sampling pdf incl. (1-F) choice and jacobian
+    return fT > 0.0 && pdfConn > 0.0;
+}
+
+// pdf that LayerConnSample(wiL) produces internal direction dIn (.z<0).
+float LayerConnPdf(vec3 wiL, vec3 dIn, float a, float etaC)
+{
+    float pdfT;
+    DielEvalT(wiL, dIn, a, 1.0, etaC, pdfT);
+    return pdfT;
+}
+
+// Forward sampling walk: full simulation from external wiL (.z>0) to an
+// exit direction. Returns weight = f*cos/pdf realization.
+bool LayeredWalkSample(Material mt, vec3 wiL, out vec3 dirOut, out vec3 weight)
+{
+    dirOut = vec3(0.0, 0.0, 1.0);
+    weight = vec3(0.0);
+    float aC = BsdfAlpha(mt.coat.x);
+    float etaC = max(mt.coat.y, 1.0001);
+    float tau = max(mt.coat.z, 0.0);
+    float g = clamp(mt.coat.w, -0.99, 0.99);
+    vec3 medAlb = clamp(mt.coatTint.rgb, vec3(0.0), vec3(1.0));
+
+    vec3 w; float wSc, pdfSc; bool crossed;
+    if (!DielScatter(wiL, aC, 1.0, etaC, w, wSc, pdfSc, crossed)) return false;
+    vec3 beta = vec3(wSc);
+    if (!crossed) { dirOut = w; weight = beta; return true; } // top reflection
+
+    float zeta = 1.0; // just inside the coat, heading down (w.z < 0)
+    int maxBounce = LayerMaxBounces();
+    for (int bounce = 0; bounce < maxBounce; ++bounce)
+    {
+        bool volume = false;
+        if (tau > 0.0 && abs(w.z) > 1.0e-6)
+        {
+            float s = -log(max(1.0 - RandomFloat(), 1.0e-7)) / tau;
+            float zNew = zeta + s * w.z;
+            if (zNew > 0.0 && zNew < 1.0) { volume = true; zeta = zNew; }
+            else zeta = (w.z > 0.0) ? 1.0 : 0.0;
+        }
+        else zeta = (w.z > 0.0) ? 1.0 : 0.0;
+
+        if (volume)
+        {
+            beta *= medAlb;
+            w = HgSample(w, g);
+        }
+        else if (zeta <= 0.0)
+        {
+            vec3 wo; float pdfB;
+            vec3 fB = LayerBaseSample(mt, -w, wo, pdfB);
+            if (pdfB <= 0.0) return false;
+            beta *= fB * (wo.z / pdfB);
+            w = wo; // heading up
+        }
+        else
+        {
+            if (!DielScatter(-w, aC, 1.0, etaC, w, wSc, pdfSc, crossed)) return false;
+            beta *= wSc;
+            if (crossed) // refracted out into air
+            {
+                if (w.z <= 1.0e-6) return false;
+                dirOut = w;
+                weight = beta;
+                return true;
+            }
+            // else TIR / internal reflection, heading down again
+        }
+
+        if (bounce >= 3)
+        {
+            float q = clamp(max(beta.r, max(beta.g, beta.b)), 0.05, 1.0);
+            if (RandomFloat() >= q) return false;
+            beta /= q;
+        }
+    }
+    return false;
+}
+
+// Evaluation walk: unidirectional estimator with NEE (paper 5.2.1).
+// Estimates f_l(wi,wo) for both directions on the +z side: the analytic
+// coat reflection lobe, plus an internal walk entered from the wo side
+// whose vertices connect back to wi through the coat. NEE-only: the
+// backward connection (refracting wi through a GGX interface) has full
+// support over internal directions, so every configuration is reachable
+// and the estimator is unbiased without the paper's local-MIS partner
+// strategy. (The continuation-eval partner (Fig 7b) was implemented and
+// measured, but its code inlines at every EvalBsdf call site and pushed
+// the big megakernels past the NVIDIA assembler's instruction limit -
+// NEE-only trades some variance on glossy coats for compilability.)
+vec3 LayeredWalkEval(Material mt, vec3 wiL, vec3 woL)
+{
+    float aC = BsdfAlpha(mt.coat.x);
+    float etaC = max(mt.coat.y, 1.0001);
+    float tau = max(mt.coat.z, 0.0);
+    float g = clamp(mt.coat.w, -0.99, 0.99);
+    vec3 medAlb = clamp(mt.coatTint.rgb, vec3(0.0), vec3(1.0));
+
+    float pdfTopR;
+    vec3 f = vec3(DielEvalR(wiL, woL, aC, 1.0, etaC, pdfTopR));
+
+    // Enter the slab from the wo side: force the refraction branch,
+    // weighted by its true sampling probability ((1-F) folded into fT/pdf).
+    vec3 mEnter = GgxSampleVndf(woL, aC, RandomFloat2());
+    float dotWoM = dot(woL, mEnter);
+    if (dotWoM <= 1.0e-6) return f;
+    vec3 w = refract(-woL, mEnter, 1.0 / etaC);
+    if (dot(w, w) < 1.0e-9 || w.z >= -1.0e-6) return f;
+    w = normalize(w);
+    // Forced-refraction weight: (1-F) * G2/G1 (the eta-free VNDF weight).
+    float Fent = FresnelDielectric(dotWoM, 1.0, etaC);
+    vec3 beta = vec3((1.0 - Fent) * GgxG2(woL, w, aC) / GgxG1(woL, aC));
+    if (beta.r <= 0.0) return f;
+
+    float zeta = 1.0;
+    int maxBounce = LayerMaxBounces();
+    for (int bounce = 0; bounce < maxBounce; ++bounce)
+    {
+        bool volume = false;
+        if (tau > 0.0 && abs(w.z) > 1.0e-6)
+        {
+            float s = -log(max(1.0 - RandomFloat(), 1.0e-7)) / tau;
+            float zNew = zeta + s * w.z;
+            if (zNew > 0.0 && zNew < 1.0) { volume = true; zeta = zNew; }
+            else zeta = (w.z > 0.0) ? 1.0 : 0.0;
+        }
+        else zeta = (w.z > 0.0) ? 1.0 : 0.0;
+
+        if (volume)
+        {
+            // NEE from a volume vertex: light propagates down along dIn to
+            // the vertex, scatters into -w (back along the walk). Volume
+            // in-scattering has no cosine; the connection weight fT/pdfConn
+            // needs the 1/|cos| stripped off the exchange (see derivation).
+            vec3 dIn; float fT, pdfConn;
+            if (LayerConnSample(wiL, aC, etaC, dIn, fT, pdfConn))
+            {
+                float ph = HgPhase(dot(dIn, -w), g);
+                float Tr = exp(-tau * (1.0 - zeta) / max(-dIn.z, 1.0e-6));
+                f += beta * medAlb * ph * Tr * (fT / pdfConn);
+            }
+            beta *= medAlb;
+            w = HgSample(w, g);
+        }
+        else if (zeta <= 0.0)
+        {
+            // NEE from the base interface (the surface RE carries the
+            // |cos| of the connection segment).
+            vec3 dIn; float fT, pdfConn;
+            if (LayerConnSample(wiL, aC, etaC, dIn, fT, pdfConn))
+            {
+                vec3 vConnUp = vec3(-dIn.x, -dIn.y, -dIn.z); // toward coat
+                float pdfBase;
+                vec3 fB = LayerBaseEval(mt, vConnUp, -w, pdfBase);
+                float Tr = exp(-tau / max(vConnUp.z, 1.0e-6));
+                f += beta * fB * vConnUp.z * Tr * (fT / pdfConn);
+            }
+            vec3 wo; float pdfB;
+            vec3 fB2 = LayerBaseSample(mt, -w, wo, pdfB);
+            if (pdfB <= 0.0) return f;
+            beta *= fB2 * (wo.z / pdfB);
+            w = wo;
+        }
+        else
+        {
+            // Walk reached the coat from inside: internal reflection
+            // continues, refraction exits (contributes nothing to eval).
+            float wSc, pdfSc; bool crossed; vec3 wNew;
+            if (!DielScatter(-w, aC, 1.0, etaC, wNew, wSc, pdfSc, crossed)) return f;
+            if (crossed) return f;
+            beta *= wSc;
+            w = wNew;
+        }
+
+        if (bounce >= 3)
+        {
+            float q = clamp(max(beta.r, max(beta.g, beta.b)), 0.05, 1.0);
+            if (RandomFloat() >= q) return f;
+            beta /= q;
+        }
+    }
+    return f;
+}
+
+// Deterministic analytic pdf approximation for the layered BSDF (paper
+// 5.3.2): coat reflection lobe + a roughened base lobe + a Lambertian
+// floor. Only ever used for MIS weighting - never to divide estimates.
+float LayeredApproxPdf(Material mt, vec3 wiL, vec3 woL)
+{
+    if (wiL.z <= 1.0e-6 || woL.z <= 1.0e-6) return 0.0;
+    float aC = BsdfAlpha(mt.coat.x);
+    float etaC = max(mt.coat.y, 1.0001);
+    float F = FresnelDielectric(wiL.z, 1.0, etaC);
+    vec3 m = normalize(wiL + woL);
+    float dotWiM = max(dot(wiL, m), 1.0e-6);
+    float pTop = GgxVndfPdf(wiL, m, aC) / (4.0 * dotWiM);
+    float metal = clamp(mt.params.x, 0.0, 1.0);
+    float aB = BsdfAlpha(mt.params.y);
+    float aEff = min(1.0, sqrt(aB * aB + aC * aC)); // refraction-roughened base
+    float pBase = GgxVndfPdf(wiL, m, aEff) / (4.0 * dotWiM);
+    float pDiff = woL.z / PI;
+    float p = F * pTop + (1.0 - F) * mix(pDiff, pBase, metal);
+    return (p + 0.1 * pDiff) / 1.1; // constant floor keeps full support
+}
+
 // f(wi,wo) for connections and NEE, plus both direction pdfs (pdfDir =
 // pdf of sampling wo given wi, pdfRev = the reverse) - the reverse pdf
 // feeds the recursive MIS quantities. Delta materials return black: a
-// delta lobe can never be hit by a connection.
+// delta lobe can never be hit by a connection. Rough dielectric evaluates
+// its reflection lobe only (transmission connections are not supported -
+// same as glass, the transmitted field is carried by sampled paths whose
+// technique partner here reports pdf 0, keeping the MIS partition valid).
 vec3 EvalBsdf(Material mat, vec3 n, vec3 wi, vec3 wo, out float pdfDir, out float pdfRev, out float cosOut)
 {
     pdfDir = 0.0;
@@ -211,11 +725,46 @@ vec3 EvalBsdf(Material mat, vec3 n, vec3 wi, vec3 wo, out float pdfDir, out floa
     cosOut = 0.0;
     if (MatIsDelta(mat)) return vec3(0.0);
 
+    int type = int(mat.params.w + 0.5);
     vec3 nf = (dot(n, wi) >= 0.0) ? n : -n;
     float cosI = dot(nf, wi);
     float cosO = dot(nf, wo);
     if (cosI <= 1e-6 || cosO <= 1e-6) return vec3(0.0); // reflection side only
     cosOut = cosO;
+
+    if (type == 2) // conductor
+    {
+        mat3 B = BsdfBasis(nf);
+        vec3 wiL = wi * B;
+        vec3 woL = wo * B;
+        return CondEval(mat.baseColor.rgb, BsdfAlpha(mat.params.y), wiL, woL, pdfDir, pdfRev);
+    }
+    if (type == 3) // rough dielectric, reflection lobe
+    {
+        mat3 B = BsdfBasis(nf);
+        vec3 wiL = wi * B;
+        vec3 woL = wo * B;
+        float eta = max(mat.params.z, 1.0001);
+        bool entering = dot(n, wi) >= 0.0;
+        float etaI = entering ? 1.0 : eta;
+        float etaT = entering ? eta : 1.0;
+        float a = BsdfAlpha(mat.params.y);
+        float fR = DielEvalR(wiL, woL, a, etaI, etaT, pdfDir);
+        float pdfRevR;
+        DielEvalR(woL, wiL, a, etaI, etaT, pdfRevR);
+        pdfRev = pdfRevR;
+        return mat.baseColor.rgb * fR;
+    }
+    if (type == 4) // layered (stochastic value, deterministic approx pdfs)
+    {
+        mat3 B = BsdfBasis(nf);
+        vec3 wiL = wi * B;
+        vec3 woL = wo * B;
+        pdfDir = LayeredApproxPdf(mat, wiL, woL);
+        pdfRev = LayeredApproxPdf(mat, woL, wiL);
+        return LayeredWalkEval(mat, wiL, woL);
+    }
+
     pdfDir = cosO / PI;
     pdfRev = cosI / PI;
     return mat.baseColor.rgb / PI;
@@ -283,6 +832,87 @@ BsdfSample SampleBsdf(Material mat, vec3 n, vec3 wi, bool isLightPath)
         return bs;
     }
 
+    int type = int(mat.params.w + 0.5);
+
+    if (type == 2) // GGX conductor
+    {
+        vec3 nf = (dot(n, wi) >= 0.0) ? n : -n;
+        mat3 B = BsdfBasis(nf);
+        vec3 wiL = wi * B;
+        if (wiL.z <= 1e-6) return bs;
+        float a = BsdfAlpha(mat.params.y);
+        vec3 m = GgxSampleVndf(wiL, a, RandomFloat2());
+        float dotWM = dot(wiL, m);
+        if (dotWM <= 1e-6) return bs;
+        vec3 woL = normalize(2.0 * dotWM * m - wiL);
+        if (woL.z <= 1e-6) return bs;
+        float pdfDir, pdfRev;
+        vec3 fC = CondEval(mat.baseColor.rgb, a, wiL, woL, pdfDir, pdfRev);
+        if (pdfDir <= 0.0) return bs;
+        bs.dir = B * woL;
+        bs.cosOut = woL.z;
+        bs.pdfDir = pdfDir;
+        bs.pdfRev = pdfRev;
+        bs.weight = fC * (woL.z / pdfDir);
+        return bs;
+    }
+
+    if (type == 3) // GGX rough dielectric (Walter 2007)
+    {
+        float eta = max(mat.params.z, 1.0001);
+        bool entering = dot(n, wi) > 0.0;
+        vec3 nf = entering ? n : -n;
+        float etaI = entering ? 1.0 : eta;
+        float etaT = entering ? eta : 1.0;
+        mat3 B = BsdfBasis(nf);
+        vec3 wiL = wi * B;
+        if (wiL.z <= 1e-6) return bs;
+        float a = BsdfAlpha(mat.params.y);
+        vec3 woL; float wSc, pdfSc; bool crossed;
+        if (!DielScatter(wiL, a, etaI, etaT, woL, wSc, pdfSc, crossed)) return bs;
+        bs.dir = B * woL;
+        bs.cosOut = abs(woL.z);
+        bs.pdfDir = pdfSc;
+        // eta-free VNDF weight; refraction gets the radiance-compression
+        // factor on eye paths only (same adjoint convention as glass).
+        float etaScale = crossed ? (isLightPath ? 1.0 : (etaI * etaI) / (etaT * etaT)) : 1.0;
+        bs.weight = mat.baseColor.rgb * (wSc * etaScale);
+        // reverse pdf: pdf of sampling wiL back from woL across the lobe
+        if (crossed)
+        {
+            // reverse transmission pdf: mirror the frame so woL becomes the
+            // +z-side incident view; etas swap accordingly
+            float pdfRevT;
+            vec3 wiRev = vec3(woL.xy, -woL.z);
+            vec3 woRev = vec3(wiL.xy, -wiL.z);
+            DielEvalT(wiRev, woRev, a, etaT, etaI, pdfRevT);
+            bs.pdfRev = pdfRevT;
+        }
+        else
+        {
+            float pdfRevR;
+            DielEvalR(woL, wiL, a, etaI, etaT, pdfRevR);
+            bs.pdfRev = pdfRevR;
+        }
+        return bs;
+    }
+
+    if (type == 4) // layered slab (Guo et al. 2018)
+    {
+        vec3 nf = (dot(n, wi) >= 0.0) ? n : -n;
+        mat3 B = BsdfBasis(nf);
+        vec3 wiL = wi * B;
+        if (wiL.z <= 1e-6) return bs;
+        vec3 dirL, wgt;
+        if (!LayeredWalkSample(mat, wiL, dirL, wgt)) return bs;
+        bs.dir = B * dirL;
+        bs.cosOut = dirL.z;
+        bs.pdfDir = LayeredApproxPdf(mat, wiL, dirL);
+        bs.pdfRev = LayeredApproxPdf(mat, dirL, wiL);
+        bs.weight = wgt;
+        return bs;
+    }
+
     vec3 nf = (dot(n, wi) >= 0.0) ? n : -n;
     vec3 dir = CosineSampleHemisphere(nf);
     float cosO = dot(nf, dir);
@@ -295,8 +925,35 @@ BsdfSample SampleBsdf(Material mat, vec3 n, vec3 wi, bool isLightPath)
     return bs;
 }
 
+// ------------------------------------------------- octahedral packing ----
+// Unit direction <-> single float (2x16 bit snorm octahedral). Used to
+// cache reconnection-suffix directions in reservoir spare fields so shifts
+// can re-evaluate glossy BSDFs at cached vertices.
+float OctaEncode(vec3 d)
+{
+    vec2 p = d.xy / (abs(d.x) + abs(d.y) + abs(d.z));
+    if (d.z < 0.0) p = (1.0 - abs(p.yx)) * vec2(p.x >= 0.0 ? 1.0 : -1.0, p.y >= 0.0 ? 1.0 : -1.0);
+    return uintBitsToFloat(packSnorm2x16(p));
+}
+vec3 OctaDecode(float f)
+{
+    vec2 p = unpackSnorm2x16(floatBitsToUint(f));
+    vec3 d = vec3(p.xy, 1.0 - abs(p.x) - abs(p.y));
+    if (d.z < 0.0) d.xy = (1.0 - abs(d.yx)) * vec2(d.x >= 0.0 ? 1.0 : -1.0, d.y >= 0.0 ? 1.0 : -1.0);
+    return normalize(d);
+}
+
 // --------------------------------------------------------------- Ray -----
 struct Ray { vec3 origin; vec3 dir; vec3 invDir; };
+
+// Occlusion tMax for a shadow/connection segment of length d. The margin
+// must dominate the ray-origin's 1e-4 normal offset in ABSOLUTE terms: a
+// purely relative margin (d * 0.999 = d/1000) shrinks below that offset on
+// short segments, and the offset-perturbed ray then clips the TARGET's own
+// surface just before the endpoint - falsely occluding every connection
+// across a tight gap (black patches where surfaces nearly touch). Segments
+// shorter than the floor count as visible (near-contact).
+float ShadowTMax(float d) { return d * 0.999 - 2.0e-4; }
 
 Ray MakeRay(vec3 origin, vec3 dir)
 {

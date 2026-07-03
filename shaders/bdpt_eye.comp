@@ -176,7 +176,7 @@ void main()
 
                         vec3 nf = (dot(hit.normal, L) >= 0.0) ? hit.normal : -hit.normal;
                         Ray shadowRay = MakeRay(hitPos + nf * 1e-4, L);
-                        if (!IntersectSceneOccluded(shadowRay, dist * 0.999))
+                        if (!IntersectSceneOccluded(shadowRay, ShadowTMax(dist)))
                             radiance += throughput * lt.emissionWeight.rgb * f
                                         * (misWeight * cosToLight / directPdfWTrue);
                     }

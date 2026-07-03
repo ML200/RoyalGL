@@ -59,33 +59,47 @@ struct PathReservoir
                   // the valid (observer) side: a shifted predecessor
                   // x'_{r-1} must have dot(worldNormal, dirToPrev) > 0,
                   // w=uintBits(instance id; >= instInfo.x = static)
-    vec4 rcLsuf;  // xyz=L_suf: radiance leaving x_r toward x_{r-1} (direction-
-                  // independent for Lambertian x_r / one-sided emitters),
-                  // w unused. For s>=2 paths with an interior reconnection
-                  // vertex this transparently covers the connection edge
-                  // and the whole light subpath (the suffix is fixed).
+    vec4 rcLsuf;  // xyz=L_suf: radiance leaving x_r toward x_{r-1} with the
+                  // rc vertex's OWN BSDF value rho_r divided out (shifts
+                  // re-evaluate it live between the new arrival direction
+                  // and the cached suffix direction, so glossy rc lobes
+                  // stay exact; emitter / NEE-light-point rc vertices have
+                  // no BSDF and cache plain Le). w = octa-packed OBJECT-
+                  // SPACE suffix direction at x_r (unused for emitter rc).
+                  // For s>=2 paths with an interior reconnection vertex
+                  // this covers the connection edge and the whole light
+                  // subpath (the suffix is fixed).
     vec4 lyPosMat;// s>=2 LIGHTRC paths (camera prefix has no connectable
                   // pair): xyz = light subpath end y_{s-1} position in its
-                  // instance's OBJECT SPACE, w unused
+                  // instance's OBJECT SPACE, w=uintBits(y_{s-1} material)
     vec4 lyNormal;// xyz = OBJECT-SPACE shading normal at y_{s-1}, oriented
                   // toward the camera-side vertex (valid observers),
                   // w=uintBits(instance id)
-    vec4 lyTput;  // xyz = rho_y * fLightNum: every light-side factor of f
-                  // except the connection geometry term, w unused
+    vec4 lyTput;  // xyz = fLightNum: every light-side factor of f except
+                  // the connection geometry term AND the ly BSDF rho_y
+                  // (shifts re-evaluate rho_y toward the new camera vertex
+                  // - glossy ly lobes change with the connection
+                  // direction), w = octa-packed OBJECT-SPACE incoming
+                  // direction at y_{s-1}
     vec4 misCache;// Recursive reconnection MIS cache (Phase 5): the shifted
-                  // path's technique-MIS denominator is affine in the prefix
-                  // state at the reconnection vertex (the dVCM/dVC recursion
-                  // is affine and every suffix pdf is fixed - Lambertian
-                  // forward pdfs depend only on the outgoing direction).
-                  //   surface rc (generic): (C0, C1, -, -):
-                  //     denom' = C0 + C1 * (dVCM'_r + p_rev'_r * dVC'_r)
-                  //     (lightweight set: C0 + C1 * p_rev'_r * dT1'_r)
+                  // path's technique-MIS denominator is affine in the
+                  // prefix state at the reconnection vertex AND in the rc
+                  // vertex's own crossing pdfs pFwd_r = p(suffix|arrival),
+                  // pRev_r = p(arrival|suffix) - both re-evaluated by the
+                  // shift (EvalBsdf at x_r), so glossy rc materials stay
+                  // consistent. With X' = dVCM'_r + pRev_r * dVC'_r
+                  // (lightweight set: pRev_r * dT1'_r):
+                  //   interior rc (r < t-1): (A, B, C, -):
+                  //     denom' = A + (B + C * X') / pFwd_r
+                  //   rc at the candidate vertex (r == t-1, s >= 1):
+                  //     (A, B, C, -): denom' = A + B * pFwd_r + C * X'
                   //   rc = terminal emitter (s=0, r=t-1): (1, directPdfA,
                   //     emissionPdfW, -): denom' = x + y*dVCM'_r + z*dVC'_r
                   //   rc = NEE light point (rcPosMat.w==NO_MATERIAL):
                   //     (-, directPdfA, emissionPdfW, -): full split-vertex
                   //     recompute at x'_{t-1}
-                  //   LIGHTRC: (dVCM_y + dVC_y*lightRevPdfW, -, -, -)
+                  //   LIGHTRC: (dVCM_y, dVC_y, -, -): the shift folds in
+                  //     its own lightRevPdfW' at the new direction
                   // Pure-replay paths recompute omega during replay and
                   // cache nothing. Eval pdfs come from RestirLightPdfs (the
                   // frame-independent power CDF), so omega is a
@@ -228,6 +242,28 @@ void RestirLightPdfs(uint lightIdx, float cosTheta, out float directPdfA, out fl
 // chain effectively accumulates: higher = more reuse but longer-lived
 // correlation (a stale/outlier sample needs ~cap frames to wash out).
 float RestirConfidenceCap() { return max(uFrame.prevCamPos.w, 1.0); }
+
+// Temporal reuse fades with the primary vertex's glossiness. At a glossy
+// x_1 the target-function ratio between different lobe samples is huge, so
+// a history reservoir keeps winning the merge far longer than the
+// confidence cap suggests ("sticky" reservoirs): each pixel locks onto one
+// lobe sample and glossy reflections render as hard-edged partitions
+// instead of lobe averages. That is correlation, not bias - the mean is
+// right but finite-sample images look wrong. Scaling history confidence by
+// roughness restores per-pixel turnover where the lobe is sharp and keeps
+// full reuse on rough/diffuse surfaces.
+float RestirReuseRoughFade(uint matId)
+{
+    Material m = materials[matId];
+    int t = int(m.params.w + 0.5);
+    float rough = 1.0;                  // diffuse / emissive / delta glass
+                                        // (delta replays are exact - the
+                                        // lobe-partition issue is a ROUGH
+                                        // lobe phenomenon)
+    if (t == 2 || t == 3) rough = m.params.y;
+    else if (t == 4) rough = m.coat.x;  // the top interface shapes the view lobe
+    return clamp(rough * (1.0 / 0.35), 0.15, 1.0);
+}
 
 // Symmetric support restriction on shift Jacobians: a shift whose |dT/dX|
 // falls outside [1/K, K] is treated as undefined. Unbiased - the forward

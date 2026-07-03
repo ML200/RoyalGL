@@ -98,7 +98,8 @@ void main()
     // sample survived - a NULL history (W=0) still weights the MIS terms,
     // otherwise paths reachable from the previous frame get double-counted.
     vec4 bCore = pixelRes[bSlot].path.core;
-    float cB = min(bCore.z, RestirConfidenceCap()) * histFade;
+    float cB = min(bCore.z, RestirConfidenceCap()) * histFade
+             * RestirReuseRoughFade(GBufMaterial(gCur));
     float cA = aCore.z;
 
     // ------------------------------------- forward shift: B -> current ---

@@ -214,6 +214,9 @@ RestirShiftResult RestirShiftLightPath(uint baseSlot, GBufferPixel dstG, vec3 ds
     float dist = sqrt(d2);
     vec3 dirTo = toX1 / dist;
 
+    // Align stochastic-eval draws with the anchored creation's RNG_EVAL
+    // stream (s-1 = the free landing's light-path index at creation).
+    RngStream(s - 1u, RNG_EVAL);
     float pd = 0.0, pr = 0.0, cosOut = 0.0;
     if (prevIsLight)
     {
@@ -240,7 +243,7 @@ RestirShiftResult RestirShiftLightPath(uint baseSlot, GBufferPixel dstG, vec3 ds
 
     vec3 nf = (dot(prevN, dirTo) >= 0.0) ? prevN : -prevN;
     Ray shadowRay = MakeRay(prevPos + nf * 1e-4, dirTo);
-    if (IntersectSceneOccluded(shadowRay, dist * 0.999)) return res;
+    if (IntersectSceneOccluded(shadowRay, ShadowTMax(dist))) return res;
 
     // x_1' factors: BSDF toward the destination camera plus the
     // deterministic t=1 camera factor, mirroring candidate creation in
@@ -432,26 +435,48 @@ RestirShiftResult RestirShiftPath(uint baseSlot, GBufferPixel dstG, vec3 dstWi,
             float cosY = dot(lyNrmW, -dirY);
             if (cosY <= 1e-6) return res; // wrong side of y_{s-1}
 
+            // Stochastic-eval determinism: creation evaluated this
+            // connection under RNG_CONNECT (after the one LVC-pick draw).
+            // Re-seed and burn that draw so layered-material realizations
+            // reproduce creation's EXACTLY on identity shifts - otherwise
+            // the temporal<->spatial loop feeds two fixed, different
+            // realizations of the same path into the pairwise MIS ratios
+            // and the imbalance compounds geometrically.
+            RngStream(i, RNG_CONNECT);
+            RandomFloat();
             float pdfDirY, pdfRevY, cosOutY;
             vec3 fbY = EvalBsdf(mat, n, wi, dirY, pdfDirY, pdfRevY, cosOutY);
             if (fbY == vec3(0.0)) return res;
 
             vec3 nfY = (dot(n, dirY) >= 0.0) ? n : -n;
             Ray shadowRayY = MakeRay(x + nfY * 1e-4, dirY);
-            if (IntersectSceneOccluded(shadowRayY, distY * 0.999)) return res;
+            if (IntersectSceneOccluded(shadowRayY, ShadowTMax(distY))) return res;
+
+            // Re-evaluate the ly vertex's BSDF toward the NEW camera vertex
+            // (cached lyTput excludes it - glossy ly lobes change with the
+            // connection direction; its true pdfs feed the omega recompute).
+            Material lmat = materials[floatBitsToUint(RS_BASE.lyPosMat.w)];
+            vec3 lyWiW = RestirObjToWorldNormal(lyInst, OctaDecode(RS_BASE.lyTput.w));
+            float lightDirPdfW, lightRevPdfW, cosLyOut;
+            vec3 fLight = EvalBsdf(lmat, lyNrmW, lyWiW, -dirY,
+                                   lightDirPdfW, lightRevPdfW, cosLyOut);
+            if (fLight == vec3(0.0)) return res;
 
             f *= fbY * (cosOutY * cosY / d2y); // fCam * geometry term
-            f *= RS_BASE.lyTput.xyz;              // rho_y * light prefix numerator
+            f *= fLight;                       // rho_y at the new direction
+            f *= RS_BASE.lyTput.xyz;           // light prefix numerator
 
             // omega_tau: the full s>=2 connection weight at the shifted
-            // connection edge; misCache.x is the light side's fixed ratio
-            // sum (LIGHTRC paths only exist with connections enabled).
+            // connection edge; misCache carries ly's UNFOLDED prefix state
+            // (LIGHTRC paths only exist with connections enabled).
             res.omega = RS_BASE.rcInfo.z;
             if (misRecompute)
             {
                 float camDirPdfA = pdfDirY * cosY / d2y;
-                float lightDirPdfA = (cosY / PI) * cosOutY / d2y;
-                float denom = camDirPdfA * RS_BASE.misCache.x + 1.0
+                float lightDirPdfA = lightDirPdfW * cosOutY / d2y;
+                float denom = camDirPdfA
+                                  * (RS_BASE.misCache.x + RS_BASE.misCache.y * lightRevPdfW)
+                            + 1.0
                             + lightDirPdfA * (dVCM + pdfRevY * dVC);
                 if (isnan(denom) || isinf(denom)) return res;
                 res.omega = 1.0 / max(denom, 1.0);
@@ -486,24 +511,50 @@ RestirShiftResult RestirShiftPath(uint baseSlot, GBufferPixel dstG, vec3 dstWi,
             float cosRc = dot(rcNrmW, -dir);
             if (cosRc <= 1e-6) return res;
 
+            uint rcMatBits = floatBitsToUint(RS_BASE.rcPosMat.w);
+            // s=1 light-point rc: the eval vertex x_{t-1} can be a
+            // stochastic-eval (layered) material - creation ran this eval
+            // under the dedicated RNG_EVAL stream so shifts reproduce its
+            // realization exactly (rc-pair vertices are never layered, so
+            // the other cases consume no draws here).
+            if (rcMatBits == NO_MATERIAL) RngStream(i, RNG_EVAL);
             float pdfDir, pdfRev, cosOut;
             vec3 fb = EvalBsdf(mat, n, wi, dir, pdfDir, pdfRev, cosOut);
             if (fb == vec3(0.0)) return res;
 
             vec3 nf = (dot(n, dir) >= 0.0) ? n : -n;
             Ray shadowRay = MakeRay(x + nf * 1e-4, dir);
-            if (IntersectSceneOccluded(shadowRay, dist * 0.999)) return res;
+            if (IntersectSceneOccluded(shadowRay, ShadowTMax(dist))) return res;
 
             if (RS_BASE.rcInfo.x <= 0.0 || RS_BASE.rcInfo.y <= 0.0) return res;
 
+            // Re-evaluate the rc vertex's BSDF between the NEW arrival
+            // direction and the cached suffix direction (rcLsuf excludes
+            // it - glossy rc lobes change with the arrival direction). Its
+            // true pdfs replace the old folded Lambertian assumptions in
+            // the omega recompute. Skipped when the rc vertex has no BSDF
+            // (NEE light point / terminal emitter).
+            bool emitterRc = (s == 0u && r == t - 1u);
+            float pFwdRc = 0.0, pRevRc = 0.0;
+            if (rcMatBits != NO_MATERIAL && !emitterRc)
+            {
+                vec3 suffixDirW = RestirObjToWorldNormal(rcInst, OctaDecode(RS_BASE.rcLsuf.w));
+                float cosSufRc;
+                vec3 rhoRc = EvalBsdf(materials[rcMatBits], rcNrmW, -dir, suffixDirW,
+                                      pFwdRc, pRevRc, cosSufRc);
+                if (rhoRc == vec3(0.0) || pFwdRc <= 0.0) return res;
+                f *= rhoRc;
+            }
+
             f *= fb * cosOut;          // rho*cos at x'_{r-1}
-            f *= RS_BASE.rcLsuf.xyz;      // cached suffix radiance
+            f *= RS_BASE.rcLsuf.xyz;      // cached suffix radiance (sans rho_r)
             J *= (cosRc / RS_BASE.rcInfo.x) * (RS_BASE.rcInfo.y / d2); // Eq. 55
 
             // ----------------- omega_tau recomputation (Phase 5) ---------
             // The technique-MIS denominator of the shifted path is affine
-            // in the prefix state at x_r (see misCache in
-            // restir_common.glsl). pRev'_r = cosRc/PI (Lambertian x_r).
+            // in the prefix state at x_r AND in the rc vertex's own
+            // crossing pdfs (see misCache in restir_common.glsl); pFwdRc /
+            // pRevRc substitute the shift-dependent factors.
             res.omega = RS_BASE.rcInfo.z;
             if (misRecompute)
             {
@@ -511,7 +562,7 @@ RestirShiftResult RestirShiftPath(uint baseSlot, GBufferPixel dstG, vec3 dstWi,
                 float dVCr = (cosOut / pdfDir) * (dVCM + pdfRev * dVC) / cosRc;
                 float dT1r = (cosOut / pdfDir) * (i == 1u ? dT1 : pdfRev * dT1) / cosRc;
                 float denom;
-                if (floatBitsToUint(RS_BASE.rcPosMat.w) == NO_MATERIAL)
+                if (rcMatBits == NO_MATERIAL)
                 {
                     // s=1 with the sampled light point as rc vertex: full
                     // split-vertex recompute at the moved NEE vertex.
@@ -522,7 +573,7 @@ RestirShiftResult RestirShiftPath(uint baseSlot, GBufferPixel dstG, vec3 dstWi,
                                       : prefac * (i == 1u ? dT1 : pdfRev * dT1);
                     denom = 1.0 + pdfDir / directPdfW + wCam;
                 }
-                else if (s == 0u && r == t - 1u)
+                else if (emitterRc)
                 {
                     // rc vertex IS the terminal emitter.
                     denom = RS_BASE.misCache.x + RS_BASE.misCache.y * dVCMr
@@ -530,9 +581,17 @@ RestirShiftResult RestirShiftPath(uint baseSlot, GBufferPixel dstG, vec3 dstWi,
                 }
                 else
                 {
-                    float X = conn ? (dVCMr + (cosRc / PI) * dVCr)
-                                   : ((cosRc / PI) * dT1r);
-                    denom = RS_BASE.misCache.x + RS_BASE.misCache.y * X;
+                    float X = conn ? (dVCMr + pRevRc * dVCr)
+                                   : (pRevRc * dT1r);
+                    denom = (r == t - 1u)
+                        // rc at the candidate vertex (s=1 NEE / s>=2 conn):
+                        // its forward pdf competes in the numerator.
+                        ? RS_BASE.misCache.x + RS_BASE.misCache.y * pFwdRc
+                              + RS_BASE.misCache.z * X
+                        // interior rc: symbolic (A,B,C) with 1/pFwd factors.
+                        : RS_BASE.misCache.x
+                              + (RS_BASE.misCache.y + RS_BASE.misCache.z * X)
+                                    / max(pFwdRc, 1e-20);
                 }
                 if (isnan(denom) || isinf(denom)) return res;
                 res.omega = 1.0 / max(denom, 1.0);

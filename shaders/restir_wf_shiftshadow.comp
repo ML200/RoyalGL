@@ -27,6 +27,6 @@ void main()
 
     vec3 nf = (dot(n, dirDist.xyz) >= 0.0) ? n : -n;
     Ray shadowRay = MakeRay(pos + nf * 1e-4, dirDist.xyz);
-    bool occluded = IntersectSceneOccluded(shadowRay, dirDist.w * 0.999);
+    bool occluded = IntersectSceneOccluded(shadowRay, ShadowTMax(dirDist.w));
     wfArena[jb].z = uintBitsToFloat(occluded ? WF_JOB_FAIL : WF_JOB_OK);
 }

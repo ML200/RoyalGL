@@ -349,6 +349,8 @@ namespace RoyalGL
             defaultMat.baseColor = glm::vec4(0.8f, 0.8f, 0.8f, 0.0f);
             defaultMat.emissive = glm::vec4(0.0f, 0.0f, 0.0f, 0.0f);
             defaultMat.params = glm::vec4(0.0f, 0.5f, 0.0f, 0.0f);
+            defaultMat.coat = glm::vec4(0.1f, 1.5f, 0.0f, 0.0f);
+            defaultMat.coatTint = glm::vec4(1.0f, 1.0f, 1.0f, 0.0f);
             return {defaultMat};
         }
 
@@ -361,6 +363,8 @@ namespace RoyalGL
             gpuMat.baseColor = glm::vec4(mat.baseColor, 0.0f);
             gpuMat.emissive = glm::vec4(mat.emissive, 0.0f);
             gpuMat.params = glm::vec4(mat.metallic, mat.roughness, mat.ior, static_cast<float>(mat.type));
+            gpuMat.coat = glm::vec4(mat.coatRoughness, mat.coatIor, mat.coatDepth, mat.coatG);
+            gpuMat.coatTint = glm::vec4(mat.coatAlbedo, 0.0f);
             gpuMaterials.push_back(gpuMat);
         }
 

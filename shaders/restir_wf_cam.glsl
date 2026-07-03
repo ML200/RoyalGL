@@ -24,26 +24,30 @@
 // restir_common.glsl + restir_wf_common.glsl included first.
 
 // ------------------------------------------------- per-pixel state map ----
-// base = idx * 24 vec4s inside wfArena:
+// base = idx * 26 vec4s inside wfArena:
 //  0 posMat   xyz current vertex position, w uintBits(mat<<24|tri)
 //  1 nrmFlags xyz shading normal, w uintBits: bit0 rcFound,
-//             bit1 prevConnectable, bits 8-15 deltaMask, bits 16-19 rcIdx
+//             bit1 prevConnectable, bits 8-15 deltaMask, bits 16-19 rcIdx,
+//             bits 20-23 rcInst
 //  2 wiPdf    xyz wi (toward the previous vertex; the pending bounce ray
 //             direction is -wi), w pdfPrevArrival
 //  3 fCurProd xyz fCur, w pProd
 //  4 misA     x dVCM, y dVC, z dT1, w wSum
-//  5 misB     x misK1, y misK2, z uintBits(risRng), w uintBits(camSeed)
+//  5 misB     x misKA, y misKB, z uintBits(risRng), w uintBits(camSeed)
 //  6 rcPos    xyz reconnection vertex, w uintBits(rcMat)
 //  7 rcNrm    xyz oriented rc normal, w replayPdfBase
-//  8 fArrive  xyz fArriveRc, w rcBaseCos
-//  9 rcExt    x rcBaseDist2, yzw unused
+//  8 fArrive  xyz suffix-cache divisor: fCur at rc arrival, times rho_r
+//             once the rc scatter executes (rcLsuf excludes the rc BSDF -
+//             shifts re-evaluate it), w rcBaseCos
+//  9 rcExt    x rcBaseDist2, y octa(object-space suffix dir at x_r, set by
+//             the rc scatter), z misKC, w dvcmB
 // 10 hitA     xyz hit position, w hit t (<0 = miss)   [camtrace writes]
 // 11 hitB     xyz hit normal, w uintBits(mat<<24|tri) [camtrace writes]
-// 12..17 candidate slot 0 (NEE), 18..23 candidate slot 1 (LVC connection)
-uint WfCamBase(uint idx) { return idx * 24u; }
+// 12..18 candidate slot 0 (NEE), 19..25 candidate slot 1 (LVC connection)
+uint WfCamBase(uint idx) { return idx * 26u; }
 
 const uint WF_CAM_CND0 = 12u;
-const uint WF_CAM_CND_STRIDE = 6u;
+const uint WF_CAM_CND_STRIDE = 7u;
 
 // Candidate slot layout (+off from the slot base):
 //  +0 fCand.xyz, w = RIS weight (0 = empty; camshadow zeroes it when the
@@ -51,11 +55,14 @@ const uint WF_CAM_CND_STRIDE = 6u;
 //  +1 x omega_tau, y techBits (floatBits), z pProd snapshot (rcInfo.w for
 //     the light-point / LIGHTRC cases), w uintBits(kind)
 //  +2 misCache: verbatim SEL.misCache for SHARED / NEE_LIGHT; for LIGHTRC
-//     x is the cached light ratio sum and yzw carry lyTput exactly
-//  +3 shadowDir.xyz, w = surface distance (occlusion tMax = dist * 0.999)
+//     yzw carry lyTput (x unused)
+//  +3 shadowDir.xyz, w = surface distance (occlusion tMax = ShadowTMax(dist))
 //  +4 NEE_LIGHT: sampled light point.xyz (exact), w uintBits(lightIdx)
-//     LIGHTRC:   oriented lyNormal.xyz
+//     LIGHTRC:   oriented lyNormal.xyz, w uintBits(lyMat<<8 | lyInst)
 //  +5 NEE_LIGHT: x cosAtLight, y dist2 (exact); LIGHTRC: lyPos.xyz (exact)
+//  +6 SHARED_RC at-rc (r==t-1): xyz precomputed rcLsuf (candidate's own
+//     rc BSDF stripped), w octa(object-space suffix dir = connection dir)
+//     LIGHTRC: x dVCM_ly, y dVC_ly, z octa(object-space ly incoming dir)
 const uint WF_CND_EMPTY     = 0u;
 const uint WF_CND_SHARED_RC = 1u; // reconnection data = shared rc block
 const uint WF_CND_NEE_LIGHT = 2u; // rc vertex = the sampled NEE light point
@@ -66,6 +73,7 @@ const uint WF_CAMF_RCFOUND  = 1u;
 const uint WF_CAMF_PREVCONN = 2u;
 uint WfCamFlagsDeltaMask(uint f) { return (f >> 8) & 0xFFu; }
 uint WfCamFlagsRcIdx(uint f) { return (f >> 16) & 0xFu; }
+uint WfCamFlagsRcInst(uint f) { return (f >> 20) & 0xFu; }
 
 // Shade queue entries: pixel index | absorb-only flag in the top bit (the
 // path died at the BSDF sample but round k's candidates still await their
@@ -106,14 +114,31 @@ void WfCamAbsorb(uint base, uint cnd, uint outSlot, inout float wSum, inout uint
     if (kind == WF_CND_SHARED_RC)
     {
         // rc vertex is stored in OBJECT space + instance id (state slots
-        // 6/7/9.y, see restir_common.glsl's object-space storage notes).
+        // 6/7 + flags bits 20-23, see restir_common.glsl's object-space
+        // storage notes).
         vec4 rcPos = wfArena[base + 6u];
         vec4 rcNrm = wfArena[base + 7u];
         vec4 fArr = wfArena[base + 8u];
-        pixelRes[outSlot].path.rcInfo = vec4(fArr.w, wfArena[base + 9u].x, omega, rcNrm.w);
+        vec4 rcExt = wfArena[base + 9u];
+        uint rcInst = WfCamFlagsRcInst(floatBitsToUint(wfArena[base + 1u].w));
+        uint tech = floatBitsToUint(meta.y);
+        uint rr = (tech >> 20) & 0xFu;      // rcIdx (flags bits 4-7 << 16)
+        uint tt = (tech >> 8) & 0xFFu;
+        pixelRes[outSlot].path.rcInfo = vec4(fArr.w, rcExt.x, omega, rcNrm.w);
         pixelRes[outSlot].path.rcPosMat = rcPos;
-        pixelRes[outSlot].path.rcNormal = vec4(rcNrm.xyz, wfArena[base + 9u].y);
-        pixelRes[outSlot].path.rcLsuf = vec4(SafeDiv(fCand, fArr.xyz), 0.0);
+        pixelRes[outSlot].path.rcNormal = vec4(rcNrm.xyz, uintBitsToFloat(rcInst));
+        if (rr == tt - 1u)
+        {
+            // rc at the candidate vertex: Lsuf precomputed at creation
+            // (its own connection BSDF stripped, connection dir cached).
+            pixelRes[outSlot].path.rcLsuf = wfArena[cb + 6u];
+        }
+        else
+        {
+            // Interior rc: the shared divisor already carries rho_r (the
+            // rc scatter ran before this deferred absorb).
+            pixelRes[outSlot].path.rcLsuf = vec4(SafeDiv(fCand, fArr.xyz), rcExt.y);
+        }
         pixelRes[outSlot].path.misCache = wfArena[cb + 2u];
     }
     else if (kind == WF_CND_NEE_LIGHT)
@@ -134,10 +159,12 @@ void WfCamAbsorb(uint base, uint cnd, uint outSlot, inout float wSum, inout uint
     else // WF_CND_LIGHTRC
     {
         vec4 mc = wfArena[cb + 2u];
+        vec4 ext = wfArena[cb + 6u];
+        uint mi = floatBitsToUint(wfArena[cb + 4u].w); // lyMat<<8 | lyInst
         pixelRes[outSlot].path.rcInfo = vec4(0.0, 0.0, omega, meta.z);
-        pixelRes[outSlot].path.lyPosMat = vec4(wfArena[cb + 5u].xyz, 0.0);
-        pixelRes[outSlot].path.lyNormal = wfArena[cb + 4u]; // obj normal + inst id
-        pixelRes[outSlot].path.lyTput = vec4(mc.yzw, 0.0);
-        pixelRes[outSlot].path.misCache = vec4(mc.x, 0.0, 0.0, 0.0);
+        pixelRes[outSlot].path.lyPosMat = vec4(wfArena[cb + 5u].xyz, uintBitsToFloat(mi >> 8));
+        pixelRes[outSlot].path.lyNormal = vec4(wfArena[cb + 4u].xyz, uintBitsToFloat(mi & 0xFu));
+        pixelRes[outSlot].path.lyTput = vec4(mc.yzw, ext.z); // + octa(ly wi)
+        pixelRes[outSlot].path.misCache = vec4(ext.x, ext.y, 0.0, 0.0);
     }
 }

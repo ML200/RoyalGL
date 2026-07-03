@@ -151,11 +151,18 @@ void main()
 
     // Affine MIS suffix cache (Phase 5, see restir_common.glsl): once the
     // reconnection vertex is found, dVC at any later vertex decomposes as
-    // dVC_i = misK1 + misK2 * (dVCM_r + pRev_r * dVC_r) - the recursion is
-    // affine and all suffix pdfs are fixed. The lightweight dT1 shares the
-    // multiplicative chain: dT1_i = misK2 * pRev_r * dT1_r (no additions).
-    float misK1 = 0.0;
-    float misK2 = 0.0;
+    // dVC_i = misKA + (misKB + misKC * (dVCM_r + pRev_r * dVC_r)) / pFwd_r.
+    // Every factor of the rc scatter's forward pdf pFwd_r (and its reverse
+    // pdf pRev_r) is kept SYMBOLIC: shifts change the arrival direction at
+    // x_r, and for glossy rc materials those pdfs change with it - the
+    // shift recomputes them from one EvalBsdf call against the cached
+    // suffix direction and substitutes. (For Lambertian rc this reduces to
+    // the old folded cache exactly.) The lightweight dT1 shares the
+    // multiplicative chain (no dVCM additions -> no A/B parts).
+    float misKA = 0.0; // pFwd-free additive chain
+    float misKB = 0.0; // coefficient of 1/pFwd_r (dVCM_{r+1} contributions)
+    float misKC = 0.0; // coefficient of (dVCM_r + pRev_r*dVC_r)/pFwd_r
+    float dvcmB = 0.0; // dVCM tracker: while nonzero, dVCM == dvcmB/pFwd_r
 
     // Reconnection bookkeeping: r = first vertex index >= 2 whose
     // predecessor pair (x_{r-1}, x_r) is both-connectable.
@@ -166,7 +173,12 @@ void main()
     uint rcInst = 0u;
     float rcBaseCos = 0.0, rcBaseDist2 = 0.0;
     float replayPdfBase = 1.0;  // pdf product over scatters at vertices 1..r-2
-    vec3 fArriveRc = vec3(1.0); // f at arrival of x_r (prefix incl. scatter at x_{r-1})
+    // Suffix-cache divisor: f at arrival of x_r (prefix incl. scatter at
+    // x_{r-1}), TIMES the BSDF value rho of the scatter at x_r once it
+    // happens - rcLsuf then excludes the rc vertex's (direction-dependent)
+    // BSDF value, which shifts re-evaluate live against rcSuffixDirW.
+    vec3 fArriveRc = vec3(1.0);
+    vec3 rcSuffixDirW = vec3(0.0); // world dir of the suffix leaving x_r
     float pdfPrevArrival = 1.0; // pProd at arrival of the PREVIOUS vertex
     bool prevConnectable = false;
 
@@ -179,8 +191,9 @@ void main()
         bool isEmissive = dot(mat.emissive.rgb, mat.emissive.rgb) > 0.0;
 
         // Reconnection vertex: first connectable pair. Emitters and lights
-        // count as connectable; delta (glass) does not.
-        bool selfConnectable = !isDelta;
+        // count as connectable; delta (glass) and layered (stochastic
+        // sampling weights, see MatRcCacheable) do not.
+        bool selfConnectable = MatRcCacheable(mat) || isEmissive;
         if (!rcFound && pathLen >= 2u && prevConnectable && selfConnectable)
         {
             rcFound = true;
@@ -248,20 +261,27 @@ void main()
                             SEL.rcInfo = vec4(rcBaseCos, rcBaseDist2, omega, replayPdfBase);
                             SEL.rcPosMat = vec4(rcPos, uintBitsToFloat(rcMat));
                             SEL.rcNormal = vec4(rcNrm, uintBitsToFloat(rcInst));
-                            SEL.rcLsuf = vec4(SafeDiv(fCand, fArriveRc), 0.0);
+                            SEL.rcLsuf = vec4(SafeDiv(fCand, fArriveRc),
+                                              rcIdx == pathLen ? 0.0
+                                                  : OctaEncode(RestirWorldToObjNormal(rcInst, rcSuffixDirW)));
                             // MIS cache (restir_common.glsl): no competitors
                             // -> constant denominator 1; rc at the emitter
-                            // itself -> terminal-special; else fold the
-                            // fixed suffix.
+                            // itself -> terminal-special; else the symbolic
+                            // (A,B,C) fold in the rc pdfs.
                             if (!hasCompetitors)
                                 SEL.misCache = vec4(1.0, 0.0, 0.0, 0.0);
                             else if (rcIdx == pathLen)
                                 SEL.misCache = vec4(1.0, directPdfA, emissionPdfW, 0.0);
                             else
+                            {
+                                float dvcmA = (dvcmB > 0.0) ? 0.0 : dVCM;
                                 SEL.misCache = vec4(
-                                    1.0 + directPdfA * dVCM
-                                        + emissionPdfW * (connections ? misK1 : 0.0),
-                                    emissionPdfW * misK2, 0.0, 0.0);
+                                    1.0 + directPdfA * dvcmA
+                                        + emissionPdfW * (connections ? misKA : 0.0),
+                                    directPdfA * dvcmB
+                                        + emissionPdfW * (connections ? misKB : 0.0),
+                                    emissionPdfW * misKC, 0.0);
+                            }
                         }
                         else
                         {
@@ -300,6 +320,7 @@ void main()
                 RestirLightPdfs(lightIdx, cosAtLight, directPdfA, emissionPdfW);
                 float directPdfW = directPdfA * dist2 / cosAtLight;
 
+                RngStream(pathLen, RNG_EVAL); // shift-reproducible eval draws
                 float bsdfDirPdfW, bsdfRevPdfW, cosToLight;
                 vec3 fb = EvalBsdf(mat, n, wi, L, bsdfDirPdfW, bsdfRevPdfW, cosToLight);
 
@@ -327,7 +348,7 @@ void main()
                     {
                         vec3 nf = (dot(n, L) >= 0.0) ? n : -n;
                         Ray shadowRay = MakeRay(x + nf * 1e-4, L);
-                        if (!IntersectSceneOccluded(shadowRay, dist * 0.999))
+                        if (!IntersectSceneOccluded(shadowRay, ShadowTMax(dist)))
                         {
                             wSum += w;
                             if (RestirRand(risRng) * wSum <= w)
@@ -347,19 +368,31 @@ void main()
                                     SEL.rcInfo = vec4(rcBaseCos, rcBaseDist2, omega, replayPdfBase);
                                     SEL.rcPosMat = vec4(rcPos, uintBitsToFloat(rcMat));
                                     SEL.rcNormal = vec4(rcNrm, uintBitsToFloat(rcInst));
-                                    SEL.rcLsuf = vec4(SafeDiv(fCand, fArriveRc), 0.0);
-                                    // MIS cache: split at the NEE vertex
-                                    // itself (rc == x_b) or fold the suffix.
+                                    // rc at the NEE vertex itself: the
+                                    // candidate's own fb IS the rc BSDF -
+                                    // strip it and cache L as the suffix dir.
                                     if (rcIdx == pathLen)
-                                        SEL.misCache = vec4(
-                                            1.0 + bsdfDirPdfW / directPdfW, prefactor, 0.0, 0.0);
+                                    {
+                                        SEL.rcLsuf = vec4(SafeDiv(SafeDiv(fCand, fArriveRc), fb),
+                                                          OctaEncode(RestirWorldToObjNormal(rcInst, L)));
+                                        // at-rc layout: denom = A + B*pFwd' + C*X'
+                                        SEL.misCache = vec4(1.0, 1.0 / directPdfW, prefactor, 0.0);
+                                    }
                                     else
+                                    {
+                                        SEL.rcLsuf = vec4(SafeDiv(fCand, fArriveRc),
+                                                          OctaEncode(RestirWorldToObjNormal(rcInst, rcSuffixDirW)));
+                                        float dvcmA = (dvcmB > 0.0) ? 0.0 : dVCM;
                                         SEL.misCache = vec4(
                                             1.0 + bsdfDirPdfW / directPdfW
                                                 + (connections
-                                                       ? prefactor * (dVCM + bsdfRevPdfW * misK1)
+                                                       ? prefactor * (dvcmA + bsdfRevPdfW * misKA)
                                                        : 0.0),
-                                            prefactor * bsdfRevPdfW * misK2, 0.0, 0.0);
+                                            connections
+                                                ? prefactor * (dvcmB + bsdfRevPdfW * misKB)
+                                                : 0.0,
+                                            prefactor * bsdfRevPdfW * misKC, 0.0);
+                                    }
                                 }
                                 else
                                 {
@@ -435,7 +468,7 @@ void main()
                     {
                         vec3 nf2 = (dot(n, dirCtoL) >= 0.0) ? n : -n;
                         Ray shadowRay = MakeRay(x + nf2 * 1e-4, dirCtoL);
-                        if (!IntersectSceneOccluded(shadowRay, dist * 0.999))
+                        if (!IntersectSceneOccluded(shadowRay, ShadowTMax(dist)))
                         {
                             wSum += w;
                             if (RestirRand(risRng) * wSum <= w)
@@ -453,40 +486,60 @@ void main()
                                     SEL.rcInfo = vec4(rcBaseCos, rcBaseDist2, omega, replayPdfBase);
                                     SEL.rcPosMat = vec4(rcPos, uintBitsToFloat(rcMat));
                                     SEL.rcNormal = vec4(rcNrm, uintBitsToFloat(rcInst));
-                                    SEL.rcLsuf = vec4(SafeDiv(fCand, fArriveRc), 0.0);
-                                    // MIS cache: split at the connection
-                                    // vertex (rc == z_{t-1}) or fold the
-                                    // fixed suffix.
                                     if (rcIdx == pathLen)
-                                        SEL.misCache = vec4(wLight + 1.0, lightDirPdfA, 0.0, 0.0);
+                                    {
+                                        // rc at the connection vertex: fCam
+                                        // is the rc BSDF - strip it, cache
+                                        // the connection dir as suffix dir.
+                                        SEL.rcLsuf = vec4(SafeDiv(SafeDiv(fCand, fArriveRc), fCam),
+                                                          OctaEncode(RestirWorldToObjNormal(rcInst, dirCtoL)));
+                                        // at-rc layout: denom = A + B*pFwd' + C*X'
+                                        SEL.misCache = vec4(
+                                            1.0,
+                                            (cosLightV / dist2c)
+                                                * (lv.posDvcm.w + lv.normalDvc.w * lightRevPdfW),
+                                            lightDirPdfA, 0.0);
+                                    }
                                     else
+                                    {
+                                        SEL.rcLsuf = vec4(SafeDiv(fCand, fArriveRc),
+                                                          OctaEncode(RestirWorldToObjNormal(rcInst, rcSuffixDirW)));
+                                        float dvcmA = (dvcmB > 0.0) ? 0.0 : dVCM;
                                         SEL.misCache = vec4(
                                             wLight + 1.0
-                                                + lightDirPdfA * (dVCM + camRevPdfW * misK1),
-                                            lightDirPdfA * camRevPdfW * misK2, 0.0, 0.0);
+                                                + lightDirPdfA * (dvcmA + camRevPdfW * misKA),
+                                            lightDirPdfA * (dvcmB + camRevPdfW * misKB),
+                                            lightDirPdfA * camRevPdfW * misKC, 0.0);
+                                    }
                                 }
                                 else
                                 {
                                     // No connectable camera pair: the shift
                                     // replays the whole prefix and
                                     // re-evaluates the connection edge to
-                                    // the cached y_{s-1}.
+                                    // the cached y_{s-1} - INCLUDING the ly
+                                    // BSDF (glossy ly lobes change with the
+                                    // connection direction), so lyTput
+                                    // excludes fLight and the shift gets
+                                    // ly's material + incoming direction.
                                     flags |= RESTIR_FLAG_LIGHTRC;
                                     SEL.rcInfo = vec4(0.0, 0.0, omega, pProd);
                                     vec3 nly = (dot(lv.normalDvc.xyz, lv.wiLen.xyz) >= 0.0)
                                                    ? lv.normalDvc.xyz : -lv.normalDvc.xyz;
                                     // Object space + instance id (movable).
                                     SEL.lyPosMat = vec4(
-                                        RestirWorldToObjPoint(lightInst, lv.posDvcm.xyz), 0.0);
+                                        RestirWorldToObjPoint(lightInst, lv.posDvcm.xyz),
+                                        uintBitsToFloat(lightMat));
                                     SEL.lyNormal = vec4(
                                         RestirWorldToObjNormal(lightInst, nly),
                                         uintBitsToFloat(lightInst));
-                                    SEL.lyTput = vec4(fLight * lv.tputMat.xyz, 0.0);
-                                    // MIS cache: the light side's fixed
-                                    // ratio sum (wLight = camDirPdfA'*this).
+                                    SEL.lyTput = vec4(lv.tputMat.xyz,
+                                        OctaEncode(RestirWorldToObjNormal(lightInst, lv.wiLen.xyz)));
+                                    // MIS cache: ly's UNFOLDED prefix state -
+                                    // the shift folds in its own
+                                    // lightRevPdfW' at the new direction.
                                     SEL.misCache = vec4(
-                                        lv.posDvcm.w + lv.normalDvc.w * lightRevPdfW,
-                                        0.0, 0.0, 0.0);
+                                        lv.posDvcm.w, lv.normalDvc.w, 0.0, 0.0);
                                 }
                                 SEL.core.w = uintBitsToFloat(
                                     RestirPackTech(lightLen + 1u, pathLen + 1u, flags));
@@ -507,7 +560,10 @@ void main()
         pdfPrevArrival = pProd;
         fCur *= bs.weight * pdfStep; // = rho*cos (choicePdf*tint for delta)
         pProd *= pdfStep;
-        prevConnectable = !isDelta;
+        // Layered can't be x_{r-1} of an rc pair either: creation SAMPLES
+        // its scatter but shifts EVALUATE it - two different stochastic
+        // estimators whose realizations can never be aligned.
+        prevConnectable = MatRcCacheable(mat);
 
         // MIS recursions: dVCM/dVC classic (bdpt_eye.comp), dT1 the
         // t=1-only restriction - a delta x_1 kills its term, delta
@@ -522,18 +578,30 @@ void main()
         {
             if (pathLen == rcIdx)
             {
-                misK1 = 0.0;
-                misK2 = bs.specular ? 0.0 : bs.cosOut / bs.pdfDir; // x_r is never delta
+                // Crossing scatter at x_r: strip its BSDF value from the
+                // suffix-cache divisor (shifts re-evaluate it live) and keep
+                // the 1/pdfDir_r factor symbolic in the B/C chains.
+                misKA = 0.0;
+                misKB = 0.0;
+                misKC = bs.cosOut; // x_r is never delta
+                dvcmB = 1.0;       // dVCM_{r+1} = dvcmB / pdfDir_r
+                fArriveRc *= bs.weight * pdfStep / max(bs.cosOut, 1e-6); // rho_r
+                rcSuffixDirW = bs.dir;
             }
             else if (bs.specular)
             {
-                misK1 *= bs.cosOut;
-                misK2 *= bs.cosOut;
+                misKA *= bs.cosOut;
+                misKB *= bs.cosOut;
+                misKC *= bs.cosOut;
+                dvcmB = 0.0; // delta scatter: dVCM = 0
             }
             else
             {
-                misK1 = (bs.cosOut / bs.pdfDir) * (dVCM + bs.pdfRev * misK1);
-                misK2 = (bs.cosOut / bs.pdfDir) * (bs.pdfRev * misK2);
+                float dvcmA = (dvcmB > 0.0) ? 0.0 : dVCM;
+                misKA = (bs.cosOut / bs.pdfDir) * (dvcmA + bs.pdfRev * misKA);
+                misKB = (bs.cosOut / bs.pdfDir) * (dvcmB + bs.pdfRev * misKB);
+                misKC = (bs.cosOut / bs.pdfDir) * (bs.pdfRev * misKC);
+                dvcmB = 0.0; // dVCM becomes 1/pdfDir of THIS scatter: pFwd-free
             }
         }
         if (bs.specular)
@@ -574,7 +642,10 @@ void main()
                         SEL.rcInfo = vec4(rcBaseCos, rcBaseDist2, 1.0, replayPdfBase);
                         SEL.rcPosMat = vec4(rcPos, uintBitsToFloat(rcMat));
                         SEL.rcNormal = vec4(rcNrm, uintBitsToFloat(rcInst));
-                        SEL.rcLsuf = vec4(SafeDiv(fCand, fArriveRc), 0.0);
+                        // fArriveRc already carries rho_r here (the rc
+                        // scatter executed before the miss).
+                        SEL.rcLsuf = vec4(SafeDiv(fCand, fArriveRc),
+                                          OctaEncode(RestirWorldToObjNormal(rcInst, rcSuffixDirW)));
                         SEL.misCache = vec4(1.0, 0.0, 0.0, 0.0); // env: no competitors
                     }
                     else
@@ -600,8 +671,10 @@ void main()
         dVCM *= hit.t * hit.t / cosArr;
         dVC /= cosArr;
         dT1 /= cosArr;
-        misK1 /= cosArr;
-        misK2 /= cosArr;
+        misKA /= cosArr;
+        misKB /= cosArr;
+        misKC /= cosArr;
+        dvcmB *= hit.t * hit.t / cosArr; // mirrors dVCM's arrival factor
     }
 
     // ------------------------------------------------------ LRM merge ----

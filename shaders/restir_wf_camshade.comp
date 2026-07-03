@@ -61,11 +61,13 @@ void main()
     uint rcIdx = WfCamFlagsRcIdx(stFlags);
 
     float dVCM = misA.x, dVC = misA.y, dT1 = misA.z;
-    float misK1 = wfArena[base + 5u].x, misK2 = wfArena[base + 5u].y;
+    float misKA = wfArena[base + 5u].x, misKB = wfArena[base + 5u].y;
+    float misKC = wfArena[base + 9u].z, dvcmB = wfArena[base + 9u].w;
     float replayPdfBase = wfArena[base + 7u].w; // valid iff rcFound
     float rcBaseCos = wfArena[base + 8u].w;
     float rcBaseDist2 = wfArena[base + 9u].x;
-    uint rcInstBits = floatBitsToUint(wfArena[base + 9u].y); // valid iff rcFound
+    float rcSuffixOcta = wfArena[base + 9u].y;  // valid once the rc scatter ran
+    uint rcInst = WfCamFlagsRcInst(stFlags);    // valid iff rcFound
 
     vec3 x, n, wi;
     uint matId, triIdx;
@@ -110,8 +112,10 @@ void main()
                     {
                         SELP.rcInfo = vec4(rcBaseCos, rcBaseDist2, 1.0, replayPdfBase);
                         SELP.rcPosMat = wfArena[base + 6u];
-                        SELP.rcNormal = vec4(wfArena[base + 7u].xyz, uintBitsToFloat(rcInstBits));
-                        SELP.rcLsuf = vec4(SafeDiv(fCand, wfArena[base + 8u].xyz), 0.0);
+                        SELP.rcNormal = vec4(wfArena[base + 7u].xyz, uintBitsToFloat(rcInst));
+                        // slot 8 already carries rho_r (rc scatter ran in an
+                        // earlier round); 9.y is its cached suffix dir.
+                        SELP.rcLsuf = vec4(SafeDiv(fCand, wfArena[base + 8u].xyz), rcSuffixOcta);
                         SELP.misCache = vec4(1.0, 0.0, 0.0, 0.0); // env: no competitors
                     }
                     else
@@ -137,8 +141,10 @@ void main()
         dVCM *= lastEdgeDist2 / cosArr;
         dVC /= cosArr;
         dT1 /= cosArr;
-        misK1 /= cosArr;
-        misK2 /= cosArr;
+        misKA /= cosArr;
+        misKB /= cosArr;
+        misKC /= cosArr;
+        dvcmB *= lastEdgeDist2 / cosArr; // mirrors dVCM's arrival factor
     }
 
     // ------------------------------------------------- vertex k logic ----
@@ -154,8 +160,9 @@ void main()
     float numLightPaths = float(BdptNumLightPaths());
 
     // Reconnection vertex: first connectable pair (megakernel order: after
-    // the mask update, before the emitter branch).
-    bool selfConnectable = !isDelta;
+    // the mask update, before the emitter branch). Layered vertices are
+    // not rc-cacheable (see MatRcCacheable).
+    bool selfConnectable = MatRcCacheable(mat) || isEmissive;
     if (!rcFound && pathLen >= 2u && prevConnectable && selfConnectable)
     {
         rcFound = true;
@@ -163,15 +170,17 @@ void main()
         rcBaseCos = abs(dot(n, wi));
         rcBaseDist2 = lastEdgeDist2;
         replayPdfBase = wfArena[base + 2u].w; // pdfPrevArrival
-        // rc vertex stored in its instance's OBJECT space + id (slot 9.y)
-        // so the reconnection target tracks moving instances.
-        uint rcInstNew = InstanceOfTriangle(triIdx);
-        wfArena[base + 6u] = vec4(RestirWorldToObjPoint(rcInstNew, x), uintBitsToFloat(matId));
+        // rc vertex stored in its instance's OBJECT space + id (flags bits
+        // 20-23) so the reconnection target tracks moving instances.
+        rcInst = InstanceOfTriangle(triIdx);
+        wfArena[base + 6u] = vec4(RestirWorldToObjPoint(rcInst, x), uintBitsToFloat(matId));
         wfArena[base + 7u] = vec4(
-            RestirWorldToObjNormal(rcInstNew, (dot(n, wi) >= 0.0) ? n : -n), replayPdfBase);
-        wfArena[base + 8u] = vec4(fCur, rcBaseCos); // fArriveRc
-        wfArena[base + 9u] = vec4(rcBaseDist2, uintBitsToFloat(rcInstNew), 0.0, 0.0);
-        rcInstBits = rcInstNew;
+            RestirWorldToObjNormal(rcInst, (dot(n, wi) >= 0.0) ? n : -n), replayPdfBase);
+        wfArena[base + 8u] = vec4(fCur, rcBaseCos); // suffix-cache divisor
+        wfArena[base + 9u] = vec4(rcBaseDist2, 0.0, 0.0, 0.0);
+        misKC = 0.0;
+        dvcmB = 0.0;
+        rcSuffixOcta = 0.0;
     }
 
     // ---------------------------------------------------------- s = 0 ----
@@ -209,17 +218,23 @@ void main()
                     {
                         SELP.rcInfo = vec4(rcBaseCos, rcBaseDist2, omega, replayPdfBase);
                         SELP.rcPosMat = wfArena[base + 6u];
-                        SELP.rcNormal = vec4(wfArena[base + 7u].xyz, uintBitsToFloat(rcInstBits));
-                        SELP.rcLsuf = vec4(SafeDiv(fCand, wfArena[base + 8u].xyz), 0.0);
+                        SELP.rcNormal = vec4(wfArena[base + 7u].xyz, uintBitsToFloat(rcInst));
+                        SELP.rcLsuf = vec4(SafeDiv(fCand, wfArena[base + 8u].xyz),
+                                           rcIdx == pathLen ? 0.0 : rcSuffixOcta);
                         if (!hasCompetitors)
                             SELP.misCache = vec4(1.0, 0.0, 0.0, 0.0);
                         else if (rcIdx == pathLen)
                             SELP.misCache = vec4(1.0, directPdfA, emissionPdfW, 0.0);
                         else
+                        {
+                            float dvcmA = (dvcmB > 0.0) ? 0.0 : dVCM;
                             SELP.misCache = vec4(
-                                1.0 + directPdfA * dVCM
-                                    + emissionPdfW * (connections ? misK1 : 0.0),
-                                emissionPdfW * misK2, 0.0, 0.0);
+                                1.0 + directPdfA * dvcmA
+                                    + emissionPdfW * (connections ? misKA : 0.0),
+                                directPdfA * dvcmB
+                                    + emissionPdfW * (connections ? misKB : 0.0),
+                                emissionPdfW * misKC, 0.0);
+                        }
                     }
                     else
                     {
@@ -273,6 +288,7 @@ void main()
             RestirLightPdfs(lightIdx, cosAtLight, directPdfA, emissionPdfW);
             float directPdfW = directPdfA * dist2 / cosAtLight;
 
+            RngStream(pathLen, RNG_EVAL); // shift-reproducible eval draws
             float bsdfDirPdfW, bsdfRevPdfW, cosToLight;
             vec3 fb = EvalBsdf(mat, n, wi, L, bsdfDirPdfW, bsdfRevPdfW, cosToLight);
 
@@ -305,15 +321,27 @@ void main()
                     if (rcFound)
                     {
                         if (rcIdx == pathLen)
-                            wfArena[cb + 2u] = vec4(
-                                1.0 + bsdfDirPdfW / directPdfW, prefactor, 0.0, 0.0);
+                        {
+                            // rc at the NEE vertex: strip its own fb, cache
+                            // L as the suffix dir (at-rc misCache layout).
+                            wfArena[cb + 2u] = vec4(1.0, 1.0 / directPdfW, prefactor, 0.0);
+                            wfArena[cb + 6u] = vec4(
+                                SafeDiv(SafeDiv(fCand, wfArena[base + 8u].xyz), fb),
+                                OctaEncode(RestirWorldToObjNormal(rcInst, L)));
+                        }
                         else
+                        {
+                            float dvcmA = (dvcmB > 0.0) ? 0.0 : dVCM;
                             wfArena[cb + 2u] = vec4(
                                 1.0 + bsdfDirPdfW / directPdfW
                                     + (connections
-                                           ? prefactor * (dVCM + bsdfRevPdfW * misK1)
+                                           ? prefactor * (dvcmA + bsdfRevPdfW * misKA)
                                            : 0.0),
-                                prefactor * bsdfRevPdfW * misK2, 0.0, 0.0);
+                                connections
+                                    ? prefactor * (dvcmB + bsdfRevPdfW * misKB)
+                                    : 0.0,
+                                prefactor * bsdfRevPdfW * misKC, 0.0);
+                        }
                     }
                     else
                     {
@@ -382,26 +410,43 @@ void main()
                     {
                         flags |= RESTIR_FLAG_RCVALID | ((rcIdx & 0xFu) << 4);
                         if (rcIdx == pathLen)
-                            wfArena[cb + 2u] = vec4(wLight + 1.0, lightDirPdfA, 0.0, 0.0);
+                        {
+                            // rc at the connection vertex: strip fCam, cache
+                            // the connection dir (at-rc misCache layout).
+                            wfArena[cb + 2u] = vec4(
+                                1.0,
+                                (cosLightV / dist2c)
+                                    * (lv.posDvcm.w + lv.normalDvc.w * lightRevPdfW),
+                                lightDirPdfA, 0.0);
+                            wfArena[cb + 6u] = vec4(
+                                SafeDiv(SafeDiv(fCand, wfArena[base + 8u].xyz), fCam),
+                                OctaEncode(RestirWorldToObjNormal(rcInst, dirCtoL)));
+                        }
                         else
+                        {
+                            float dvcmA = (dvcmB > 0.0) ? 0.0 : dVCM;
                             wfArena[cb + 2u] = vec4(
                                 wLight + 1.0
-                                    + lightDirPdfA * (dVCM + camRevPdfW * misK1),
-                                lightDirPdfA * camRevPdfW * misK2, 0.0, 0.0);
+                                    + lightDirPdfA * (dvcmA + camRevPdfW * misKA),
+                                lightDirPdfA * (dvcmB + camRevPdfW * misKB),
+                                lightDirPdfA * camRevPdfW * misKC, 0.0);
+                        }
                     }
                     else
                     {
                         flags |= RESTIR_FLAG_LIGHTRC;
                         vec3 nly = (dot(lv.normalDvc.xyz, lv.wiLen.xyz) >= 0.0)
                                        ? lv.normalDvc.xyz : -lv.normalDvc.xyz;
-                        // misCache.x = light ratio sum; yzw carry lyTput.
-                        // Light end in object space + instance id (+4.w).
-                        wfArena[cb + 2u] = vec4(
-                            lv.posDvcm.w + lv.normalDvc.w * lightRevPdfW,
-                            fLight * lv.tputMat.xyz);
+                        // lyTput EXCLUDES fLight (the shift re-evaluates the
+                        // ly BSDF at its new direction); +6 carries ly's
+                        // unfolded prefix state + incoming dir, +4.w packs
+                        // its material and instance ids.
+                        wfArena[cb + 2u] = vec4(0.0, lv.tputMat.xyz);
                         wfArena[cb + 4u] = vec4(RestirWorldToObjNormal(lightInst, nly),
-                                                uintBitsToFloat(lightInst));
+                                                uintBitsToFloat((lightMat << 8) | lightInst));
                         wfArena[cb + 5u] = vec4(RestirWorldToObjPoint(lightInst, lv.posDvcm.xyz), 0.0);
+                        wfArena[cb + 6u] = vec4(lv.posDvcm.w, lv.normalDvc.w,
+                            OctaEncode(RestirWorldToObjNormal(lightInst, lv.wiLen.xyz)), 0.0);
                     }
                     wfArena[cb + 0u] = vec4(fCand, w);
                     wfArena[cb + 1u] = vec4(omega,
@@ -429,7 +474,7 @@ void main()
         wfArena[base + 5u].z = uintBitsToFloat(risRng);
         wfArena[base + 1u].w = uintBitsToFloat(
             (rcFound ? WF_CAMF_RCFOUND : 0u) | (prevConnectable ? WF_CAMF_PREVCONN : 0u)
-            | (deltaMask << 8) | ((rcIdx & 0xFu) << 16));
+            | (deltaMask << 8) | ((rcIdx & 0xFu) << 16) | ((rcInst & 0xFu) << 20));
         return;
     }
 
@@ -437,7 +482,8 @@ void main()
     float pdfPrevArrival = pProd;
     fCur *= bs.weight * pdfStep;
     pProd *= pdfStep;
-    prevConnectable = !isDelta;
+    // See restir_camera.comp: layered can't be x_{r-1} of an rc pair.
+    prevConnectable = MatRcCacheable(mat);
 
     // MIS recursions (identical to the megakernel; consume the OLD dVCM,
     // update dVCM last).
@@ -445,18 +491,31 @@ void main()
     {
         if (pathLen == rcIdx)
         {
-            misK1 = 0.0;
-            misK2 = bs.specular ? 0.0 : bs.cosOut / bs.pdfDir; // x_r is never delta
+            // Crossing scatter at x_r (see restir_camera.comp): strip its
+            // BSDF value from the divisor, cache the suffix direction, and
+            // keep 1/pdfDir_r symbolic in the B/C chains.
+            misKA = 0.0;
+            misKB = 0.0;
+            misKC = bs.cosOut; // x_r is never delta
+            dvcmB = 1.0;
+            wfArena[base + 8u].xyz *= bs.weight * pdfStep / max(bs.cosOut, 1e-6);
+            rcSuffixOcta = OctaEncode(RestirWorldToObjNormal(rcInst, bs.dir));
+            wfArena[base + 9u].y = rcSuffixOcta;
         }
         else if (bs.specular)
         {
-            misK1 *= bs.cosOut;
-            misK2 *= bs.cosOut;
+            misKA *= bs.cosOut;
+            misKB *= bs.cosOut;
+            misKC *= bs.cosOut;
+            dvcmB = 0.0;
         }
         else
         {
-            misK1 = (bs.cosOut / bs.pdfDir) * (dVCM + bs.pdfRev * misK1);
-            misK2 = (bs.cosOut / bs.pdfDir) * (bs.pdfRev * misK2);
+            float dvcmA = (dvcmB > 0.0) ? 0.0 : dVCM;
+            misKA = (bs.cosOut / bs.pdfDir) * (dvcmA + bs.pdfRev * misKA);
+            misKB = (bs.cosOut / bs.pdfDir) * (dvcmB + bs.pdfRev * misKB);
+            misKC = (bs.cosOut / bs.pdfDir) * (bs.pdfRev * misKC);
+            dvcmB = 0.0;
         }
     }
     if (bs.specular)
@@ -475,13 +534,15 @@ void main()
     // Persist state and enqueue the bounce (camtrace) + next shade round.
     wfArena[base + 1u].w = uintBitsToFloat(
         (rcFound ? WF_CAMF_RCFOUND : 0u) | (prevConnectable ? WF_CAMF_PREVCONN : 0u)
-        | (deltaMask << 8) | ((rcIdx & 0xFu) << 16));
+        | (deltaMask << 8) | ((rcIdx & 0xFu) << 16) | ((rcInst & 0xFu) << 20));
     wfArena[base + 2u] = vec4(-bs.dir, pdfPrevArrival);
     wfArena[base + 3u] = vec4(fCur, pProd);
     wfArena[base + 4u] = vec4(dVCM, dVC, dT1, wSum);
-    wfArena[base + 5u].x = misK1;
-    wfArena[base + 5u].y = misK2;
+    wfArena[base + 5u].x = misKA;
+    wfArena[base + 5u].y = misKB;
     wfArena[base + 5u].z = uintBitsToFloat(risRng);
+    wfArena[base + 9u].z = misKC;
+    wfArena[base + 9u].w = dvcmB;
     WfAppend(WfCtrlExtend(uWfRound), WfCamExtendQBase(), idx);
     WfAppend(WfCtrlShade(uWfRound + 1u), WfCamShadeQBase(uWfRound + 1u), idx);
 }
