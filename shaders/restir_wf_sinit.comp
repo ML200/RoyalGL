@@ -72,30 +72,47 @@ void main()
             pixelRes[outSlot].path = pixelRes[canonSlot].path;
             return;
         }
-        if (gCur.posDepth.w < 0.0)
+        if (gCur.posDepth.w < 0.0 && !(FogScatterEnabled() && RestirVolShiftEnabled()))
         {
-            // Miss pixels never get candidate rounds (dead header below):
-            // the canonical must survive verbatim, or the airlight-family
-            // reservoirs miss pixels carry under scattering fog would be
-            // zeroed by the empty aggregate.
+            // Miss pixels without a shiftable airlight family get no
+            // candidate rounds (dead header below): the canonical must
+            // survive verbatim, or its reservoir would be zeroed by the
+            // empty aggregate. Under scattering fog they instead join the
+            // dedicated fog cluster (restir_wf_ssort.comp) and run the
+            // rounds like any surface pixel, airlight family only.
             pixelRes[outSlot].path = pixelRes[canonSlot].path;
             wfArena[WfShadeAccSlot(idx)].xyz = vec3(0.0);
             wfArena[idx] = vec4(0.0, uintBitsToFloat(0u), uintBitsToFloat(0u), 0.0);
             return;
         }
-        // The mixture aggregate starts EMPTY (V = W*pHat = 0); the
-        // canonical enters through every round's pair estimator. Its
-        // confidence seeds the running confidence total.
-        PathReservoir empty = pixelRes[canonSlot].path;
-        empty.core = vec4(0.0, 0.0, pixelRes[canonSlot].path.core.z, empty.core.w);
-        pixelRes[outSlot].path = empty;
+        if (gCur.posDepth.w < 0.0)
+        {
+            // Fog-cluster pixel: the reservoir passed forward (and into next
+            // frame's temporal history) is the canonical itself - the
+            // candidate rounds feed the marginalized shading accumulator
+            // ONLY (see restir_wf_smerge.comp). Feeding spatial aggregates
+            // back through the temporal chain drains the landed t=1 classes
+            // that volOnly keeps out of the exchange.
+            pixelRes[outSlot].path = pixelRes[canonSlot].path;
+        }
+        else
+        {
+            // The mixture aggregate starts EMPTY (V = W*pHat = 0); the
+            // canonical enters through every round's pair estimator. Its
+            // confidence seeds the running confidence total.
+            PathReservoir empty = pixelRes[canonSlot].path;
+            empty.core = vec4(0.0, 0.0, pixelRes[canonSlot].path.core.z, empty.core.w);
+            pixelRes[outSlot].path = empty;
+        }
         // Marginalized RGB shading accumulator (component write: .w holds
         // the frame-persistent duplication score).
         wfArena[WfShadeAccSlot(idx)].xyz = vec3(0.0);
         uint rng = WangHash(idx * 26699u + uFrame.restirParams.z * 30323u + 0x8DA6B343u);
         if (rng == 0u) rng = 0x9E3779B9u;
+        // Every pixel reaching this point runs candidate rounds (miss
+        // pixels without fog-cluster reuse returned above).
         wfArena[idx] = vec4(uintBitsToFloat(rng),
-                            uintBitsToFloat((gCur.posDepth.w < 0.0) ? 0u : 1u),
+                            uintBitsToFloat(1u),
                             uintBitsToFloat(0u),
                             WfSobolSel(uFrame.restirParams.z, idx));
     }
@@ -138,16 +155,21 @@ void main()
     wfArena[WfShiftJobBase(job0)].z = uintBitsToFloat(WF_JOB_FAIL);
     wfArena[WfShiftJobBase(job1)].z = uintBitsToFloat(WF_JOB_FAIL);
 
+    // Fog-cluster pairs (this pixel is a miss => the whole cluster is miss
+    // pixels) restrict both merge directions to the airlight family, the
+    // same symmetric volOnly restriction as the fog pairings of tinit.
+    bool fogCluster = gCur.posDepth.w < 0.0;
+
     // Forward: candidate sample into this pixel's domain.
     uint nSlot = RestirRegionOffset(RESTIR_SCRATCH_REGION) + nIdx;
     vec4 nCore = pixelRes[nSlot].path.core;
     if (nCore.x > 0.0 && nCore.y > 0.0)
-        WfShiftCreateJob(job0, nSlot, idx, false, false);
+        WfShiftCreateJob(job0, nSlot, idx, false, fogCluster);
 
     // Backward: the FROZEN canonical into the candidate's domain (the pair
     // estimator is canonical-vs-candidate; the running aggregate never
     // feeds MIS, which is what keeps the mixture linear over rounds).
     vec4 cCore = pixelRes[canonSlot].path.core;
     if (cCore.x > 0.0 && cCore.y > 0.0)
-        WfShiftCreateJob(job1, canonSlot, nIdx, false, false);
+        WfShiftCreateJob(job1, canonSlot, nIdx, false, fogCluster);
 }

@@ -46,9 +46,16 @@ void main()
         ivec2 p = origin + lo + ivec2(int(t) % sz.x, int(t) / sz.x);
         myIdx = RestirPixelIndex(p);
         GBufferPixel g = RestirLoadGBuf(GBufCurOffset() + myIdx);
-        if (g.posDepth.w >= 0.0)
+        bool isMiss = g.posDepth.w < 0.0;
+        // Miss pixels under a scattering medium form one dedicated fog
+        // cluster (the medium-aware analog of the object-id mask): their
+        // reservoirs hold only the airlight family, which re-anchors to the
+        // destination ray, so any two miss pixels can exchange it. Without
+        // scattering fog (or with shifts off) they stay out of the sort.
+        if (!isMiss || (FogScatterEnabled() && RestirVolShiftEnabled()))
         {
-            uint cluster = (InstanceOfTriangle(GBufTriangle(g)) << 8u) | GBufMaterial(g);
+            uint cluster = isMiss ? 0xFFFFFF00u
+                                  : (InstanceOfTriangle(GBufTriangle(g)) << 8u) | GBufMaterial(g);
             float pHat = pixelRes[RestirRegionOffset(RESTIR_SCRATCH_REGION) + myIdx].path.core.y;
             key = uvec2(cluster, floatBitsToUint(max(pHat, 0.0)));
             mine = true;

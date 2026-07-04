@@ -39,12 +39,23 @@ void main()
             // Miss pixels carry the airlight family (untruncated primary
             // in-scatter walk) + t=1 landings in the caustic reservoir; the
             // environment itself is unreachable through infinite fog
-            // (Tr -> 0). RIS-only (no reuse passes touch miss pixels), so
-            // always the winner-only expression.
+            // (Tr -> 0). When the fog-cluster spatial rounds ran, shade the
+            // marginalized sum (the path reservoir itself stays the
+            // canonical for the temporal chain - restir_wf_smerge.comp);
+            // otherwise the winner-only expression.
             CausticReservoir c = pixelRes[RestirRegionOffset(RestirFinalRegion()) + idx].caustic;
-            PathReservoir r = pixelRes[RestirRegionOffset(RestirFinalRegion()) + idx].path;
-            color = r.rcInfo.z * r.fSeed.xyz * r.core.x
-                  + c.meta.x * c.fSeed.xyz * c.core.x;
+            vec3 regular;
+            if (RestirSpatialEnabled() && uFrame.prevCameraParams.w >= 0.5 &&
+                RestirVolShiftEnabled())
+            {
+                regular = wfArena[WfShadeAccSlot(idx)].xyz;
+            }
+            else
+            {
+                PathReservoir r = pixelRes[RestirRegionOffset(RestirFinalRegion()) + idx].path;
+                regular = r.rcInfo.z * r.fSeed.xyz * r.core.x;
+            }
+            color = regular + c.meta.x * c.fSeed.xyz * c.core.x;
         }
         else
         {

@@ -30,10 +30,19 @@ void main()
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= RestirPixelCount()) return;
 
-    if (floatBitsToUint(wfArena[idx].y) == 0u) return; // primary miss
+    if (floatBitsToUint(wfArena[idx].y) == 0u) return; // dead pixel
     uint nIdxPlus1 = floatBitsToUint(wfArena[idx].z);
     if (nIdxPlus1 == 0u) return;
     uint nIdx = nIdxPlus1 - 1u;
+
+    // Fog-cluster pixels (miss destinations): spatial reuse contributes to
+    // SHADING only (the marginalized accumulator); the reservoir - and with
+    // it next frame's temporal history - stays the post-temporal canonical
+    // that sinit copied verbatim. Adopting spatial aggregates into the
+    // temporal chain measurably drains the landed t=1 classes that volOnly
+    // keeps out of the exchange (-3% in miss regions); shading-only mixing
+    // is unbiased on top of the temporal-only chain.
+    bool fogCluster = RestirLoadGBuf(GBufCurOffset() + idx).posDepth.w < 0.0;
 
     uint outSlot = RestirRegionOffset(RestirFinalRegion()) + idx;
     uint canonSlot = RestirRegionOffset(RESTIR_SCRATCH_REGION) + idx;
@@ -59,18 +68,21 @@ void main()
             vec3 vRgb = canonF * cCore.x / M;
             if (!any(isnan(vRgb)) && !any(isinf(vRgb)))
                 wfArena[WfShadeAccSlot(idx)].xyz += vRgb;
-            V += v;
-            if (RestirRand(rng) * V <= v)
+            if (!fogCluster)
             {
-                float cOut = aCore.z;
-                pixelRes[outSlot].path = pixelRes[canonSlot].path;
-                pixelRes[outSlot].path.core = vec4(V / cCore.y, cCore.y, cOut, cCore.w);
+                V += v;
+                if (RestirRand(rng) * V <= v)
+                {
+                    float cOut = aCore.z;
+                    pixelRes[outSlot].path = pixelRes[canonSlot].path;
+                    pixelRes[outSlot].path.core = vec4(V / cCore.y, cCore.y, cOut, cCore.w);
+                }
+                else
+                {
+                    pixelRes[outSlot].path.core.x = V / aCore.y;
+                }
+                wfArena[idx].x = uintBitsToFloat(rng);
             }
-            else
-            {
-                pixelRes[outSlot].path.core.x = V / aCore.y;
-            }
-            wfArena[idx].x = uintBitsToFloat(rng);
         }
         return;
     }
@@ -125,6 +137,12 @@ void main()
     if (isnan(w_N) || isinf(w_N)) w_N = 0.0;
     if (!any(isnan(wRgb)) && !any(isinf(wRgb)))
         wfArena[WfShadeAccSlot(idx)].xyz += wRgb / M;
+
+    if (fogCluster)
+    {
+        wfArena[idx].x = uintBitsToFloat(rng);
+        return; // shading-only: the reservoir stays the canonical
+    }
 
     float wSum = w_C + w_N;
     // The candidate's confidence joins the running total even when its

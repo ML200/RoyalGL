@@ -37,11 +37,11 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-FR = r"C:\Users\Malte\AppData\Local\Temp\claude\C--Users-Malte-Documents-GitHub-RoyalGL\a69c44b3-956f-4345-b2bb-f7e7fdead0dd\scratchpad\frames"
+FR = r"C:\Users\Malte\AppData\Local\Temp\claude\C--Users-Malte-Documents-GitHub-RoyalGL\fca9cd82-8db0-4710-bc7c-ef9c683e52d3\scratchpad\frames_plots"
 OUT = r"C:\Users\Malte\Documents\GitHub\RoyalGL"
 W, H = 1600, 900
 
-MS = {"bdpt": 24.42, "ptacc": 30.03, "uni": 43.85, "ours": 49.97}  # measured
+MS = {"bdpt": 20.7, "ptacc": 29.1, "uni": 55.3, "ours": 58.8}  # measured (StatsTime deltas)
 
 
 import flip_evaluator as flip
@@ -238,3 +238,27 @@ print("floors: uni %.4g ours %.4g ratio %.2f" % (u_floor, o_floor, u_floor / o_f
 for name, cn, cv in [("bdpt", bceil_n, bceil_v), ("ptacc", ptceil_n, ptceil_v)]:
     cross = cn[np.searchsorted(-cv, -o_floor)] if (cv < o_floor).any() else -1
     print("%s crosses ours floor at frame %s" % (name, cross))
+
+
+# Linear-luminance relMSE (eps 1e-4) for the variance statements in the
+# captions: per-frame values at f8/f10 and the per-frame floor ratio.
+def linlum(path):
+    a = np.fromfile(path, dtype=np.float32)
+    return a.reshape(H, W, 4)[:, :, :3].astype(np.float64) @ LUMA
+
+
+TRUTH_LIN = linlum(os.path.join(FR, "truth_04096.f32"))
+
+
+def relmse(path):
+    y = linlum(path)
+    return float(np.mean((y - TRUTH_LIN) ** 2 / (TRUTH_LIN ** 2 + 1e-4)))
+
+
+for k in [8, 10]:
+    print("relMSE f%d: uni %.3f ours %.3f" %
+          (k, relmse(os.path.join(FR, "uni_%05d.f32" % k)),
+           relmse(os.path.join(FR, "ours_%05d.f32" % k))))
+uf = np.mean([relmse(os.path.join(FR, "uceil_%05d.f32" % n)) for n in uceil_n[-10:]])
+of = np.mean([relmse(os.path.join(FR, "oceil_%05d.f32" % n)) for n in oceil_n[-10:]])
+print("relMSE floors: uni %.4f ours %.4f ratio %.1f" % (uf, of, uf / of))

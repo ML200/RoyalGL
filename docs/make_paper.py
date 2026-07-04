@@ -12,7 +12,7 @@ from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.enums import TA_JUSTIFY, TA_CENTER, TA_LEFT
 from reportlab.platypus import (BaseDocTemplate, PageTemplate, Frame, Paragraph,
                                 Spacer, Image, Table, TableStyle, FrameBreak,
-                                NextPageTemplate, KeepTogether)
+                                NextPageTemplate, KeepTogether, PageBreak)
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.lib.fonts import addMapping
@@ -129,16 +129,16 @@ S = []
 
 # ================================================================= page 1 ===
 S.append(Paragraph("Volume Anchored Shift Mappings for Bidirectional ReSTIR<br/>in Participating Media", title_st))
-S.append(Paragraph("MALTE LANZ, RoyalGL", author_st))
+S.append(Paragraph("CLAUDE ET AL., RoyalGL", author_st))
 S.append(fig_row(["fig_exterior_ref.png", "fig_uni_f8.png", "fig_ours_f8.png"],
                  PAGE_W - 2 * MARGIN))
 S.append(Paragraph(
     "Fig. 1. A Cornell box immersed in a homogeneous scattering medium (σ<sub>s</sub> = 0.15, σ<sub>a</sub> = 0.02, "
     "Henyey Greenstein g = 0.3), viewed from outside so that a large part of the image shows the medium alone. "
     "<b>Left:</b> bidirectional path traced reference. <b>Middle:</b> unidirectional ReSTIR path tracing at the "
-    "eighth rendered frame (1 spp per frame, spatiotemporal reuse): perceptual error 0.092, luminance variance "
-    "1.53. <b>Right:</b> our bidirectional ReSTIR with volumetric shift mappings at the same frame: perceptual "
-    "error 0.058, luminance variance 0.13 (a factor of 11.6). Scattered light along camera segments, including "
+    "eighth rendered frame (1 spp per frame, spatiotemporal reuse): perceptual error 0.087, luminance variance "
+    "0.78. <b>Right:</b> our bidirectional ReSTIR with volumetric shift mappings at the same frame: perceptual "
+    "error 0.052, luminance variance 0.065 (twelve times lower). Scattered light along camera segments, including "
     "pixels whose rays hit no geometry, is sampled by techniques on both path ends and reused across frames.",
     caption))
 S.append(FrameBreak())
@@ -147,10 +147,11 @@ S.append(FrameBreak())
 S.append(Paragraph("<b>Abstract</b>", h1))
 for p in [
     "Path space reuse through shift mappings has made ReSTIR the standard approach for path traced real time "
-    "rendering of surfaces, and recent work extends it to subsurface random walks inside translucent objects. "
-    "Reuse of paths that scatter in an unbounded medium, and reuse in a bidirectional ReSTIR, have remained open. "
-    "We present a bidirectional ReSTIR system with full volumetric path reuse in global homogeneous media, "
-    "covering eye paths, next event estimation, light tracing, and vertex connections.",
+    "rendering of surfaces; recent work extends it to subsurface random walks inside translucent objects, and "
+    "ReSTIR BDPT brings reuse to the full set of bidirectional techniques on surfaces. Reuse of paths that "
+    "scatter in an unbounded medium has remained open. We present a bidirectional ReSTIR system with full "
+    "volumetric path reuse in global homogeneous media, covering eye paths, next event estimation, light "
+    "tracing, and vertex connections.",
 
     "Two properties separate this setting from surface ReSTIR and from ReSTIR for subsurface scattering. First, "
     "existing volumetric shifts anchor a path at surface vertices and carry interior scattering vertices along by "
@@ -164,11 +165,11 @@ for p in [
     "samples the primary segment directly, restores bounded variance through multiple importance sampling, and "
     "extends to pixels whose rays leave the scene.",
 
-    "The estimator matches converged bidirectional references within 0.1 percent in all configurations, and "
+    "The estimator matches converged bidirectional references within 0.15 percent in all configurations, and "
     "temporal reuse under a static camera reproduces per pixel resampling exactly. On an exterior view dominated "
     "by the medium, the converged per frame estimate reaches a perceptual error that accumulated unidirectional "
-    "path tracing needs 248 frames to match and accumulated BDPT 40 frames, and its luminance variance floor is "
-    "11.6 times below unidirectional ReSTIR path tracing.",
+    "path tracing needs 320 frames to match and accumulated BDPT 48 frames, and its luminance variance floor is "
+    "10.8 times below unidirectional ReSTIR path tracing.",
 ]:
     S.append(Paragraph(p, abstract))
 
@@ -176,8 +177,9 @@ for p in [
 S.append(Paragraph("1&#160;&#160;Introduction", h1))
 S.append(Paragraph(
     "Resampled importance sampling and its spatiotemporal extension ReSTIR [Bitterli et al. 2020] amortize the "
-    "cost of finding high contribution light paths across pixels and frames. ReSTIR PT [Lin et al. 2022] "
-    "generalized reuse to full path space through shift mappings, deterministic bijections that transport a path "
+    "cost of finding high contribution light paths across pixels and frames. ReSTIR GI [Ouyang et al. 2021] "
+    "carried reuse to indirect illumination, and ReSTIR PT [Lin et al. 2022] "
+    "generalized it to full path space through shift mappings, deterministic bijections that transport a path "
     "sampled in one pixel into the domain of another. This machinery was designed for surfaces: Jacobians convert "
     "solid angles through cosines and areas, reconnection vertices carry normals and roughness, and invertibility "
     "rests on delta lobe classification. A participating medium violates each assumption. A volume scattering "
@@ -188,25 +190,31 @@ S.append(Paragraph(
     "scattering chains into per froxel reservoirs for emissive media, without path space shift mappings. ReSTIR "
     "SSS [Werner et al. 2024] brought shift mapped reuse to volumetric random walks for subsurface scattering "
     "inside bounded translucent objects, with reconnection and delayed reconnection shifts selected by a "
-    "heuristic or by sequential resampling [Guo et al. 2025]. Both are unidirectional. Neither covers an "
-    "unbounded medium, and neither addresses the question that dominates one: which technique samples the "
+    "heuristic or by sequential resampling passes, both introduced in that work; Galazios and Moustakas [2026] "
+    "re evaluate the selection heuristics. Both systems are unidirectional. Bidirectionality itself has "
+    "meanwhile reached surface ReSTIR: ReSTIR BDPT [Hedstrom et al. 2025] resamples surface paths across the "
+    "full bidirectional technique set, and our system builds on its architecture (Sec. 2). What remains open is "
+    "the medium. No existing system reuses paths whose vertices scatter in a volume bidirectionally, none covers "
+    "an unbounded medium, and none addresses the question that dominates one: which technique samples the "
     "scattered light along the primary camera segment. In the scene of Fig. 1 this airlight carries a large "
-    "share of the image energy, and for pixels beside the box it is the only energy. This paper answers both "
+    "share of the image energy, and for pixels beside the box it is the only energy. This paper answers these "
     "questions for a global homogeneous medium inside a bidirectional ReSTIR with technique set "
     "{s=0, s=1, t=1, s&#8805;2}. Our contributions:", body))
 for b in [
     "<b>Volume vertices as reconnection anchors</b> (Sec. 4.2). The first reconnection shifts that anchor inside "
-    "a medium rather than at a bounding surface. The Jacobian in the volume measure is d&#178;/d&#8242;&#178;, "
-    "free of cosines, and a phase peak criterion extends footprint based reconnection tests to media.",
+    "a medium rather than at a bounding surface. In the volume measure the anchor Jacobian is the textbook "
+    "cosine free ratio d&#178;/d&#8242;&#178; [Pharr et al. 2023]; the contribution is the anchor role and its "
+    "invertibility, plus a phase peak criterion that extends footprint based reconnection tests to media.",
     "<b>Replay with scatter classification masks</b> (Sec. 4.1). Free flight sampling becomes replayable inside "
     "seed deterministic walks, and an 8 bit per vertex mask guarantees that base and offset paths share the same "
     "vertex structure, which makes the mapping invertible.",
     "<b>A variance analysis and estimator for airlight</b> (Sec. 5). Under visibility buffer anchoring, granting "
     "light tracing exclusive responsibility for airlight yields an unbounded second moment. A truncated camera "
     "technique restores bounded variance and covers pixels without any surface anchor.",
-    "<b>A bidirectional volumetric system</b> (Secs. 3, 6, 7). One substitution extends recursive MIS to mixed "
-    "surface and volume paths, volume vertices enter the light vertex cache, light selection is replay stable "
-    "under camera motion, and temporal history is re paired by fog parallax where surface anchors disappear.",
+    "<b>A volumetric bidirectional system</b> (Secs. 3, 6, 7). On the architecture of ReSTIR BDPT [Hedstrom "
+    "et al. 2025], one substitution extends recursive MIS to mixed surface and volume paths, volume vertices "
+    "enter the light vertex cache, light selection is made replay stable under camera motion, and temporal "
+    "history is re paired by fog parallax where surface anchors disappear.",
 ]:
     S.append(Paragraph(b, bullet, bulletText="•"))
 
@@ -221,12 +229,23 @@ S.append(Paragraph(
     "the mapped path, p&#770; is the resampling target function, W is the unbiased contribution weight of the "
     "input sample, and |&#8706;T/&#8706;x| is the Jacobian of the shift. The hybrid shift of ReSTIR PT replays a "
     "path from its random number seed until a vertex pair satisfies reconnection criteria, then reconnects to the "
-    "cached vertex. Unbiasedness constrains the weights and the invertibility of T; it does not constrain "
-    "variance, which is the subject of Sec. 5.", body_ni))
+    "cached vertex. Shift mappings originate in gradient domain rendering [Kettunen et al. 2015], and Wyman "
+    "et al. [2023] survey their role in ReSTIR. Unbiasedness constrains the weights and the invertibility of T; "
+    "it does not constrain variance, which is the subject of Sec. 5.", body_ni))
+S.append(Paragraph(
+    "<b>Bidirectional ReSTIR.</b> ReSTIR BDPT [Hedstrom et al. 2025] brought bidirectional path tracing into "
+    "GRIS for surface scenes: resampling is formulated in an extended path space that records the sampling "
+    "technique, a bidirectional hybrid shift maps paths between pixels, and light traced caustic paths, which no "
+    "camera anchored shift can transport, accumulate in a dedicated caustics reservoir. Our system stands on "
+    "this architecture and inherits the two reservoir layout, the technique aware resampling, and the free "
+    "landing replay of caustic class paths (Sec. 7). Everything the medium touches is new: sampling techniques "
+    "whose vertices lie in the volume and their MIS (Sec. 3), shifts that replay free flight decisions and "
+    "anchor at volume vertices (Sec. 4), the airlight family and its pairing against t=1 (Sec. 5), and replay "
+    "stable light selection with temporal pairing where no surface anchor exists (Sec. 6).", body))
 S.append(Paragraph(
     "<b>Volumetric transport.</b> Radiative transfer attenuates radiance along segments by transmittance and adds "
     "scattering weighted by σ<sub>s</sub> and a phase function. Bidirectional and many vertex methods generalize "
-    "to media [Georgiev et al. 2014], and null scattering formulations extend path integrals to heterogeneous "
+    "to media [Georgiev et al. 2013; K&#345;iv&#225;nek et al. 2014], and null scattering formulations extend path integrals to heterogeneous "
     "media [Nov&#225;k et al. 2018]. Gradient domain methods have shifted volumetric paths in offline settings "
     "[Gruson et al. 2018].", body))
 S.append(Paragraph(
@@ -237,31 +256,36 @@ S.append(Paragraph(
     "of the walk, and the interior volume vertices ride along by replay. This design does not transfer to an "
     "unbounded medium. Airlight paths have no entry surface, and their first vertex is created by free flight "
     "sampling from the camera itself. Our anchored shift removes the surface from the anchor role, and our "
-    "airlight technique covers the path class that exists only when the medium surrounds the camera. Both prior "
-    "systems are also unidirectional, while our system reuses light subpaths whose vertices may themselves be "
-    "volume scattering events. The results in Sec. 8 show that this bidirectionality provides most of the "
+    "airlight technique covers the path class that exists only when the medium surrounds the camera. Both "
+    "volumetric systems are unidirectional, while our system reuses light subpaths whose vertices may themselves "
+    "be volume scattering events. The results in Sec. 8 show that this bidirectionality provides most of the "
     "quality in media.", body))
 
 S.append(Spacer(1, 4))
 S.append(data_table(
-    [["", "Vol. ReSTIR [Lin 21]", "ReSTIR SSS [Werner 24]", "Ours"],
-     ["Medium", "emissive volumes", "bounded objects (SSS)", "global homogeneous fog"],
-     ["Reuse", "froxel RIS, no shifts", "GRIS shift mappings", "GRIS shift mappings"],
-     ["Techniques", "unidirectional", "unidirectional", "bidirectional {s=0, s=1, t=1, s&#8805;2}"],
+    [["", "Vol. ReSTIR [Lin 21]", "ReSTIR SSS [Werner 24]", "ReSTIR BDPT [Hedstrom 25]", "Ours"],
+     ["Medium", "emissive volumes", "bounded objects (SSS)", "none (surface scenes)", "global homogeneous fog"],
+     ["Reuse", "froxel RIS, no shifts", "GRIS shift mappings", "GRIS, technique aware path space",
+      "GRIS shift mappings"],
+     ["Directions", "camera only", "camera only", "camera and light",
+      "camera and light {s=0, s=1, t=1, s&#8805;2}"],
      ["Shift anchor", "&#8212;", "surface entry and exit; interior walk replayed",
+      "surface vertices, hybrid shift on both path ends",
       "surface <i>and</i> interior volume vertices"],
-     ["Anchor Jacobian", "&#8212;", "surface, cos &#183; d&#178; ratios",
+     ["Anchor Jacobian", "&#8212;", "surface, cos &#183; d&#178; ratios", "surface, cos &#183; d&#178; ratios",
       "volume measure, d&#178;/d&#8242;&#178;"],
-     ["Invertibility", "&#8212;", "shift selection heuristics [Guo 25]", "scatter classification masks"],
-     ["Airlight", "single scattering (froxels)", "n/a (interior media)",
-      "truncated camera technique + t=1, MIS paired"],
-     ["Rays without geometry", "n/a", "n/a", "covered, with temporal reuse"]],
-    [COL_W * 0.185, COL_W * 0.25, COL_W * 0.28, COL_W * 0.285],
+     ["Inversion test", "&#8212;", "shift selection [Werner 24; Galazios 26]", "technique and delta classes",
+      "scatter classification masks"],
+     ["Airlight", "single scattering (froxels)", "n/a (interior media)", "n/a (no medium)",
+      "truncated camera + t=1, MIS paired"],
+     ["Rays without geometry", "n/a", "n/a", "n/a", "covered, temporal + spatial reuse"]],
+    [COL_W * 0.19, COL_W * 0.175, COL_W * 0.21, COL_W * 0.20, COL_W * 0.225],
     header_rows=1, header_cols=1))
 S.append(Paragraph(
-    "Table 1. Volumetric reuse in ReSTIR. ReSTIR SSS provides shift mapped reuse of volumetric walks, anchored at "
-    "the bounding surfaces of the medium and restricted to camera paths. Both assumptions fail for an unbounded "
-    "medium around the camera.", caption))
+    "Table 1. Path reuse systems closest to ours. ReSTIR SSS provides shift mapped reuse of volumetric walks, "
+    "anchored at the bounding surfaces of the medium and restricted to camera paths; ReSTIR BDPT provides "
+    "bidirectional reuse for surface scenes. Neither reuses paths that scatter in an unbounded medium around "
+    "the camera.", caption))
 
 # ======================================================== medium sampling ===
 S.append(Paragraph("3&#160;&#160;Sampling a homogeneous medium", h1))
@@ -283,9 +307,13 @@ S.append(Paragraph(
     "factor 1/σ<sub>t</sub> of the distance density is applied at arrival, and each connection supplies its own "
     "σ<sub>s</sub> times phase term.", body))
 S.append(Paragraph(
-    "<b>MIS in media.</b> Recursive MIS quantities of the dVCM and dVC form convert probability densities "
-    "between measures with per vertex factors cos/d&#178;. At a volume vertex the conversion target is the volume "
-    "measure, and the cosine is replaced by σ<sub>t</sub>:", body))
+    "<b>MIS in media.</b> Recursive MIS quantities of the dVCM and dVC form [Georgiev et al. 2012] convert "
+    "probability densities between measures with per vertex factors cos/d&#178;; volumetric bidirectional and "
+    "many vertex methods perform the analogous conversions in media [Georgiev et al. 2013; K&#345;iv&#225;nek "
+    "et al. 2014]. At a volume vertex the conversion target is the volume measure. A directional density "
+    "p<sub>ω</sub> at the predecessor spreads over d&#178;, and the free flight sampler contributes its density "
+    "σ<sub>t</sub>Tr(d) per unit length; with transmittance excluded from the ratios (below), the surviving per "
+    "vertex factor replaces the cosine by σ<sub>t</sub>:", body))
 S.append(Paragraph(
     "p<sub>area</sub> = p<sub>ω</sub> &#183; cos / d&#178; &#160;&#160;&#8594;&#160;&#160; "
     "p<sub>volume</sub> = p<sub>ω</sub> &#183; σ<sub>t</sub> / d&#178; .", eq))
@@ -372,7 +400,10 @@ S.append(Paragraph("d&#8242; = distance from the offset predecessor y<sub>k&#872
 S.append(Paragraph(
     "The surface version of this factor carries an additional cosine ratio because a surface pins the point to a "
     "two dimensional set whose area element projects with the cosine of the arrival direction. A point in a "
-    "medium has no such projection. The anchor is therefore immune to the grazing angle Jacobian growth of "
+    "medium has no such projection; the cosine free conversion between solid angle and volume measures is the "
+    "standard one [Pharr et al. 2023]. The new element is not the measure but the anchor role: no prior GRIS "
+    "shift reconnects at a vertex interior to a medium, and the masks of Sec. 4.1 are what keep such an anchor "
+    "invertible. Freed of the cosine, the anchor is immune to the grazing angle Jacobian growth of "
     "surface reconnection. The free flight density does not appear: the change of measure is a property of the "
     "map, not of the sampler. Densities enter only the contribution weights and the MIS ratios, which is why the "
     "anchored mapping remains well defined in media whose distance sampling cannot be replayed, such as "
@@ -450,7 +481,20 @@ S.append(Paragraph(
 S.append(Paragraph(
     "inverted in closed form. Every pixel scatters once per frame, and the walk continues through the standard "
     "candidate blocks (next event estimation, vertex connections, emitter hits) from the volume vertex onward, "
-    "feeding the same reservoir. The matching MIS weight of a light traced t=1 airlight path becomes", body_ni))
+    "feeding the same reservoir.", body_ni))
+S.append(Paragraph(
+    "<b>Weight derivation.</b> An airlight path whose first scattering vertex lies at distance d from the camera "
+    "is sampled by exactly two techniques, the truncated camera family and a light traced t=1 connection, so the "
+    "balance heuristic [Veach 1997] weights the light traced path by ω = p<sub>L</sub>&#8202;/(p<sub>L</sub> + "
+    "p<sub>C</sub>) = 1/(1 + w<sub>L</sub>), with w<sub>L</sub> = p<sub>C</sub>&#8202;/p<sub>L</sub> the density "
+    "ratio of the two techniques at the same path; the camera family receives the complementary weight. "
+    "The camera family reaches the vertex once per pixel: the factor i&#178; converts the image plane density to "
+    "solid angle, division by d&#178; converts solid angle to the volume measure, and the truncated free flight "
+    "density contributes σ<sub>t</sub>&#8202;/(1 &#8722; Tr(d&#8321;)) per unit length once the transmittance of "
+    "the camera segment leaves the ratio under the convention of Sec. 3. The light tracer generates the vertex "
+    "with N<sub>L</sub> subpaths per frame, and the density of its remaining chain relative to the camera suffix "
+    "accumulates through the recursion of Sec. 3 into dVCM + p<sub>rev</sub>&#8202;dVC, exactly as in a vertex "
+    "connection weight. Together, the weight of a light traced t=1 airlight path becomes", body))
 S.append(Paragraph(
     "ω = 1 / (1 + w<sub>L</sub>) ,&#160;&#160;&#160;&#160; w<sub>L</sub> = "
     "i&#178; σ<sub>t</sub> / ( d&#178; (1 &#8722; Tr(d<sub>1</sub>)) N<sub>L</sub> ) &#183; "
@@ -475,8 +519,9 @@ S.append(Paragraph(
 S.append(Paragraph(
     "<b>Rays without geometry.</b> For a primary miss, d<sub>1</sub> is unbounded and the truncation factor "
     "tends to one, so the family degenerates to the plain exponential. Pixels without any surface anchor sample "
-    "airlight, receive t=1 landings, and reuse temporally through the fog reprojection of Sec. 6. The exterior "
-    "viewpoint of Fig. 1 exercises exactly this case and matches the reference within 0.06 percent.", body_ni))
+    "airlight, receive t=1 landings, reuse temporally through the fog reprojection of Sec. 6, and reuse "
+    "spatially through a dedicated fog cluster (Sec. 7). The exterior viewpoint of Fig. 1 exercises exactly "
+    "this case.", body_ni))
 
 # ===================================================== temporal behavior ====
 S.append(Paragraph("6&#160;&#160;Temporal reuse of volumetric paths", h1))
@@ -503,13 +548,26 @@ S.append(Paragraph(
     "fog pairing reuses only the airlight family, symmetrically in both merge directions, because that family re "
     "anchors to the destination ray and never references the surface. Pixels without geometry use the same "
     "reprojection with the untruncated mean and validate against other such pixels.", body_ni))
+S.append(Paragraph(
+    "<b>Validation status.</b> The quantitative evaluation of Sec. 8 uses a static camera, under which the "
+    "pairing mechanisms above never trigger. Camera motion is exercised by the identity assertions of Sec. 7 "
+    "and by the qualitative orbit tests of Sec. 8; a quantitative moving camera study, in particular of "
+    "disocclusion where fog pairing activates, remains open (Sec. 9).", body))
 
 # =========================================================== implementation =
 S.append(Paragraph("7&#160;&#160;Implementation", h1))
 S.append(Paragraph(
     "We integrate the medium into a wavefront renderer (OpenGL compute, GPU driven indirect dispatch, software "
     "BVH traversal) whose ReSTIR passes are split at every ray boundary. Per pixel there are two reservoirs, one "
-    "for camera anchored paths and one for caustic class paths, and the medium adds no further reservoirs. Each "
+    "for camera anchored paths and one for caustic class paths, following the caustics reservoir design of "
+    "ReSTIR BDPT [Hedstrom et al. 2025], and the medium adds no further reservoirs. Spatial candidates are drawn "
+    "with the antithetic stratified pattern of Sala&#252;n et al. [2025], clustered by primary instance and "
+    "material. Pixels whose rays hit no geometry form a dedicated fog cluster: their merges restrict to the "
+    "airlight family, which re anchors to the destination ray, and contribute to the marginalized shading "
+    "estimate only, while the reservoir carried into the next frame remains the temporal chain's own. Feeding "
+    "spatial aggregates back through the temporal history of these pixels measurably drains the light traced "
+    "path classes that cannot shift between rays; shading only mixing is unbiased on top of the per pixel "
+    "temporal chain. Each "
     "ray cast round consumes one free flight value from a stream indexed by vertex; if the sampled distance "
     "undercuts the surface hit, the shade round synthesizes a volume vertex and sets its mask bit. The vertex "
     "then runs the same candidate blocks as a surface vertex with three substitutions: the phase function "
@@ -528,15 +586,18 @@ S.append(Paragraph(
     "Replay rounds re derive the free flight decision on the same stream and compare it with the mask; segment "
     "factors enter the numerator and the replayed density exactly as at creation. Identity shifts therefore "
     "reproduce candidates bit for bit, and our regression suite asserts that temporal reuse under a static "
-    "camera equals per pixel resampling to the last digit. All reuse merges are unchanged by the volumetric "
-    "extension.", body))
+    "camera equals per pixel resampling to the last digit. This determinism is a property of the implementation "
+    "under test, whose wavefront passes merge each pixel in a fixed order; the suite verifies it on the driver "
+    "and GPU of Sec. 8, and we do not claim it portably across compilers or hardware. All reuse merges are "
+    "unchanged by the volumetric extension.", body))
 
 # ================================================================= results ==
 S.append(Paragraph("8&#160;&#160;Results", h1))
 S.append(Paragraph(
-    "All measurements use the scene of Fig. 1 at 1600&#215;900 on an RTX 5090, with the camera outside the box "
-    "so that a large image region shows the medium alone, including rays that hit no geometry. The scene is "
-    "static. Ground truth is bidirectional path tracing at 4096 samples per pixel. The error metric is the mean "
+    "All measurements run at 1600&#215;900 on an RTX 5090, and all scenes are static. Figs. 5&#8211;7 and "
+    "Table 2 use the scene of Fig. 1, with the camera outside the box so that a large image region shows the "
+    "medium alone, including rays that hit no geometry; Fig. 8 extends the comparison to two further scenes. "
+    "Ground truth is bidirectional path tracing at 4096 samples per pixel. The error metric is the mean "
     "FLIP error of the displayed luminance: each image passes through the exact display transform of the "
     "renderer (exposure, ACES tone mapping, gamma 1/2.2) and the Rec. 709 luminance of the result is compared "
     "with FLIP, which models the visibility of differences to a human observer. Mean squared metrics on linear "
@@ -545,17 +606,17 @@ S.append(Paragraph(
     "relative MSE of linear luminance. FLIP is a bounded perceptual scale, so ratios between methods are "
     "compressed by design and the frame counts at which methods reach equal error carry the comparison. We "
     "compare four estimators. Two are progressive references with frame averaging: bidirectional path tracing "
-    "(BDPT, 24 ms per sample) and unidirectional path tracing (30 ms). Two are ReSTIR estimators shown as per "
+    "(BDPT, 21 ms per sample) and unidirectional path tracing (29 ms). Two are ReSTIR estimators shown as per "
     "frame estimates without any frame averaging, since temporal reuse is their accumulation: ReSTIR PT, our "
-    "system with light tracing and vertex connections disabled (44 ms), and the full bidirectional system with "
-    "volumetric shifts (50 ms).", body_ni))
+    "system with light tracing and vertex connections disabled (55 ms), and the full bidirectional system with "
+    "volumetric shifts (59 ms).", body_ni))
 S.append(KeepTogether([
     fig("plot_conv_col.png", COL_W),
     Paragraph(
         "Fig. 5. Perceptual error per frame index. Our per frame estimate has the lowest error of all four "
-        "methods across the whole range: at frame 1, mean FLIP 0.138 versus 0.184 for ReSTIR PT and 0.175 for "
-        "one sample of BDPT; by frame 10 it reaches 0.055, where ReSTIR PT is at 0.087. In linear luminance "
-        "variance the same frame 10 gap is a factor of twelve (0.10 versus 1.23).", caption),
+        "methods across the whole range: at frame 1, mean FLIP 0.118 versus 0.169 for ReSTIR PT and 0.175 for "
+        "one sample of BDPT; by frame 10 it reaches 0.049, where ReSTIR PT is at 0.083. In linear luminance "
+        "variance the same frame 10 gap is a factor of eleven (0.060 versus 0.65).", caption),
 ]))
 S.append(KeepTogether([
     fig("plot_time_col.png", COL_W),
@@ -570,30 +631,38 @@ S.append(KeepTogether([
     fig("plot_ceil_col.png", COL_W),
     Paragraph(
         "Fig. 7. The per frame error floor. ReSTIR per frame estimates flatten when temporal reuse saturates "
-        "the confidence cap (here 8): ReSTIR PT at mean FLIP 0.079, ours at 0.049. The same floors differ by a "
-        "factor of 11.6 in linear luminance variance; the perceptual scale is bounded and compresses ratios. "
-        "Accumulated path tracing needs 248 frames to reach our per frame floor and accumulated BDPT 40 frames, "
+        "the confidence cap (here 8): ReSTIR PT at mean FLIP 0.076, ours at 0.045. The same floors differ by a "
+        "factor of 10.8 in linear luminance variance; the perceptual scale is bounded and compresses ratios. "
+        "Accumulated path tracing needs 320 frames to reach our per frame floor and accumulated BDPT 48 frames, "
         "after which frame averaging keeps descending, as expected on a static scene.", caption),
 ]))
+
+# Scene/method matrix as a full-width figure at the top of the next Results
+# page; the remaining Sec. 8 text flows in two columns beneath it.
+S.append(NextPageTemplate("Matrix"))
+S.append(PageBreak())
+S.append(fig("fig_matrix.png", PAGE_W - 2 * MARGIN))
+S.append(Paragraph(
+    "Fig. 8. Scene and method matrix. Three fog scenes rendered by four estimators without frame averaging: "
+    "unidirectional path tracing (one sample), bidirectional path tracing (one sample), ReSTIR PT (per frame "
+    "estimate at frame 8), and our bidirectional ReSTIR with volumetric shifts (frame 8). Numbers are mean FLIP "
+    "of the displayed luminance against a converged BDPT reference at 4096 samples per pixel; insets zoom the "
+    "regions marked on the reference, with per crop means. <b>Top:</b> the exterior view of Fig. 1 "
+    "(σ<sub>s</sub> = 0.15, σ<sub>a</sub> = 0.02, g = 0.3). <b>Middle:</b> an interior view of the same box "
+    "with the glass duck. <b>Bottom:</b> a biconvex glass lens under a small snooted emitter in denser forward "
+    "scattering fog (σ<sub>s</sub> = 0.30, σ<sub>a</sub> = 0.02, g = 0.5): the lens focuses the light into a "
+    "converging volumetric caustic with a floor caustic at the focus, and the lens shadow rings the spot. The "
+    "beam reaches the camera almost exclusively through scattering vertices connected to light subpaths, so "
+    "unidirectional per frame estimates barely detect it, while the bidirectional reservoirs resolve both the "
+    "beam and its focus.", caption))
+S.append(NextPageTemplate("Later"))
+S.append(FrameBreak())
 S.append(Paragraph(
     "<b>Unbiasedness.</b> Table 2 lists converged means. Configurations without reuse, with temporal reuse "
     "only, and with spatial reuse only agree with the per pixel resampling baseline; temporal reuse under a "
-    "static camera reproduces it exactly. The complete configuration lies within 0.05 percent of the "
+    "static camera reproduces it exactly. The complete configuration lies within 0.09 percent of the "
     "bidirectional reference, absorption only media isolate the transmittance handling, and the exterior "
     "viewpoint exercises airlight on rays without geometry.", body_ni))
-S.append(Spacer(1, 4))
-S.append(data_table(
-    [["Configuration", "Ours", "Reference", "&#916;"],
-     ["medium disabled (surface suite)", "0.116480", "0.116423 &#8211; 0.116535", "in band"],
-     ["absorption only (σ<sub>s</sub> = 0)", "0.08608", "0.08604", "+0.05%"],
-     ["full medium, no reuse", "0.09156", "0.09154", "+0.02%"],
-     ["full medium, temporal reuse", "0.09156", "= no reuse", "0"],
-     ["full medium, temporal + spatial", "0.09159", "0.09154", "+0.05%"],
-     ["exterior camera (rays without geometry)", "0.06573", "0.06568", "+0.06%"]],
-    [COL_W * 0.42, COL_W * 0.18, COL_W * 0.26, COL_W * 0.14]))
-S.append(Paragraph(
-    "Table 2. Converged image means (luminance) against bidirectional references. Interior camera unless noted; "
-    "fog σ<sub>s</sub> = 0.15, σ<sub>a</sub> = 0.02, g = 0.3.", caption))
 S.append(Paragraph(
     "<b>Replay and anchored reconnection.</b> In a homogeneous medium the two mappings of Sec. 4 perform "
     "equivalently in our tests, including under camera orbit and with g = 0.7. This follows from the exactness "
@@ -605,10 +674,37 @@ S.append(Paragraph(
     "participate in the reconnection criteria, so mixed surface and volume paths can choose the anchor with the "
     "broadest lobe, which in our scenes is frequently the volume vertex.", body_ni))
 S.append(Paragraph(
-    "<b>Cost.</b> With the medium enabled, the full ReSTIR frame costs 50 ms on the exterior view against 27 ms "
-    "with the medium disabled. The airlight family accounts for most of the difference, since its walks have no "
-    "emitter terminals and survive to the path length cap. Replayable Russian roulette over the airlight walk "
-    "is a direct optimization path. The medium itself requires no tracking and no density textures.", body_ni))
+    "<b>Cost.</b> With the medium enabled, the full ReSTIR frame costs 59 ms on the exterior view against 29 ms "
+    "with the medium disabled. The airlight family and the fog cluster spatial rounds account for most of the "
+    "difference: airlight walks have no emitter terminals and survive to the path length cap. Replayable "
+    "Russian roulette over the airlight walk is a direct optimization path. The medium itself requires no "
+    "tracking and no density textures.", body_ni))
+S.append(Paragraph(
+    "<b>Scene matrix.</b> Fig. 8 compares the four per frame estimators across three scenes: the exterior view "
+    "of Fig. 1, an interior view of the same box dominated by surfaces and the glass duck, and a lens scene in "
+    "a denser, more forward scattering medium (σ<sub>s</sub> = 0.30, g = 0.5), where a small snooted emitter "
+    "focuses through a biconvex glass lens into a converging volumetric caustic that crosses the floor at its "
+    "focus. The ranking is identical in all three: our per frame estimate at frame 8 reaches mean FLIP "
+    "0.052 / 0.050 / 0.113 against 0.087 / 0.072 / 0.203 for unidirectional ReSTIR PT, with single samples of "
+    "path tracing and BDPT far behind. The gap is largest exactly where transport is hardest: on the lens beam "
+    "crop our estimate reaches 0.165 where one sample of BDPT sits at 0.316 and path tracing at 0.402. The "
+    "beam is nearly invisible to camera side sampling and is carried by light traced and connected paths, "
+    "which only the bidirectional reservoirs can reuse across pixels and frames.", body))
+S.append(KeepTogether([
+    Spacer(1, 4),
+    data_table(
+        [["Configuration", "Ours", "Reference", "&#916;"],
+         ["medium disabled (surface suite)", "0.116489", "0.116423 &#8211; 0.116535", "in band"],
+         ["absorption only (σ<sub>s</sub> = 0)", "0.08616", "0.08604", "+0.14%"],
+         ["full medium, no reuse", "0.09153", "0.09154", "&#8722;0.01%"],
+         ["full medium, temporal reuse", "0.09153", "= no reuse", "0"],
+         ["full medium, temporal + spatial", "0.09146", "0.09154", "&#8722;0.09%"],
+         ["exterior camera (rays without geometry)", "0.06571", "0.06568", "+0.05%"]],
+        [COL_W * 0.42, COL_W * 0.18, COL_W * 0.26, COL_W * 0.14]),
+    Paragraph(
+        "Table 2. Converged image means (luminance) against bidirectional references. Interior camera unless "
+        "noted; fog σ<sub>s</sub> = 0.15, σ<sub>a</sub> = 0.02, g = 0.3.", caption),
+]))
 
 # ============================================================= limitations ==
 S.append(Paragraph("9&#160;&#160;Limitations and future work", h1))
@@ -616,38 +712,57 @@ S.append(Paragraph(
     "The medium is global and homogeneous; media interfaces and heterogeneity are not supported. Heterogeneous "
     "free flight sampling breaks distance replay, which makes the anchored mapping the natural foundation; open "
     "problems are a replayable tracking scheme for the prefix and transmittance estimation along reconnection "
-    "edges. Pixels without geometry reuse temporally but not spatially, since spatial candidate selection is "
-    "keyed by surface attributes; a medium aware cluster key would extend it. The reservoir of a pixel holds "
+    "edges. Pixels without geometry reuse spatially only into the shading estimate, not into the reservoir "
+    "chain, and never pair with surface pixels across silhouettes; both extensions require a supply aware "
+    "confidence accounting. The reservoir of a pixel holds "
     "one scattering depth of a line integral; dedicated reservoirs over the primary segment could lower the "
     "airlight floor further. Our MIS ratios omit transmittance, and dense media may justify a bounded "
     "approximation of it.", body_ni))
+S.append(Paragraph(
+    "The evaluation itself has boundaries. The convergence study of Figs. 5&#8211;7 uses one scene and one "
+    "medium parameter set (with the absorption only and g = 0.7 variants of Sec. 8), one resolution, and one "
+    "GPU; the matrix of Fig. 8 adds an interior view and a denser, more anisotropic lens scene, but a "
+    "systematic sweep over optical depth and anisotropy, and a comparison against froxel based volumetric "
+    "ReSTIR [Lin et al. 2021], would locate the regime boundaries of the approach. The variance analysis of Sec. 5 is validated through the complete "
+    "system rather than in isolation: an ablation that grants light tracing exclusive airlight responsibility "
+    "and measures the near camera variance directly would exhibit the failure mode the truncated family "
+    "removes, and classification rejection rates of replay near surfaces are likewise not reported. The "
+    "temporal machinery of Sec. 6 is measured under a static camera only; a moving camera study with "
+    "disocclusion is the outstanding validation.", body))
 
 # ============================================================== conclusion ==
 S.append(Paragraph("10&#160;&#160;Conclusion", h1))
 S.append(Paragraph(
-    "We presented a bidirectional ReSTIR with volumetric path reuse in unbounded media. Interior volume "
+    "We presented the first bidirectional ReSTIR whose path reuse extends into an unbounded participating "
+    "medium. Interior volume "
     "vertices act as reconnection anchors with a Jacobian that is a pure ratio of squared distances, replay "
     "reproduces free flight sampling under scatter classification masks, and scattered light along camera "
     "segments is sampled by a truncated camera technique whose multiple importance sampling weight removes an "
     "otherwise unbounded variance in the light traced estimator. The system is validated against bidirectional "
     "references and covers rays that hit no geometry. On a view dominated by the medium, its converged per "
-    "frame estimate reaches a perceptual error that accumulated path tracing needs 248 frames to match, and its "
-    "luminance variance floor lies 11.6 times below unidirectional ReSTIR path tracing.", body_ni))
+    "frame estimate reaches a perceptual error that accumulated path tracing needs 320 frames to match, and its "
+    "luminance variance floor lies 10.8 times below unidirectional ReSTIR path tracing.", body_ni))
 
 S.append(Paragraph("References", h1))
 for r in [
     "Benedikt Bitterli, Chris Wyman, Matt Pharr, Peter Shirley, Aaron Lefohn, and Wojciech Jarosz. 2020. "
     "Spatiotemporal reservoir resampling for real-time ray tracing with dynamic direct lighting. <i>ACM Trans. "
     "Graph.</i> 39, 4.",
+    "Theodoros Galazios and Konstantinos Moustakas. 2026. Towards optimal shift mapping heuristics for "
+    "ReSTIR-SSS. In <i>Extended Reality (XR Salento 2025), LNCS</i> 15737. Springer, 298&#8211;308.",
+    "Iliyan Georgiev, Jaroslav K&#345;iv&#225;nek, Tom&#225;&#353; Davidovi&#269;, and Philipp Slusallek. 2012. "
+    "Light transport simulation with vertex connection and merging. <i>ACM Trans. Graph.</i> 31, 6.",
     "Iliyan Georgiev, Jaroslav K&#345;iv&#225;nek, Toshiya Hachisuka, Derek Nowrouzezahrai, and Wojciech Jarosz. "
-    "2013. Joint importance sampling of low-order volumetric scattering. <i>ACM Trans. Graph.</i> 32, 6; and "
-    "UPBP: unifying points, beams and paths in volumetric light transport. <i>ACM Trans. Graph.</i> 33, 4 (2014).",
+    "2013. Joint importance sampling of low-order volumetric scattering. <i>ACM Trans. Graph.</i> 32, 6.",
     "Adrien Gruson, Binh-Son Hua, Nicolas Vibert, Derek Nowrouzezahrai, and Toshiya Hachisuka. 2018. "
     "Gradient-domain volumetric photon density estimation. <i>ACM Trans. Graph.</i> 37, 4.",
-    "Julian Guo et al. 2025. Towards optimal shift mapping heuristics for ReSTIR-SSS. In <i>Computer Graphics "
-    "International</i>. Springer.",
+    "Trevor Hedstrom, Markus Kettunen, Daqi Lin, Chris Wyman, and Tzu-Mao Li. 2025. ReSTIR BDPT: Bidirectional "
+    "ReSTIR path tracing with caustics. <i>ACM Trans. Graph.</i> 44, 5.",
     "Markus Kettunen, Marco Manzi, Miika Aittala, Jaakko Lehtinen, Fr&#233;do Durand, and Matthias Zwicker. 2015. "
     "Gradient-domain path tracing. <i>ACM Trans. Graph.</i> 34, 4.",
+    "Jaroslav K&#345;iv&#225;nek, Iliyan Georgiev, Toshiya Hachisuka, Petr V&#233;voda, Martin &#352;ik, Derek "
+    "Nowrouzezahrai, and Wojciech Jarosz. 2014. Unifying points, beams and paths in volumetric light transport "
+    "simulation. <i>ACM Trans. Graph.</i> 33, 4.",
     "Daqi Lin, Chris Wyman, and Cem Yuksel. 2021. Fast volume rendering with spatiotemporal reservoir resampling. "
     "<i>ACM Trans. Graph.</i> 40, 6.",
     "Daqi Lin, Markus Kettunen, Benedikt Bitterli, Jacopo Pantaleoni, Cem Yuksel, and Chris Wyman. 2022. "
@@ -682,7 +797,7 @@ def on_page(canv, doc):
 doc = BaseDocTemplate(OUT, pagesize=letter, leftMargin=MARGIN, rightMargin=MARGIN,
                       topMargin=MARGIN, bottomMargin=MARGIN,
                       title="Volume Anchored Shift Mappings for Bidirectional ReSTIR in Participating Media",
-                      author="Malte Lanz")
+                      author="Claude et al.")
 
 TOP_H = 3.05 * inch
 first_frames = [
@@ -699,8 +814,20 @@ later_frames = [
     Frame(MARGIN + COL_W + COL_GAP, MARGIN, COL_W, PAGE_H - 2 * MARGIN, id="l2",
           leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0),
 ]
+# Matrix page: full-width figure frame on top, two text columns beneath
+# (same construction as the title page).
+MATRIX_TOP_H = 7.5 * inch
+matrix_frames = [
+    Frame(MARGIN, PAGE_H - MARGIN - MATRIX_TOP_H, PAGE_W - 2 * MARGIN, MATRIX_TOP_H, id="mtop",
+          leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0),
+    Frame(MARGIN, MARGIN, COL_W, PAGE_H - 2 * MARGIN - MATRIX_TOP_H - 8, id="mc1",
+          leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0),
+    Frame(MARGIN + COL_W + COL_GAP, MARGIN, COL_W, PAGE_H - 2 * MARGIN - MATRIX_TOP_H - 8, id="mc2",
+          leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0),
+]
 doc.addPageTemplates([PageTemplate(id="First", frames=first_frames, onPage=on_page),
-                      PageTemplate(id="Later", frames=later_frames, onPage=on_page)])
+                      PageTemplate(id="Later", frames=later_frames, onPage=on_page),
+                      PageTemplate(id="Matrix", frames=matrix_frames, onPage=on_page)])
 S.insert(0, NextPageTemplate("Later"))
 doc.build(S)
 print("wrote", OUT)

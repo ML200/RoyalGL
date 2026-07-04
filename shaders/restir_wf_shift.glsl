@@ -105,8 +105,10 @@ void WfJobComplete(uint jb, vec3 f, float replayPdf, float J,
 
 // Creates one shift job: the megakernel's pre-loop prologue. Everything
 // here is ray-free; jobs that need replay work are enqueued into step
-// round 0, trivial and impossible shifts complete immediately. The caller
-// guarantees the destination anchor exists (non-miss G-buffer entry).
+// round 0, trivial and impossible shifts complete immediately. Miss
+// destinations are legal for the airlight family (fog-cluster spatial
+// merges and the fog pairings below); every surface-anchored class
+// rejects on them.
 //
 // volOnly = fog-paired merges (restir_wf_tinit.comp's fog-fallback and
 // miss-pixel pairings): only the AIRLIGHT family (t>=2, volMask bit 0)

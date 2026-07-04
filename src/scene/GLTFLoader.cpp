@@ -38,6 +38,13 @@ namespace RoyalGL
                 float strength = mat->has_emissive_strength ? mat->emissive_strength.emissive_strength : 1.0f;
                 out.emissive = glm::vec3(mat->emissive_factor[0], mat->emissive_factor[1], mat->emissive_factor[2]) * strength;
             }
+            // KHR_materials_transmission marks transmissive surfaces; map
+            // them onto the delta dielectric (smooth) or rough dielectric,
+            // with the IOR from KHR_materials_ior when present.
+            if (mat && mat->has_ior)
+                out.ior = mat->ior.ior;
+            if (mat && mat->has_transmission && mat->transmission.transmission_factor > 0.5f)
+                out.type = (out.roughness > 0.05f) ? MaterialType::RoughDielectric : MaterialType::Glass;
             return out;
         }
 
