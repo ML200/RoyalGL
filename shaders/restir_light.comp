@@ -80,8 +80,10 @@ void main()
     RngStream(0u, RNG_EMIT);
 
     // ------------------------------------------------------- emission ----
+    // Power-CDF pick (NOT the camera-anchored tree): replay-stable under
+    // camera motion, see RestirSampleLightIndex in restir_common.glsl.
     float pickPdfTrue;
-    uint lightIdx = BdptSampleLightIndex(pickPdfTrue);
+    uint lightIdx = RestirSampleLightIndex(pickPdfTrue);
     if (pickPdfTrue <= 0.0) return;
     LightTri lt = lightTris[lightIdx];
     vec3 lightNormal = lt.normalArea.xyz;
@@ -127,6 +129,8 @@ void main()
     float prevDVCM = 0.0, prevDVC = 0.0, prevDLW = 0.0;
 
     uint deltaMask = 0u;
+    uint volMask = 0u;
+    bool prevIsVolume = false;
     uint maxLen = BdptMaxPathLength();
     uint pathLength = 1u; // segments from the light after the next hit
     float numLightPaths = float(BdptNumLightPaths());
@@ -137,11 +141,167 @@ void main()
     for (uint iter = 0u; iter < BDPT_MAX_LIGHT_VERTS; ++iter)
     {
         Hit hit;
-        if (!IntersectScene(ray, hit)) break;
+        bool surfHit = IntersectScene(ray, hit);
+
+        // Homogeneous fog free-flight (replayable stream keyed by the
+        // departing vertex index - shifts reproduce the classification).
+        bool volScatter = false;
+        if (FogEnabled())
+        {
+            RngStream(pathLength, RNG_DIST);
+            float tS = FogSampleDist(RandomFloat());
+            if (tS < (surfHit ? hit.t : 1e30)) { volScatter = true; hit.t = tS; }
+        }
+        if (!surfHit && !volScatter) break;
+
+        if (volScatter)
+        {
+            // ------------------------- volume scattering vertex ----------
+            // True-value convention (fNum/pProd tracked separately): the
+            // segment contributes Tr to f and sigma_t*Tr to the pdf; the
+            // vertex contributes sigma_s*phase to f and phase to the pdf.
+            vec3 vPos = ray.origin + ray.dir * hit.t;
+            float sigmaT = FogSigmaT();
+            float trSeg = FogTr(hit.t);
+            fNum *= trSeg;
+            pProd *= sigmaT * trSeg;
+            dVCM *= hit.t * hit.t / sigmaT;
+            dVC /= sigmaT;
+            dLW /= sigmaT;
+            vec3 wiV = -ray.dir;
+            volMask |= 1u << (pathLength - 1u);
+
+            if (connections && pathLength + 2u <= maxLen)
+            {
+                // LVC append: 8-bit sentinel 0xFE marks a volume vertex in
+                // the packed matId field; instance 15 = static world space.
+                uint slot = atomicAdd(lightVertCount[0], 1u);
+                if (slot < BdptNumLightPaths() * BDPT_MAX_LIGHT_VERTS)
+                {
+                    LightVertex v;
+                    v.posDvcm = vec4(vPos, dVCM);
+                    v.normalDvc = vec4(0.0, 0.0, 1.0, dVC);
+                    v.tputMat = vec4(fNum, uintBitsToFloat(
+                        (0xFEu << 8) | (15u << 4) | (pathLength & 0xFu)));
+                    v.wiLen = vec4(wiV, pProd);
+                    lightVerts[slot] = v;
+                }
+            }
+
+            if (lightTracing && pathLength + 1u <= maxLen)
+            {
+                // ------------- volume t=1 candidate (airlight) -----------
+                // Free landing + pure replay: the CAUSTIC class. The
+                // in-scatter point is a fixed world-space point; shifting
+                // it to another pixel makes no sense, but replaying the
+                // whole subpath and re-projecting the camera connection
+                // does - exactly the caustic machinery.
+                vec3 toCam = uFrame.camPos.xyz - vPos;
+                float dist2 = dot(toCam, toCam);
+                float dist = sqrt(max(dist2, 1e-12));
+                vec3 dirToCam = toCam / dist;
+                ivec2 pixel;
+                float cosAtCam;
+                if (dist2 > 1e-12 && BdptDirToPixel(-dirToCam, pixel, cosAtCam))
+                {
+                    uint pixIdx = RestirPixelIndex(pixel);
+                    GBufferPixel g = RestirLoadGBuf(GBufCurOffset() + pixIdx);
+                    // Visible in-scatter only: the point must lie in front
+                    // of the pixel's surface. Miss pixels accept every
+                    // distance (infinite medium; their airlight family is
+                    // the untruncated exponential).
+                    if (g.posDepth.w < 0.0 || dist < g.posDepth.w)
+                    {
+                        float pDir, pRev;
+                        vec3 fp = EvalPhase(ray.dir, dirToCam, pDir, pRev);
+                        float iptcd = ipd / cosAtCam;
+                        float i2solid = (iptcd * iptcd) / cosAtCam;
+                        float i2contrib = i2solid / dist2;            // no cos at a volume point
+
+                        // Technique MIS against the camera-side airlight
+                        // family (restir_wf_caminit.comp walk 2): the
+                        // camera samples this in-scatter point with the
+                        // TRUNCATED free-flight pdf, whose Tr-free volume
+                        // density is i2solid*sigma_t/(d^2*pScat). This is
+                        // the exact volume analog of bdpt_light.comp's t=1
+                        // weight - and the term that kills the 1/d^2
+                        // near-camera singularity (omega ~ d^2 as d -> 0).
+                        // The old omega = 1 ("no camera competitor") left
+                        // the splat estimator's second moment DIVERGENT:
+                        // correct means, unbounded fireflies, accumulation
+                        // that never visibly converges.
+                        float pScat = FogScatterProb(g.posDepth.w);
+                        float wLight = (i2solid * FogSigmaT()
+                                        / (dist2 * max(pScat, 1e-7) * numLightPaths))
+                                     * (connections
+                                            ? (dVCM + pRev * dVC)
+                                            : (pathLength == 1u ? (dVCM + pRev * dLW)
+                                                                : (pRev * dLW)));
+                        float omega = 1.0 / (1.0 + wLight);
+
+                        vec3 fPix = fNum * fp * i2contrib * FogTr(dist);
+                        float w = omega * RestirLum(fPix) / (pProd * numLightPaths);
+
+                        if (w > 0.0 && !isnan(w) && !isinf(w))
+                        {
+                            Ray shadowRay = MakeRay(vPos, dirToCam);
+                            if (!IntersectSceneOccluded(shadowRay, ShadowTMax(dist)))
+                            {
+                                uint flags = RESTIR_FLAG_CAUSTIC | (deltaMask << 8) | (volMask << 16);
+                                uint tech = RestirPackTech(pathLength + 1u, 1u, flags);
+                                LrmAppend(pixIdx, vec4(fPix, w),
+                                          vec4(1.0, hit.t * hit.t, omega, pProd),
+                                          tech, baseSeed, 0u);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (pathLength + 2u > maxLen) break;
+
+            // Snapshot for the next vertex's anchored candidate.
+            prevDVCM = dVCM;
+            prevDVC = dVC;
+            prevDLW = dLW;
+            prevFNum = fNum;
+
+            RngStream(pathLength, RNG_BSDF);
+            float pdfPhase;
+            vec3 dirNew = SamplePhaseHG(ray.dir, FogG(), RandomFloat2(), pdfPhase);
+            if (pdfPhase <= 0.0) break;
+            // Scatter recursion with the volume measure factor sigma_t.
+            dVC = (sigmaT / pdfPhase) * (dVCM + pdfPhase * dVC);
+            dLW = (sigmaT / pdfPhase) * ((pathLength == 1u ? dVCM : 0.0) + pdfPhase * dLW);
+            dVCM = 1.0 / pdfPhase;
+
+            pdfPrevArrival = pProd;
+            fNum *= vec3(FogSigmaS() * pdfPhase); // = sigma_s * phase (pdf-cancelled form)
+            pProd *= pdfPhase;
+
+            prevPos = vPos;
+            prevN = vec3(0.0, 0.0, 1.0);
+            prevWi = wiV;
+            prevMat = MAT_VOLUME;
+            prevIsDelta = false;
+            prevIsVolume = true;
+            pathLength++;
+
+            ray = MakeRay(vPos, dirNew);
+            continue;
+        }
 
         vec3 hitPos = ray.origin + ray.dir * hit.t;
         float cosIn = abs(dot(hit.normal, ray.dir));
         if (cosIn <= 1e-6) break;
+
+        if (FogEnabled())
+        {
+            // Pass-through: P(no scatter) = Tr enters f and pdf equally.
+            float trSeg = FogTr(hit.t);
+            fNum *= trSeg;
+            pProd *= trSeg;
+        }
 
         dVCM *= hit.t * hit.t;
         dVCM /= cosIn;
@@ -222,7 +382,7 @@ void main()
                                                                 : (bsdfRevPdfW * dLW)));
                         float omega = 1.0 / (1.0 + wLight);
 
-                        vec3 fPix = fNum * fb * imageToSurface;
+                        vec3 fPix = fNum * fb * imageToSurface * FogTr(dist);
                         float w = omega * RestirLum(fPix) / (pProd * numLightPaths);
 
                         if (w > 0.0 && !isnan(w) && !isinf(w))
@@ -231,7 +391,7 @@ void main()
                             Ray shadowRay = MakeRay(hitPos + nf * 1e-4, dirToCam);
                             if (!IntersectSceneOccluded(shadowRay, ShadowTMax(dist)))
                             {
-                                uint flags = RESTIR_FLAG_CAUSTIC | (deltaMask << 8);
+                                uint flags = RESTIR_FLAG_CAUSTIC | (deltaMask << 8) | (volMask << 16);
                                 uint tech = RestirPackTech(pathLength + 1u, 1u, flags);
                                 // Caustic shifts replay everything: the
                                 // replayed-pdf product is the full arrival
@@ -283,7 +443,23 @@ void main()
                         float pdP = 0.0; // pdf of sampling dirA at y_{s-2}
                         float nVC = 0.0, nLW = 0.0;
                         bool prevOk = false;
-                        if (prevMat == NO_MATERIAL)
+                        if (prevIsVolume)
+                        {
+                            // y_{s-2} is a volume vertex: phase reconnect,
+                            // sigma_t in the conversion roles, no cosine.
+                            float prP;
+                            vec3 fbP = EvalPhase(-prevWi, dirA, pdP, prP);
+                            if (fbP != vec3(0.0) && pdP > 0.0)
+                            {
+                                fPrev = prevFNum * fbP;
+                                float sT = FogSigmaT();
+                                nVC = (sT / pdP) * (prevDVCM + prP * prevDVC);
+                                nLW = (sT / pdP)
+                                    * ((pathLength == 2u ? prevDVCM : 0.0) + prP * prevDLW);
+                                prevOk = true;
+                            }
+                        }
+                        else if (prevMat == NO_MATERIAL)
                         {
                             // y_{s-2} = y_0: the emission direction itself
                             // is replaced (one-sided emitter).
@@ -349,7 +525,8 @@ void main()
                                                                : (pdXA * nLWa)));
                                 float omegaA = 1.0 / (1.0 + wLightA);
 
-                                vec3 fA = fPrev * fbX * i2sA;
+                                vec3 fA = fPrev * fbX * i2sA
+                                          * FogTr(distA) * FogTr(g.posDepth.w);
                                 // Free landing -> anchor Jacobian (Eq. 56):
                                 // endpoint geometry ratio at the moving x_1.
                                 // Same symmetric support restriction as the
@@ -367,11 +544,17 @@ void main()
 
                                 if (w > 0.0 && !isnan(w) && !isinf(w))
                                 {
-                                    vec3 nf = (dot(prevN, dirA) >= 0.0) ? prevN : -prevN;
-                                    Ray shadowRay = MakeRay(prevPos + nf * 1e-4, dirA);
+                                    Ray shadowRay;
+                                    if (prevIsVolume)
+                                        shadowRay = MakeRay(prevPos, dirA);
+                                    else
+                                    {
+                                        vec3 nf = (dot(prevN, dirA) >= 0.0) ? prevN : -prevN;
+                                        shadowRay = MakeRay(prevPos + nf * 1e-4, dirA);
+                                    }
                                     if (!IntersectSceneOccluded(shadowRay, ShadowTMax(distA)))
                                     {
-                                        uint flags = RESTIR_FLAG_RCVALID | (deltaMask << 8);
+                                        uint flags = RESTIR_FLAG_RCVALID | (deltaMask << 8) | (volMask << 16);
                                         uint tech = RestirPackTech(pathLength + 1u, 1u, flags);
                                         LrmAppend(pixIdx, vec4(fA, w),
                                                   vec4(cosRcA, d2A, omegaA, pdfPrevArrival),
@@ -428,6 +611,7 @@ void main()
         prevWi = wi;
         prevMat = hit.materialIndex;
         prevIsDelta = isDelta;
+        prevIsVolume = false;
         pathLength++;
 
         vec3 offN = (dot(bs.dir, hit.normal) >= 0.0) ? hit.normal : -hit.normal;

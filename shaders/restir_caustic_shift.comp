@@ -40,15 +40,17 @@ void main()
     uint seed = floatBitsToUint(pixelRes[hSlot].caustic.fSeed.w);
 
     RestirCausticReplayResult res = RestirCausticReplay(
-        seed, RestirTechS(tech), RestirFlagsDeltaMask(RestirTechFlags(tech)),
+        seed, RestirTechS(tech), RestirTechFlags(tech),
         uFrame.camPos.xyz, uFrame.camForward.xyz, uFrame.camRight.xyz, uFrame.camUp.xyz,
-        uFrame.cameraParams.x, uFrame.cameraParams.y);
+        uFrame.cameraParams.x, uFrame.cameraParams.y, GBufCurOffset());
     if (!res.ok) return;
 
     // Same support convention as candidate creation: paths landing on
-    // primary-miss pixels are dropped (the resolve shows the background).
+    // primary-miss pixels are dropped (the resolve shows the background) -
+    // except when the fog scatters: miss pixels then carry live caustic
+    // reservoirs (airlight) and the merge runs on them too.
     uint dstIdx = RestirPixelIndex(res.pixel);
-    if (gbuf[GBufCurOffset() + dstIdx].posDepth.w < 0.0) return;
+    if (gbuf[GBufCurOffset() + dstIdx].posDepth.w < 0.0 && !FogScatterEnabled()) return;
 
     // Pure-replay Jacobian (Eq. 53): base pdf product over shifted's. The
     // symmetric support restriction matters here more than anywhere: the

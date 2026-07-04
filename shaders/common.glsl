@@ -56,6 +56,7 @@ layout(std140, binding = 0) uniform FrameUBO
     vec4 prevCameraParams; // x=tanHalfFovY, y=aspect
     uvec4 restirParams;    // x=debug view, y=flags (bit0 restir, bit1 temporal, bit2 spatial,
                            //   bit3 accumulate frames), z=frame counter, w=ping-pong parity
+    vec4 fogParams;        // homogeneous medium: x=sigma_s, y=sigma_a, z=HG g, w=enabled
     // Instance transforms for object-space surface storage (see
     // GPUTypes.h): frame-persistent positions (G-buffer, reservoir
     // reconnection data) are stored in instance object space and converted
@@ -160,6 +161,10 @@ const uint RNG_EVAL    = 8u; // stochastic BSDF *evaluation* draws at the s=1
                              // the light sampling that precedes the eval
                              // consumes a variable number of RNG_NEE draws
                              // (tree descent) that shifts don't replay.
+const uint RNG_DIST    = 9u; // free-flight distance sampling in the fog
+                             // (one draw per path segment, replayable so
+                             // shift mappings reproduce the scatter/pass
+                             // classification along replayed prefixes).
 
 void RngStream(uint vertex, uint purpose)
 {
@@ -240,6 +245,106 @@ float MatRcRoughness(Material m)
     if (t == 0) return 1.0;
     if (t == 2 || t == 3) return m.params.y;
     return 0.0;
+}
+
+// -------------------------------------------- homogeneous medium (fog) ----
+// Global homogeneous medium with a Henyey-Greenstein phase function. For a
+// homogeneous medium everything is ANALYTIC and the estimator is exact in
+// the distance dimension: Beer-Lambert transmittance in closed form (no
+// delta/ratio tracking), exponential free-flight sampling whose pdf
+// sigma_t*Tr(t) cancels the medium factors of the throughput exactly
+// (scatter events contribute the single-scattering albedo, pass-throughs
+// contribute 1), and exact HG importance sampling. Volume scattering
+// vertices have NO cosine terms; in the recursive MIS quantities the
+// per-vertex measure factor "cos" is replaced by sigma_t (the volume event
+// density: p_vol = p_omega * sigma_t / d^2 vs p_area = p_omega * cos /
+// d^2). Transmittance is kept OUT of the MIS ratios (a consistent,
+// partition-preserving convention across every technique - exact
+// unbiasedness, approximate optimality in dense media).
+bool  FogEnabled() { return uFrame.fogParams.w > 0.5; }
+float FogSigmaS()  { return uFrame.fogParams.x; }
+float FogSigmaT()  { return uFrame.fogParams.x + uFrame.fogParams.y; }
+float FogG()       { return uFrame.fogParams.z; }
+float FogAlbedo()  { return uFrame.fogParams.x / max(FogSigmaT(), 1e-8); }
+float FogTr(float d) { return FogEnabled() ? exp(-FogSigmaT() * d) : 1.0; }
+// Free-flight distance for a uniform u (exponential, pdf sigma_t*e^(-t)).
+float FogSampleDist(float u) { return -log(max(1.0 - u, 1e-7)) / max(FogSigmaT(), 1e-8); }
+
+// The camera walk's primary-segment in-scatter technique (airlight) exists
+// only when the medium actually scatters.
+bool FogScatterEnabled() { return FogEnabled() && FogSigmaS() > 0.0; }
+
+// P(scatter before the surface at distance dSurf) = 1 - Tr(dSurf); dSurf < 0
+// marks a primary miss (infinite medium -> certain scatter).
+float FogScatterProb(float dSurf)
+{
+    return (dSurf < 0.0) ? 1.0 : 1.0 - FogTr(dSurf);
+}
+
+// TRUNCATED free-flight distance on [0, dSurf): the ReSTIR camera pass
+// samples the primary in-scatter point CONDITIONED on scattering before the
+// anchor (pdf sigma_t*Tr(t)/pScat with pScat = FogScatterProb(dSurf)), so
+// the surface family keeps its deterministic probability-1 anchor and
+// fog-off behavior is bit-for-bit unchanged. Exact inversion.
+float FogSampleDistTrunc(float u, float pScat)
+{
+    return -log(max(1.0 - min(u, 0.99999994) * pScat, 1e-7)) / max(FogSigmaT(), 1e-8);
+}
+
+// Representative primary in-scatter depth for FOG MOTION VECTORS: the mean
+// of the truncated free-flight distribution on [0, dSurf],
+//   E[t] = 1/sigma_t - dSurf * Tr(dSurf) / (1 - Tr(dSurf)),
+// (-> 1/sigma_t for a primary miss). A SAMPLE-INDEPENDENT function of the
+// G-buffer alone - required so temporal history pairing never depends on
+// realized reservoir content (the same rule as proxy confidence).
+float FogRepDistance(float dSurf)
+{
+    float sT = max(FogSigmaT(), 1e-8);
+    if (dSurf < 0.0) return 1.0 / sT;
+    float tr = FogTr(dSurf);
+    float pScat = max(1.0 - tr, 1e-7);
+    return max(1.0 / sT - dSurf * tr / pScat, 0.0);
+}
+
+// HG phase function: cosTheta between the PROPAGATION direction of the
+// incoming ray and the outgoing direction (g > 0 = forward scattering).
+// Normalized over the sphere; symmetric (pdfRev == pdfDir).
+float PhaseHG(float cosTheta, float g)
+{
+    float d = 1.0 + g * g - 2.0 * g * cosTheta;
+    return (1.0 - g * g) / (4.0 * PI * d * sqrt(max(d, 1e-8)));
+}
+
+// Sample the HG phase around propagation direction wProp; returns the
+// outgoing direction, with pdf = PhaseHG(dot(wProp, out), g).
+vec3 SamplePhaseHG(vec3 wProp, float g, vec2 u, out float pdf)
+{
+    float cosTheta;
+    if (abs(g) < 1e-3)
+    {
+        cosTheta = 1.0 - 2.0 * u.x;
+    }
+    else
+    {
+        float sq = (1.0 - g * g) / (1.0 + g - 2.0 * g * u.x);
+        cosTheta = (1.0 + g * g - sq * sq) / (2.0 * g);
+    }
+    float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+    float phi = 2.0 * PI * u.y;
+    // Orthonormal basis around wProp.
+    vec3 a = (abs(wProp.x) > 0.9) ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 t1 = normalize(cross(a, wProp));
+    vec3 t2 = cross(wProp, t1);
+    pdf = PhaseHG(cosTheta, g);
+    return normalize(wProp * cosTheta + t1 * (sinTheta * cos(phi)) + t2 * (sinTheta * sin(phi)));
+}
+
+// Peak of the HG pdf (at cosTheta = sign-of-g extreme), for the volume
+// analog of the inverse-footprint reconnection criterion.
+float PhaseHGPeak(float g)
+{
+    float ag = abs(g);
+    return (1.0 + ag) / (4.0 * PI * (1.0 - ag) * (1.0 - ag));
 }
 
 // Exact unpolarized dielectric Fresnel reflectance; returns 1 on total
@@ -987,6 +1092,22 @@ struct Hit
 
 const float RAY_TMAX = 1.0e30;
 const uint  NO_MATERIAL = 0xFFFFFFFFu;
+// Sentinel material id marking a VOLUME scattering vertex (fog): the
+// vertex has no BSDF/normal - scatter evaluation goes through the phase
+// function and MIS measure factors use sigma_t instead of cosines.
+const uint  MAT_VOLUME  = 0xFFFFFFFEu;
+
+// Scatter evaluation at a volume vertex: f = sigma_s * phase (per solid
+// angle), symmetric pdfs. wProp = propagation direction of the INCOMING
+// ray (i.e. -wi in the walk convention); the contribution cosine is 1 -
+// callers use FogSigmaT() as the MIS measure factor instead.
+vec3 EvalPhase(vec3 wProp, vec3 wo, out float pdfDir, out float pdfRev)
+{
+    float p = PhaseHG(dot(wProp, wo), FogG());
+    pdfDir = p;
+    pdfRev = p;
+    return vec3(FogSigmaS() * p);
+}
 
 float IntersectAABB(Ray ray, vec3 bmin, vec3 bmax, float tMax)
 {

@@ -72,6 +72,17 @@ void main()
             pixelRes[outSlot].path = pixelRes[canonSlot].path;
             return;
         }
+        if (gCur.posDepth.w < 0.0)
+        {
+            // Miss pixels never get candidate rounds (dead header below):
+            // the canonical must survive verbatim, or the airlight-family
+            // reservoirs miss pixels carry under scattering fog would be
+            // zeroed by the empty aggregate.
+            pixelRes[outSlot].path = pixelRes[canonSlot].path;
+            wfArena[WfShadeAccSlot(idx)].xyz = vec3(0.0);
+            wfArena[idx] = vec4(0.0, uintBitsToFloat(0u), uintBitsToFloat(0u), 0.0);
+            return;
+        }
         // The mixture aggregate starts EMPTY (V = W*pHat = 0); the
         // canonical enters through every round's pair estimator. Its
         // confidence seeds the running confidence total.
@@ -131,12 +142,12 @@ void main()
     uint nSlot = RestirRegionOffset(RESTIR_SCRATCH_REGION) + nIdx;
     vec4 nCore = pixelRes[nSlot].path.core;
     if (nCore.x > 0.0 && nCore.y > 0.0)
-        WfShiftCreateJob(job0, nSlot, idx, false);
+        WfShiftCreateJob(job0, nSlot, idx, false, false);
 
     // Backward: the FROZEN canonical into the candidate's domain (the pair
     // estimator is canonical-vs-candidate; the running aggregate never
     // feeds MIS, which is what keeps the mixture linear over rounds).
     vec4 cCore = pixelRes[canonSlot].path.core;
     if (cCore.x > 0.0 && cCore.y > 0.0)
-        WfShiftCreateJob(job1, canonSlot, nIdx, false);
+        WfShiftCreateJob(job1, canonSlot, nIdx, false, false);
 }

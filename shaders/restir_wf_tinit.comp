@@ -30,6 +30,46 @@ void main()
     GBufferPixel gCur = RestirLoadGBuf(GBufCurOffset() + idx);
     if (gCur.posDepth.w < 0.0)
     {
+        // Anchor-less pixels carry airlight reservoirs when the fog
+        // scatters (caminit's walk 2). Their history source is the prev
+        // pixel that looked through the same fog: reproject a
+        // representative in-scatter point (one mean free path along the
+        // pixel ray) and reuse miss-to-miss only - the airlight family's
+        // truncated replay (volMask bit 0) handles the rest, and
+        // WfShiftCreateJob rejects every surface-anchored class on a miss
+        // destination.
+        if (FogScatterEnabled())
+        {
+            ivec2 pixel = ivec2(int(idx % uFrame.frameInfo.x), int(idx / uFrame.frameInfo.x));
+            vec3 rayDir = RestirPrimaryRay(pixel).dir;
+            vec3 rep = uFrame.camPos.xyz + rayDir / max(FogSigmaT(), 1e-4);
+            vec2 prevPixF;
+            if (RestirPrevProject(rep, prevPixF))
+            {
+                ivec2 prevPix = ivec2(prevPixF);
+                if (prevPix.x >= 0 && prevPix.y >= 0 && prevPix.x < size.x && prevPix.y < size.y)
+                {
+                    uint prevIdx = RestirPixelIndex(prevPix);
+                    GBufferPixel gPrev = RestirLoadGBuf(GBufPrevOffset() + prevIdx);
+                    if (gPrev.posDepth.w < 0.0)
+                    {
+                        wfArena[idx] = vec4(uintBitsToFloat(prevIdx), uintBitsToFloat(1u), 1.0, 0.0);
+                        uint bSlot = RestirRegionOffset(RestirHistoryRegion()) + prevIdx;
+                        vec4 bCore = pixelRes[bSlot].path.core;
+                        vec4 aCore = pixelRes[inSlot].path.core;
+                        uint job0 = idx * 2u;
+                        uint job1 = idx * 2u + 1u;
+                        wfArena[WfShiftJobBase(job0)].z = uintBitsToFloat(WF_JOB_FAIL);
+                        wfArena[WfShiftJobBase(job1)].z = uintBitsToFloat(WF_JOB_FAIL);
+                        if (bCore.x > 0.0 && bCore.y > 0.0)
+                            WfShiftCreateJob(job0, bSlot, idx, false, true);
+                        if (aCore.x > 0.0 && aCore.y > 0.0)
+                            WfShiftCreateJob(job1, inSlot, prevIdx, true, true);
+                        return;
+                    }
+                }
+            }
+        }
         if (outSlot != inSlot) pixelRes[outSlot].path = pixelRes[inSlot].path;
         return;
     }
@@ -64,6 +104,37 @@ void main()
         }
     }
 
+    bool volOnly = false;
+    if (!histValid && FogScatterEnabled() && RestirFogPairingEnabled())
+    {
+        // Fog fallback: the surface anchor disoccluded / failed validation,
+        // but the pixel's AIRLIGHT content lives in front of the surface
+        // and is continuous across silhouettes - losing it with the anchor
+        // is what makes fog history die under camera motion. Re-pair by
+        // FOG PARALLAX: reproject the representative in-scatter depth
+        // (truncated-exponential mean - a G-buffer-only, sample-independent
+        // function, same rule as proxy confidence) and reuse the AIRLIGHT
+        // FAMILY ONLY (WfShiftCreateJob volOnly): its truncated replay
+        // re-anchors to this pixel's ray and never touches the surface, so
+        // the anchor-validation rationale (surface W random walks) does not
+        // apply to it. Surface classes fail symmetrically in both merge
+        // directions - the partition stays exact.
+        ivec2 pixel = ivec2(int(idx % uFrame.frameInfo.x), int(idx / uFrame.frameInfo.x));
+        vec3 rayDir = RestirPrimaryRay(pixel).dir;
+        vec3 rep = uFrame.camPos.xyz + rayDir * FogRepDistance(gCur.posDepth.w);
+        vec2 repPixF;
+        if (RestirPrevProject(rep, repPixF))
+        {
+            ivec2 repPix = ivec2(repPixF);
+            if (repPix.x >= 0 && repPix.y >= 0 && repPix.x < size.x && repPix.y < size.y)
+            {
+                prevPix = repPix;
+                histValid = true;
+                histFade = 1.0;
+                volOnly = true;
+            }
+        }
+    }
     if (!histValid)
     {
         // Disocclusion / off-screen: the candidate stands alone, m_A = 1.
@@ -72,7 +143,7 @@ void main()
     }
 
     uint prevIdx = RestirPixelIndex(prevPix);
-    histFade *= RestirReuseRoughFade(GBufMaterial(gCur));
+    if (!volOnly) histFade *= RestirReuseRoughFade(GBufMaterial(gCur));
     wfArena[idx] = vec4(uintBitsToFloat(prevIdx), uintBitsToFloat(1u), histFade, 0.0);
 
     uint bSlot = RestirRegionOffset(RestirHistoryRegion()) + prevIdx;
@@ -86,7 +157,7 @@ void main()
     wfArena[WfShiftJobBase(job0)].z = uintBitsToFloat(WF_JOB_FAIL);
     wfArena[WfShiftJobBase(job1)].z = uintBitsToFloat(WF_JOB_FAIL);
     if (bCore.x > 0.0 && bCore.y > 0.0)
-        WfShiftCreateJob(job0, bSlot, idx, false);
+        WfShiftCreateJob(job0, bSlot, idx, false, volOnly);
     if (aCore.x > 0.0 && aCore.y > 0.0)
-        WfShiftCreateJob(job1, inSlot, prevIdx, true);
+        WfShiftCreateJob(job1, inSlot, prevIdx, true, volOnly);
 }

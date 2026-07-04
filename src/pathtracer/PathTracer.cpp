@@ -69,8 +69,6 @@ namespace RoyalGL
         // Wavefront ReSTIR needs SSBO bindings 16-17 (restir_wf_common.glsl)
         // - available on discrete GPUs (NVIDIA 96, AMD 64) but not on Intel
         // iGPUs (16). Without them ReSTIR falls back to plain BDPT.
-        if (const char* v = std::getenv("ROYALGL_RESTIR_CAUSTIC"))
-            m_causticPassesEnabled = (v[0] != '0');
         GLint maxSsboBindings = 0;
         GL_CALL(glGetIntegerv(GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS, &maxSsboBindings));
         if (maxSsboBindings < 18)
@@ -107,10 +105,8 @@ namespace RoyalGL
         m_accum.Clear(); // fresh allocation: alpha (per-pixel counts) must start at 0
 
         uint32_t pixelCount = static_cast<uint32_t>(width) * static_cast<uint32_t>(height);
-        m_numLightPaths = std::min(pixelCount, kMaxLightPaths);
-        m_lightVertexBuffer.Upload(nullptr, size_t(m_numLightPaths) * kMaxLightVerts * kLightVertexBytes,
-                                   GL_DYNAMIC_COPY);
-        m_lightVertCountBuffer.Upload(nullptr, size_t(m_numLightPaths) * sizeof(uint32_t), GL_DYNAMIC_COPY);
+        m_numLightPaths = 0; // force the light buffers to re-derive from the new size
+        EnsureLightPathBuffers(m_lightPathsRequested);
         m_splatBuffer.Upload(nullptr, size_t(pixelCount) * 3 * sizeof(uint32_t), GL_DYNAMIC_COPY);
         m_pixelPupilBuffer.Upload(nullptr, size_t(pixelCount) * 4 * sizeof(float), GL_DYNAMIC_COPY);
         m_pupilsDirty = true;
@@ -136,6 +132,30 @@ namespace RoyalGL
         // would otherwise add them into the fresh image.
         if (m_splatBuffer.IsValid())
             GL_CALL(glClearNamedBufferData(m_splatBuffer.Id(), GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr));
+    }
+
+    void PathTracer::EnsureLightPathBuffers(uint32_t requested)
+    {
+        // N_L is a live editor setting (RenderSettings::restirLightPaths):
+        // clamp to the buffer cap and reallocate the buffers whose size
+        // scales with it. Reset() afterwards - the estimator's 1/N_L
+        // weights changed, and the tiled-BDPT cursor must not point past
+        // the new path count.
+        uint32_t pixelCount = static_cast<uint32_t>(m_width) * static_cast<uint32_t>(m_height);
+        uint32_t n = std::clamp(requested, 4096u, std::min(std::max(pixelCount, 4096u), kMaxLightPaths));
+        m_lightPathsRequested = requested;
+        if (n == m_numLightPaths) return;
+        m_numLightPaths = n;
+        m_lightVertexBuffer.Upload(nullptr, size_t(n) * kMaxLightVerts * kLightVertexBytes,
+                                   GL_DYNAMIC_COPY);
+        m_lightVertCountBuffer.Upload(nullptr, size_t(n) * sizeof(uint32_t), GL_DYNAMIC_COPY);
+        // The LRM entry pool scales with N_L too; when the ReSTIR buffers
+        // are already sized for this resolution, resize it in lockstep
+        // (EnsureRestirBuffers covers the fresh-allocation path otherwise).
+        if (m_restirWidth == m_width && m_restirHeight == m_height && m_lrmEntryBuffer.IsValid())
+            m_lrmEntryBuffer.Upload(nullptr, size_t(n) * kMaxLrmEntriesPerPath * kLrmEntryBytes,
+                                    GL_DYNAMIC_COPY);
+        Reset();
     }
 
     void PathTracer::ClearRestirHistory()
@@ -189,6 +209,8 @@ namespace RoyalGL
         // ReSTIR needs a deterministic pinhole primary hit; lens mode falls
         // back to plain progressive BDPT. ReSTIR always uses the
         // bidirectional pipeline and full-frame dispatch.
+        EnsureLightPathBuffers(static_cast<uint32_t>(std::max(settings.restirLightPaths, 1)));
+
         bool restirActive = settings.enableRestir && !lensMode && m_restirSupported;
         if (restirActive)
         {
@@ -244,9 +266,15 @@ namespace RoyalGL
                              | (settings.restirConnections ? 32u : 0u)
                              | (settings.restirRecomputeMis ? 64u : 0u)
                              | (settings.restirStratified ? 128u : 0u)
-                             | (settings.restirDecorrelate ? 256u : 0u);
+                             | (settings.restirDecorrelate ? 256u : 0u)
+                             | (settings.restirVolumeMode >= 2 ? 512u : 0u)
+                             | (settings.restirVolumeMode >= 1 ? 1024u : 0u)
+                             | (settings.restirFogPairing ? 2048u : 0u);
         frame.restirParams = glm::uvec4(static_cast<uint32_t>(settings.restirDebugView),
                                         restirFlags, m_frameCounter, m_restirParity);
+        frame.fogParams = glm::vec4(settings.fogSigmaS, settings.fogSigmaA,
+                                    glm::clamp(settings.fogG, -0.95f, 0.95f),
+                                    settings.fogEnable ? 1.0f : 0.0f);
 
         // Instance transforms for object-space surface storage (see
         // GPUTypes.h): the EFFECTIVE matrices track the geometry actually
@@ -436,28 +464,48 @@ namespace RoyalGL
 
             rtBegin(2, "restir camera RIS");
             {
+                auto camWalkRounds = [&]() {
+                    for (uint32_t k = 1; k <= maxLen; ++k)
+                    {
+                        m_wfCamShadeShader.Use();
+                        m_wfCamShadeShader.SetUint("uWfRound", k);
+                        m_wfCamShadeShader.DispatchIndirect(GLintptr(k) * 16);
+                        wfBarrier();
+                        if (k < maxLen)
+                        {
+                            // Independent: the bounce trace and the candidate
+                            // occlusion tests share one barrier.
+                            m_wfCamTraceShader.Use();
+                            m_wfCamTraceShader.SetUint("uWfRound", k);
+                            m_wfCamTraceShader.DispatchIndirect(GLintptr(10u + k) * 16);
+                            m_wfCamShadowShader.Use();
+                            m_wfCamShadowShader.SetUint("uWfRound", k);
+                            m_wfCamShadowShader.DispatchIndirect(GLintptr(20u + k) * 16);
+                            wfBarrier();
+                        }
+                    }
+                };
                 wfClearCtrl();
                 m_wfCamInitShader.Use();
+                m_wfCamInitShader.SetUint("uWfVolWalk", 0u);
                 m_wfCamInitShader.Dispatch(groupsN, 1u, 1u);
                 wfBarrier();
-                for (uint32_t k = 1; k <= maxLen; ++k)
+                camWalkRounds();
+                if (settings.fogEnable && settings.fogSigmaS > 0.0f)
                 {
-                    m_wfCamShadeShader.Use();
-                    m_wfCamShadeShader.SetUint("uWfRound", k);
-                    m_wfCamShadeShader.DispatchIndirect(GLintptr(k) * 16);
+                    // Airlight walk (walk 2): every pixel - including
+                    // primary misses - samples one truncated in-scatter
+                    // point on its primary segment and runs the full
+                    // candidate walk from it, continuing the same RIS
+                    // chain. This is the camera-side competitor that
+                    // MIS-damps the t=1 airlight singularity (see
+                    // restir_wf_caminit.comp).
+                    wfClearCtrl();
+                    m_wfCamInitShader.Use();
+                    m_wfCamInitShader.SetUint("uWfVolWalk", 1u);
+                    m_wfCamInitShader.Dispatch(groupsN, 1u, 1u);
                     wfBarrier();
-                    if (k < maxLen)
-                    {
-                        // Independent: the bounce trace and the candidate
-                        // occlusion tests share one barrier.
-                        m_wfCamTraceShader.Use();
-                        m_wfCamTraceShader.SetUint("uWfRound", k);
-                        m_wfCamTraceShader.DispatchIndirect(GLintptr(10u + k) * 16);
-                        m_wfCamShadowShader.Use();
-                        m_wfCamShadowShader.SetUint("uWfRound", k);
-                        m_wfCamShadowShader.DispatchIndirect(GLintptr(20u + k) * 16);
-                        wfBarrier();
-                    }
+                    camWalkRounds();
                 }
                 m_wfCamFinalShader.Use();
                 m_wfCamFinalShader.Dispatch(groupsN, 1u, 1u);
@@ -478,7 +526,7 @@ namespace RoyalGL
                 rtEnd();
                 GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));
             }
-            if (settings.restirTemporal && lightTracing && m_causticPassesEnabled)
+            if (settings.restirTemporal && lightTracing && settings.restirCausticReuse)
             {
                 // Caustic temporal reuse (Phase 3, frame-graph pass 7):
                 // re-bin the previous frame's caustic reservoirs into the

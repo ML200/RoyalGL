@@ -72,6 +72,9 @@ void main()
     vec3 x, n, wi;
     uint matId, triIdx;
     float lastEdgeDist2 = 0.0;
+    bool isVolume = false;      // vertex k is a fog scattering vertex
+    float pdfEdgePrev = 0.0;    // scatter pdf at k-1 (for the rc criteria)
+    uint volMask = WfCamFlagsVolMask(stFlags);
 
     if (pathLen == 1u)
     {
@@ -83,12 +86,32 @@ void main()
         uint mt = floatBitsToUint(posMat.w);
         matId = mt >> 24;
         triIdx = mt & 0x00FFFFFFu;
+        // Airlight family (walk 2, caminit's uWfVolWalk): vertex 1 is the
+        // truncated primary in-scatter point - volMask bit 0 set at init.
+        isVolume = (volMask & 1u) != 0u;
     }
     else
     {
         // --------------------------- consume round k-1's trace result ----
         vec4 hitA = wfArena[base + 10u];
         wi = wfArena[base + 2u].xyz; // already the NEW wi = -bs.dir
+        pdfEdgePrev = pProd / max(wfArena[base + 2u].w, 1e-30);
+
+        // Fog free-flight for the segment arriving at vertex k (replayable
+        // draw; candidates never scatter on the DETERMINISTIC primary
+        // segment - airlight is covered by the light-side t=1 technique).
+        if (FogEnabled())
+        {
+            RngStream(pathLen, RNG_DIST);
+            float tS = FogSampleDist(RandomFloat());
+            float dSurf = (hitA.w < 0.0) ? 1e30 : hitA.w;
+            if (tS < dSurf)
+            {
+                isVolume = true;
+                hitA.w = tS;
+            }
+        }
+
         if (hitA.w < 0.0)
         {
             // ------------------------------------------- s = 0, env ------
@@ -101,7 +124,8 @@ void main()
                 wSum += w;
                 if (RestirRand(risRng) * wSum <= w)
                 {
-                    uint flags = (rcFound ? RESTIR_FLAG_RCVALID : RESTIR_FLAG_ENVEND) | (deltaMask << 8);
+                    uint flags = (rcFound ? RESTIR_FLAG_RCVALID : RESTIR_FLAG_ENVEND)
+                               | (deltaMask << 8) | (volMask << 16);
                     if (rcFound) flags |= (rcIdx & 0xFu) << 4;
                     // env pseudo-vertex: scatter happened at vertex k-1, so
                     // t = (k-1) + 2 (matches the megakernel's pathLen+2).
@@ -130,14 +154,38 @@ void main()
         }
 
         // Advance to vertex k (megakernel's loop-bottom arrival block).
-        vec4 hitB = wfArena[base + 11u];
-        x = hitA.xyz;
-        n = hitB.xyz;
-        uint mt = floatBitsToUint(hitB.w);
-        matId = mt >> 24;
-        triIdx = mt & 0x00FFFFFFu;
         lastEdgeDist2 = hitA.w * hitA.w;
-        float cosArr = max(abs(dot(n, -wi)), 1e-6); // bounce dir = -wi
+        float cosArr;
+        if (isVolume)
+        {
+            // Synthetic volume vertex on the segment; true-value f/pdf
+            // convention (segment: Tr to f, sigma_t*Tr to pdf).
+            x = wfArena[base + 0u].xyz + (-wi) * hitA.w;
+            n = vec3(0.0, 0.0, 1.0);
+            matId = 0u;
+            triIdx = 0u;
+            cosArr = FogSigmaT();
+            float trSeg = FogTr(hitA.w);
+            fCur *= trSeg;
+            pProd *= FogSigmaT() * trSeg;
+            volMask |= 1u << (pathLen - 1u);
+        }
+        else
+        {
+            vec4 hitB = wfArena[base + 11u];
+            x = hitA.xyz;
+            n = hitB.xyz;
+            uint mt = floatBitsToUint(hitB.w);
+            matId = mt >> 24;
+            triIdx = mt & 0x00FFFFFFu;
+            cosArr = max(abs(dot(n, -wi)), 1e-6); // bounce dir = -wi
+            if (FogEnabled())
+            {
+                float trSeg = FogTr(hitA.w);
+                fCur *= trSeg;
+                pProd *= trSeg;
+            }
+        }
         dVCM *= lastEdgeDist2 / cosArr;
         dVC /= cosArr;
         dT1 /= cosArr;
@@ -149,9 +197,9 @@ void main()
 
     // ------------------------------------------------- vertex k logic ----
     Material mat = materials[matId];
-    bool isDelta = MatIsDelta(mat);
+    bool isDelta = !isVolume && MatIsDelta(mat);
     if (isDelta) deltaMask |= 1u << (pathLen - 1u);
-    bool isEmissive = dot(mat.emissive.rgb, mat.emissive.rgb) > 0.0;
+    bool isEmissive = !isVolume && dot(mat.emissive.rgb, mat.emissive.rgb) > 0.0;
 
     bool haveLights = uFrame.lightInfo.x > 0u;
     bool lightTracing = RestirLightTracingEnabled() && haveLights;
@@ -168,16 +216,24 @@ void main()
     // scene-independent thresholds derived from the pixel's primary
     // footprint. pdf of this pair's edge = pProd / slot2.w (the scatter at
     // x_{k-1}; rc-eligible materials are single-lobe, choicePdf = 1).
-    bool selfConnectable = MatRcCacheable(mat) || isEmissive;
+    // Volume vertices qualify as reconnection anchors when the volumetric
+    // shift is enabled: a fixed world-space point with a broad phase lobe
+    // is an ideal anchor (no cosine singularities, no orientation).
+    bool selfConnectable = isVolume || MatRcCacheable(mat) || isEmissive;
     if (!rcFound && pathLen >= 2u && prevConnectable && selfConnectable)
     {
         ivec2 pixel = ivec2(int(idx % uFrame.frameInfo.x), int(idx / uFrame.frameInfo.x));
         GBufferPixel g1 = RestirLoadGBuf(GBufCurOffset() + idx);
+        // Miss pixels (airlight walk only) have no primary footprint: keep
+        // them pure-replay - no reconnection anchor, ever (the shift side
+        // never creates jobs for them, so no criteria to mirror).
         float cosPrim = abs(dot(g1.normalMat.xyz, RestirPrimaryRay(pixel).dir));
         float T = RestirRcFootThreshold(g1.posDepth.w, cosPrim);
-        float pdfEdge = pProd / max(wfArena[base + 2u].w, 1e-30);
-        selfConnectable = RestirRcFootprintOk(lastEdgeDist2, pdfEdge, abs(dot(n, wi)),
-                                              mat, isEmissive, T);
+        selfConnectable = g1.posDepth.w >= 0.0
+            && (isVolume
+                    ? RestirRcFootprintOkVolume(lastEdgeDist2, pdfEdgePrev, T)
+                    : RestirRcFootprintOk(lastEdgeDist2, pdfEdgePrev, abs(dot(n, wi)),
+                                          mat, isEmissive, T));
     }
     else
         selfConnectable = false;
@@ -185,15 +241,17 @@ void main()
     {
         rcFound = true;
         rcIdx = pathLen;
-        rcBaseCos = abs(dot(n, wi));
+        rcBaseCos = isVolume ? 1.0 : abs(dot(n, wi));
         rcBaseDist2 = lastEdgeDist2;
         replayPdfBase = wfArena[base + 2u].w; // pdfPrevArrival
         // rc vertex stored in its instance's OBJECT space + id (flags bits
         // 20-23) so the reconnection target tracks moving instances.
-        rcInst = InstanceOfTriangle(triIdx);
-        wfArena[base + 6u] = vec4(RestirWorldToObjPoint(rcInst, x), uintBitsToFloat(matId));
+        // Volume anchors are static world-space points (instance 15).
+        rcInst = isVolume ? 15u : InstanceOfTriangle(triIdx);
+        wfArena[base + 6u] = vec4(RestirWorldToObjPoint(rcInst, x),
+                                  uintBitsToFloat(isVolume ? MAT_VOLUME : matId));
         wfArena[base + 7u] = vec4(
-            RestirWorldToObjNormal(rcInst, (dot(n, wi) >= 0.0) ? n : -n), replayPdfBase);
+            RestirWorldToObjNormal(rcInst, (isVolume || dot(n, wi) >= 0.0) ? n : -n), replayPdfBase);
         wfArena[base + 8u] = vec4(fCur, rcBaseCos); // suffix-cache divisor
         wfArena[base + 9u] = vec4(rcBaseDist2, 0.0, 0.0, 0.0);
         misKC = 0.0;
@@ -227,7 +285,8 @@ void main()
                 wSum += w;
                 if (RestirRand(risRng) * wSum <= w)
                 {
-                    uint flags = (rcFound ? RESTIR_FLAG_RCVALID : 0u) | (deltaMask << 8);
+                    uint flags = (rcFound ? RESTIR_FLAG_RCVALID : 0u)
+                               | (deltaMask << 8) | (volMask << 16);
                     if (rcFound) flags |= (rcIdx & 0xFu) << 4;
                     SELP.core.w = uintBitsToFloat(RestirPackTech(0u, pathLen + 1u, flags));
                     SELP.core.y = omega * RestirLum(fCand);
@@ -307,19 +366,30 @@ void main()
             float directPdfW = directPdfA * dist2 / cosAtLight;
 
             RngStream(pathLen, RNG_EVAL); // shift-reproducible eval draws
-            float bsdfDirPdfW, bsdfRevPdfW, cosToLight;
-            vec3 fb = EvalBsdf(mat, n, wi, L, bsdfDirPdfW, bsdfRevPdfW, cosToLight);
+            float bsdfDirPdfW, bsdfRevPdfW, cosToLight, kToLight;
+            vec3 fb;
+            if (isVolume)
+            {
+                fb = EvalPhase(-wi, L, bsdfDirPdfW, bsdfRevPdfW);
+                cosToLight = 1.0;
+                kToLight = FogSigmaT();
+            }
+            else
+            {
+                fb = EvalBsdf(mat, n, wi, L, bsdfDirPdfW, bsdfRevPdfW, cosToLight);
+                kToLight = cosToLight;
+            }
 
             if (fb != vec3(0.0) && directPdfW > 1e-20 && directPdfWTrue > 1e-20)
             {
                 float wCam = 0.0;
-                float prefactor = emissionPdfW * cosToLight / (directPdfW * cosAtLight);
+                float prefactor = emissionPdfW * kToLight / (directPdfW * cosAtLight);
                 if (connections)
                     wCam = prefactor * (dVCM + bsdfRevPdfW * dVC);
                 else if (lightTracing)
                     wCam = prefactor * (pathLen == 1u ? dT1 : bsdfRevPdfW * dT1);
                 float omega = directPdfW / (directPdfW + bsdfDirPdfW + directPdfW * wCam);
-                vec3 fCand = fCur * fb * cosToLight * lt.emissionWeight.rgb;
+                vec3 fCand = fCur * fb * cosToLight * FogTr(dist) * lt.emissionWeight.rgb;
                 float pCand = pProd * directPdfWTrue;
                 float w = omega * RestirLum(fCand) / pCand;
 
@@ -327,7 +397,7 @@ void main()
                 {
                     // Candidate slot 0; visibility resolved by camshadow,
                     // absorbed next round.
-                    uint flags = RESTIR_FLAG_RCVALID | (deltaMask << 8);
+                    uint flags = RESTIR_FLAG_RCVALID | (deltaMask << 8) | (volMask << 16);
                     uint r = rcFound ? rcIdx : pathLen + 1u;
                     flags |= (r & 0xFu) << 4;
                     uint cb = base + WF_CAM_CND0;
@@ -400,29 +470,52 @@ void main()
             float dist = sqrt(max(dist2c, 1e-12));
             vec3 dirCtoL = toL / dist;
 
-            float camDirPdfW, camRevPdfW, cosCamera;
-            vec3 fCam = EvalBsdf(mat, n, wi, dirCtoL, camDirPdfW, camRevPdfW, cosCamera);
-            Material lmat = materials[lightMat];
-            float lightDirPdfW, lightRevPdfW, cosLightV;
-            vec3 fLight = EvalBsdf(lmat, lv.normalDvc.xyz, lv.wiLen.xyz, -dirCtoL,
-                                   lightDirPdfW, lightRevPdfW, cosLightV);
+            bool lvVolume = (lightMat == 0xFEu); // volume LVC sentinel
+            float camDirPdfW, camRevPdfW, cosCamera, kCam;
+            vec3 fCam;
+            if (isVolume)
+            {
+                fCam = EvalPhase(-wi, dirCtoL, camDirPdfW, camRevPdfW);
+                cosCamera = 1.0;
+                kCam = FogSigmaT();
+            }
+            else
+            {
+                fCam = EvalBsdf(mat, n, wi, dirCtoL, camDirPdfW, camRevPdfW, cosCamera);
+                kCam = cosCamera;
+            }
+            float lightDirPdfW, lightRevPdfW, cosLightV, kLight;
+            vec3 fLight;
+            if (lvVolume)
+            {
+                fLight = EvalPhase(-lv.wiLen.xyz, -dirCtoL, lightDirPdfW, lightRevPdfW);
+                cosLightV = 1.0;
+                kLight = FogSigmaT();
+            }
+            else
+            {
+                Material lmat = materials[lightMat];
+                fLight = EvalBsdf(lmat, lv.normalDvc.xyz, lv.wiLen.xyz, -dirCtoL,
+                                  lightDirPdfW, lightRevPdfW, cosLightV);
+                kLight = cosLightV;
+            }
 
             if (dist2c > 1e-12 && fCam != vec3(0.0) && fLight != vec3(0.0))
             {
                 float geometryTerm = cosCamera * cosLightV / dist2c;
-                float camDirPdfA = camDirPdfW * cosLightV / dist2c;
-                float lightDirPdfA = lightDirPdfW * cosCamera / dist2c;
+                float camDirPdfA = camDirPdfW * kLight / dist2c;
+                float lightDirPdfA = lightDirPdfW * kCam / dist2c;
                 float wLight = camDirPdfA * (lv.posDvcm.w + lv.normalDvc.w * lightRevPdfW);
                 float wCamera = lightDirPdfA * (dVCM + dVC * camRevPdfW);
                 float omega = 1.0 / (wLight + 1.0 + wCamera);
 
-                vec3 fCand = fCur * fCam * geometryTerm * fLight * lv.tputMat.xyz;
+                vec3 fCand = fCur * fCam * geometryTerm * FogTr(dist) * fLight * lv.tputMat.xyz;
                 float pCand = pProd * pLight * (numLightPaths / float(lvcCount));
                 float w = omega * RestirLum(fCand) / pCand;
 
                 if (w > 0.0 && !isnan(w) && !isinf(w))
                 {
-                    uint flags = deltaMask << 8;
+                    uint flags = (deltaMask << 8) | (volMask << 16);
                     uint cb = base + WF_CAM_CND0 + WF_CAM_CND_STRIDE;
                     if (rcFound)
                     {
@@ -431,9 +524,13 @@ void main()
                         {
                             // rc at the connection vertex: strip fCam, cache
                             // the connection dir (at-rc misCache layout).
+                            // kLight, not cosLightV: for a VOLUME light
+                            // vertex the MIS measure factor is sigma_t (the
+                            // shift's pFwdRc pairing must reconstruct
+                            // camDirPdfA = camDirPdfW * kLight / d2).
                             wfArena[cb + 2u] = vec4(
                                 1.0,
-                                (cosLightV / dist2c)
+                                (kLight / dist2c)
                                     * (lv.posDvcm.w + lv.normalDvc.w * lightRevPdfW),
                                 lightDirPdfA, 0.0);
                             wfArena[cb + 6u] = vec4(
@@ -481,7 +578,22 @@ void main()
 
     // ----------------------------------------------------- BSDF bounce ---
     RngStream(pathLen, RNG_BSDF);
-    BsdfSample bs = SampleBsdf(mat, n, wi, false);
+    BsdfSample bs;
+    if (isVolume)
+    {
+        // Phase scatter: weight sigma_s (f gains sigma_s*phase, pdf gains
+        // phase), MIS measure factor sigma_t rides in cosOut.
+        float pdfPhase;
+        bs.dir = SamplePhaseHG(-wi, FogG(), RandomFloat2(), pdfPhase);
+        bs.weight = vec3(FogSigmaS());
+        bs.pdfDir = pdfPhase;
+        bs.pdfRev = pdfPhase;
+        bs.cosOut = FogSigmaT();
+        bs.choicePdf = 1.0;
+        bs.specular = false;
+    }
+    else
+        bs = SampleBsdf(mat, n, wi, false);
     bool dead = (bs.weight == vec3(0.0)) || (!bs.specular && bs.pdfDir <= 0.0);
     if (dead)
     {
@@ -492,7 +604,8 @@ void main()
         wfArena[base + 5u].z = uintBitsToFloat(risRng);
         wfArena[base + 1u].w = uintBitsToFloat(
             (rcFound ? WF_CAMF_RCFOUND : 0u) | (prevConnectable ? WF_CAMF_PREVCONN : 0u)
-            | (deltaMask << 8) | ((rcIdx & 0xFu) << 16) | ((rcInst & 0xFu) << 20));
+            | (deltaMask << 8) | ((rcIdx & 0xFu) << 16) | ((rcInst & 0xFu) << 20)
+            | (volMask << 24));
         return;
     }
 
@@ -502,8 +615,12 @@ void main()
     pProd *= pdfStep;
     // x_{k-1} eligibility: structurally cacheable (no layered/delta) AND
     // rough enough (single-vertex threshold, ReSTIR PT Enhanced sec. 4.2).
-    prevConnectable = MatRcCacheable(mat)
-                      && MatRcRoughness(mat) >= RESTIR_RC_ALPHA_MIN;
+    // Volume vertices: eligible under the volumetric shift for moderate
+    // anisotropy (the phase lobe is the "roughness").
+    prevConnectable = isVolume
+                      ? (RestirVolRcEnabled() && abs(FogG()) <= 0.8)
+                      : (MatRcCacheable(mat)
+                         && MatRcRoughness(mat) >= RESTIR_RC_ALPHA_MIN);
 
     // MIS recursions (identical to the megakernel; consume the OLD dVCM,
     // update dVCM last).
@@ -513,12 +630,15 @@ void main()
         {
             // Crossing scatter at x_r (see restir_camera.comp): strip its
             // BSDF value from the divisor, cache the suffix direction, and
-            // keep 1/pdfDir_r symbolic in the B/C chains.
+            // keep 1/pdfDir_r symbolic in the B/C chains. For a volume rc
+            // the re-evaluated quantity is sigma_s*phase itself (cosOut
+            // carries sigma_t for the MIS chains, not a contribution cos).
             misKA = 0.0;
             misKB = 0.0;
             misKC = bs.cosOut; // x_r is never delta
             dvcmB = 1.0;
-            wfArena[base + 8u].xyz *= bs.weight * pdfStep / max(bs.cosOut, 1e-6);
+            wfArena[base + 8u].xyz *= bs.weight * pdfStep
+                                      / (isVolume ? 1.0 : max(bs.cosOut, 1e-6));
             rcSuffixOcta = OctaEncode(RestirWorldToObjNormal(rcInst, bs.dir));
             wfArena[base + 9u].y = rcSuffixOcta;
         }
@@ -554,7 +674,8 @@ void main()
     // Persist state and enqueue the bounce (camtrace) + next shade round.
     wfArena[base + 1u].w = uintBitsToFloat(
         (rcFound ? WF_CAMF_RCFOUND : 0u) | (prevConnectable ? WF_CAMF_PREVCONN : 0u)
-        | (deltaMask << 8) | ((rcIdx & 0xFu) << 16) | ((rcInst & 0xFu) << 20));
+        | (deltaMask << 8) | ((rcIdx & 0xFu) << 16) | ((rcInst & 0xFu) << 20)
+        | (volMask << 24));
     wfArena[base + 2u] = vec4(-bs.dir, pdfPrevArrival);
     wfArena[base + 3u] = vec4(fCur, pProd);
     wfArena[base + 4u] = vec4(dVCM, dVC, dT1, wSum);

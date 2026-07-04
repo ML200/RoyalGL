@@ -221,6 +221,20 @@ bool RestirStratifiedEnabled()   { return (uFrame.restirParams.y & 128u) != 0u; 
 // Introduces a small bias in correlated regions; ROYALGL_RESTIR_DECORR=0
 // restores exact unbiasedness for soaks.
 bool RestirDecorrEnabled()       { return (uFrame.restirParams.y & 256u) != 0u; }
+// Volumetric shift modes (ROYALGL_RESTIR_VOLMODE): VolRc = volume vertices
+// qualify as reconnection anchors (mode 2, ours); VolShift = volume paths
+// are shiftable at all via distance replay + classification masks (modes
+// 1-2). With both off (mode 0), a path containing any volume vertex fails
+// every shift - the naive "ReSTIR PT ported to a medium" baseline. All
+// modes are unbiased; they differ in reuse efficiency.
+bool RestirVolRcEnabled()        { return (uFrame.restirParams.y & 512u) != 0u; }
+bool RestirVolShiftEnabled()     { return (uFrame.restirParams.y & 1024u) != 0u; }
+// Fog-parallax temporal pairing (ROYALGL_RESTIR_FOGPAIR, default on):
+// when the surface-anchor validation fails (disocclusion/silhouette under
+// camera motion), re-pair history by reprojecting the representative
+// in-scatter depth and reuse the airlight family only. Off = fog history
+// dies with the surface anchor (ablation baseline).
+bool RestirFogPairingEnabled()   { return (uFrame.restirParams.y & 2048u) != 0u; }
 
 // ---------------------------------------------- MIS eval light pdfs ------
 // EVAL pick pdf for every ReSTIR MIS quantity: the power-proportional CDF
@@ -242,6 +256,31 @@ void RestirLightPdfs(uint lightIdx, float cosTheta, out float directPdfA, out fl
     float invArea = 1.0 / max(lightTris[lightIdx].normalArea.w, 1e-10);
     directPdfA = RestirLightPickPdf(lightIdx) * invArea;
     emissionPdfW = directPdfA * max(cosTheta, 0.0) / PI;
+}
+
+// SAMPLED light pick for ReSTIR light subpaths: binary search of the same
+// power CDF, ONE uniform draw. The classic camera-anchored tree descent
+// (BdptSampleLightIndex) is better importance sampling per frame, but its
+// replay is anchored at the DESTINATION camera: under camera motion the
+// same seed descends to a different light, turning every caustic-class /
+// airlight history replay into an unrelated path (rejected by the J-guard
+// or accepted with an arbitrary ratio) - reservoirs churn exactly where
+// fog is brightest. The power CDF is camera- and frame-independent, so
+// replay reproduces the pick under ANY motion, and the sampled pdf now
+// EQUALS the MIS eval pdf (RestirLightPdfs). Camera-side NEE keeps the
+// tree: its light points are stored, never re-picked by shifts.
+uint RestirSampleLightIndex(out float pickPdf)
+{
+    uint n = uFrame.lightInfo.x;
+    float u = RandomFloat();
+    uint lo = 0u, hi = n - 1u;
+    while (lo < hi)
+    {
+        uint mid = (lo + hi) >> 1;
+        if (lightCdf[mid] < u) lo = mid + 1u; else hi = mid;
+    }
+    pickPdf = RestirLightPickPdf(lo);
+    return lo;
 }
 
 // Confidence (M) cap for every reuse pass, user-adjustable (RenderSettings
@@ -308,12 +347,17 @@ uint GBufCurOffset()  { return uFrame.restirParams.w * RestirPixelCount(); }
 uint GBufPrevOffset() { return (1u - uFrame.restirParams.w) * RestirPixelCount(); }
 
 // ------------------------------------------------------ technique bits ----
-// tech word: s bits 0-7 | t bits 8-15 | flags bits 16+.
+// tech word: s bits 0-3 | t bits 4-7 | flags bits 8+ (s, t <= 8 = the
+// path-length cap, so 4 bits each; the freed byte carries the volume mask).
 // Flag bits: bit0 rcValid, bit1 envEnd, bit2 caustic (t=1 path whose
-// y_{s-2} is delta), bits 4-7 rcIndex (vertex index of the reconnection
-// vertex, 1-based), bits 8-15 deltaMask (bit j-1 set = path vertex x_j is a
-// delta material; for t=1 the mask covers the light subpath vertices
-// y_1..y_8 instead).
+// y_{s-2} is delta OR whose y_{s-1} is a volume vertex - both are pure-
+// replay free-landing classes), bits 4-7 rcIndex (vertex index of the
+// reconnection vertex, 1-based), bits 8-15 deltaMask (bit j-1 set = path
+// vertex x_j is a delta material; for t=1 the mask covers the light
+// subpath vertices y_1..y_8 instead), bits 16-23 volMask (bit j-1 set =
+// vertex j is a VOLUME scattering vertex - same indexing as deltaMask;
+// replay invertibility requires the offset path to reproduce the
+// scatter/pass classification exactly).
 const uint RESTIR_FLAG_RCVALID = 1u;
 const uint RESTIR_FLAG_ENVEND  = 2u;
 const uint RESTIR_FLAG_CAUSTIC = 4u;
@@ -322,12 +366,13 @@ const uint RESTIR_FLAG_CAUSTIC = 4u;
 // light subpath end (lyPosMat/lyNormal/lyTput).
 const uint RESTIR_FLAG_LIGHTRC = 8u;
 
-uint RestirPackTech(uint s, uint t, uint flags) { return (s & 0xFFu) | ((t & 0xFFu) << 8) | (flags << 16); }
-uint RestirTechS(uint tech) { return tech & 0xFFu; }
-uint RestirTechT(uint tech) { return (tech >> 8) & 0xFFu; }
-uint RestirTechFlags(uint tech) { return tech >> 16; }
+uint RestirPackTech(uint s, uint t, uint flags) { return (s & 0xFu) | ((t & 0xFu) << 4) | (flags << 8); }
+uint RestirTechS(uint tech) { return tech & 0xFu; }
+uint RestirTechT(uint tech) { return (tech >> 4) & 0xFu; }
+uint RestirTechFlags(uint tech) { return tech >> 8; }
 uint RestirFlagsRcIndex(uint flags) { return (flags >> 4) & 0xFu; }
 uint RestirFlagsDeltaMask(uint flags) { return (flags >> 8) & 0xFFu; }
+uint RestirFlagsVolMask(uint flags) { return (flags >> 16) & 0xFFu; }
 
 PathReservoir RestirEmptyReservoir()
 {
@@ -398,6 +443,20 @@ bool RestirRcFootprintOk(float dist2, float pdfEdge, float cosAtK,
             if (dist2 * PI * a * a < T) return false;
         }
     }
+    return true;
+}
+
+// Volume analog (our volumetric shift): a VOLUME vertex as the
+// reconnection anchor x_k. No cosine at x_k (cosAtK = 1); the inverse
+// footprint uses the HG peak pdf - for isotropic-to-moderate g the phase
+// lobe is broad, making volume vertices excellent anchors (this is what
+// the volume-anchored shift exploits).
+bool RestirRcFootprintOkVolume(float dist2, float pdfEdge, float T)
+{
+    if (!RestirVolRcEnabled()) return false;
+    if (pdfEdge <= 0.0) return false;
+    if (dist2 < T * pdfEdge) return false;             // fwd footprint
+    if (dist2 < T * PhaseHGPeak(FogG())) return false; // inverse (peak proxy)
     return true;
 }
 

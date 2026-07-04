@@ -12,8 +12,27 @@
 // pre-loop code), empties the output reservoir, and enqueues shade round 1
 // for every pixel with a valid primary hit - streaming compaction starts
 // here: primary misses never enter the pipeline.
+//
+// uWfVolWalk = 1 (fog scattering only): SECOND per-pixel walk, dispatched
+// after the surface walk's rounds finished. The pixel's camera technique is
+// SPLIT into two families with disjoint supports: the surface family (the
+// deterministic anchor, probability 1 - unchanged) and the airlight family,
+// whose first vertex is a volume in-scatter point on the primary segment
+// sampled from the TRUNCATED free-flight pdf sigma_t*Tr(t)/(1-Tr(d1)).
+// Every pixel scatters every frame, the walk continues through the normal
+// candidate blocks (NEE / s>=2 / s=0 at and after the volume vertex), and
+// the reservoir's RIS chain (wSum/risRng/SEL) continues across the two
+// walks. This is the camera-side competitor that MIS-damps the t=1
+// airlight's 1/d^2 near-camera singularity (see restir_light.comp) - the
+// volumetric analog of BDPT's eye-side in-scatter. Primary-miss pixels get
+// the airlight family too (d1 = inf, pScat = 1), lifting the old
+// no-airlight-on-miss-pixels limitation. Walk-2 draws come from a DERIVED
+// seed (volSeed) stored in the seed slot, so reservoir winners replay
+// transparently; volMask bit 0 marks the family.
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+uniform uint uWfVolWalk;
 
 void main()
 {
@@ -25,17 +44,84 @@ void main()
     uint causticSlot = RestirRegionOffset(RestirFinalRegion()) + idx;
 
     GBufferPixel g = RestirLoadGBuf(GBufCurOffset() + idx);
+    uint base = WfCamBase(idx);
+
+    // Seeding identical to restir_camera.comp.
+    uint frameC = uFrame.restirParams.z;
+    uint camSeed = WangHash(uint(pixel.x) * 1973u + uint(pixel.y) * 9277u + frameC * 26699u + 7u);
+
+    if (uWfVolWalk != 0u)
+    {
+        // ---------------------- walk 2: airlight (volume-primary) family --
+        float pScat = FogScatterProb(g.posDepth.w);
+        if (pScat <= 1e-7) return;
+
+        float wSum;
+        uint risRng;
+        if (g.posDepth.w < 0.0)
+        {
+            // Miss pixels skipped walk 1: start the RIS chain here.
+            wSum = 0.0;
+            risRng = WangHash(camSeed ^ 0x5f356495u);
+            if (risRng == 0u) risRng = 0x9E3779B9u;
+        }
+        else
+        {
+            // Anchored pixels: continue walk 1's chain.
+            wSum = wfArena[base + 4u].w;
+            risRng = floatBitsToUint(wfArena[base + 5u].z);
+        }
+
+        uint volSeed = WangHash(camSeed ^ 0x0DDB0117u);
+        g_rngSeed = volSeed;
+        RngStream(1u, RNG_DIST);
+        float tS = FogSampleDistTrunc(RandomFloat(), pScat);
+        vec3 rayDir = RestirPrimaryRay(pixel).dir;
+        vec3 x = uFrame.camPos.xyz + rayDir * tS;
+        float trSeg = FogTr(tS);
+
+        // Volume-measure MIS seeds (bdpt_eye.comp's pathLength==1 volume
+        // branch with the truncation folded in: the effective Tr-free
+        // camera pdf per volume is i2solid*sigma_t/(t^2*pScat), so the
+        // reciprocal seed gains *pScat and swaps cos -> sigma_t).
+        bool haveLights = uFrame.lightInfo.x > 0u;
+        bool lightTracing = RestirLightTracingEnabled() && haveLights;
+        float dT1 = 0.0, dVCM = 0.0;
+        float cosAtCam = dot(rayDir, uFrame.camForward.xyz);
+        if (cosAtCam > 1e-3 && lightTracing)
+        {
+            float ipd = (float(uFrame.frameInfo.y) * 0.5) / uFrame.cameraParams.x;
+            float imagePointToCamDist = ipd / cosAtCam;
+            float cameraPdfW = (imagePointToCamDist * imagePointToCamDist) / cosAtCam;
+            dVCM = (float(uFrame.lightInfo.z) / cameraPdfW)
+                 * (tS * tS / max(FogSigmaT(), 1e-8)) * pScat;
+            dT1 = dVCM;
+        }
+
+        float pProd = FogSigmaT() * trSeg / pScat;
+        wfArena[base + 0u] = vec4(x, uintBitsToFloat(0u));
+        wfArena[base + 1u] = vec4(0.0, 0.0, 1.0, uintBitsToFloat(1u << 24)); // volMask bit 0
+        wfArena[base + 2u] = vec4(-rayDir, pProd);
+        wfArena[base + 3u] = vec4(vec3(trSeg), pProd);
+        wfArena[base + 4u] = vec4(dVCM, 0.0, dT1, wSum);
+        wfArena[base + 5u] = vec4(0.0, 0.0, uintBitsToFloat(risRng), uintBitsToFloat(volSeed));
+        wfArena[base + 9u] = vec4(0.0);
+        wfArena[base + WF_CAM_CND0].w = 0.0;
+        wfArena[base + WF_CAM_CND0 + WF_CAM_CND_STRIDE].w = 0.0;
+
+        WfAppend(WfCtrlShade(1u), WfCamShadeQBase(1u), idx);
+        return;
+    }
+
     if (g.posDepth.w < 0.0)
     {
-        // Primary miss: the resolve pass adds the background directly.
+        // Primary miss: the resolve pass adds the background directly
+        // (walk 2 still runs here when the fog scatters).
         pixelRes[outSlot].path = RestirEmptyReservoir();
         pixelRes[causticSlot].caustic = RestirEmptyCaustic();
         return;
     }
 
-    // Seeding identical to restir_camera.comp.
-    uint frameC = uFrame.restirParams.z;
-    uint camSeed = WangHash(uint(pixel.x) * 1973u + uint(pixel.y) * 9277u + frameC * 26699u + 7u);
     uint risRng = WangHash(camSeed ^ 0x5f356495u);
     if (risRng == 0u) risRng = 0x9E3779B9u;
 
@@ -67,11 +153,14 @@ void main()
         }
     }
 
-    uint base = WfCamBase(idx);
+    // Primary-segment transmittance: the anchor segment is deterministic
+    // (no sampling), so Tr enters f only - every candidate based at this
+    // anchor carries it.
+    float trPrimary = FogTr(g.posDepth.w);
     wfArena[base + 0u] = vec4(x, g.normalMat.w);
     wfArena[base + 1u] = vec4(n, uintBitsToFloat(0u));
     wfArena[base + 2u] = vec4(wi, 1.0);
-    wfArena[base + 3u] = vec4(1.0, 1.0, 1.0, 1.0);
+    wfArena[base + 3u] = vec4(vec3(trPrimary), 1.0);
     wfArena[base + 4u] = vec4(dVCM, 0.0, dT1, 0.0);
     wfArena[base + 5u] = vec4(0.0, 0.0, uintBitsToFloat(risRng), uintBitsToFloat(camSeed));
     // rc block (6..8) is only read once rcFound is set, which always

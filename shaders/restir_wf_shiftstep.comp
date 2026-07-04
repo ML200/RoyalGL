@@ -45,7 +45,7 @@ void WfLightReconnect(uint jobIdx, uint jb, uint baseSlot, uint dstIdx, bool isP
     // Light-side factor + MIS state across the reconnected edge. Eval
     // draws aligned with creation's RNG_EVAL stream (see restir_shift.glsl).
     RngStream(s - 1u, RNG_EVAL);
-    float pd = 0.0, pr = 0.0, cosOut = 0.0;
+    float pd = 0.0, pr = 0.0, cosOut = 0.0, kOutP = 0.0;
     float mVCM, mVC, mLW;
     if (prevIsLight)
     {
@@ -60,12 +60,27 @@ void WfLightReconnect(uint jobIdx, uint jb, uint baseSlot, uint dstIdx, bool isP
         mLW = mVC;
         pd = cosL / PI;
         cosOut = cosL;
+        kOutP = cosL;
+    }
+    else if (prevMatId == MAT_VOLUME)
+    {
+        // y_{s-2} is a volume vertex: phase reconnect, no cosine, sigma_t
+        // in the MIS conversion roles.
+        vec3 fb = EvalPhase(-prevWi, dirTo, pd, pr);
+        if (fb == vec3(0.0)) { WfJobFail(jb); return; }
+        f *= fb;
+        kOutP = FogSigmaT();
+        vec4 mis = wfArena[jb + 5u];
+        mVCM = mis.x;
+        mVC = mis.y;
+        mLW = mis.z;
     }
     else
     {
         vec3 fb = EvalBsdf(materials[prevMatId], prevN, prevWi, dirTo, pd, pr, cosOut);
         if (fb == vec3(0.0)) { WfJobFail(jb); return; }
         f *= fb * cosOut;
+        kOutP = cosOut;
         vec4 mis = wfArena[jb + 5u];
         mVCM = mis.x;
         mVC = mis.y;
@@ -85,7 +100,8 @@ void WfLightReconnect(uint jobIdx, uint jb, uint baseSlot, uint dstIdx, bool isP
     float imagePointToCamDist = WfDstIpd(isPrev) / cosAtCam;
     float imageToSurface = (imagePointToCamDist * imagePointToCamDist) / cosAtCam
                            * cosToCam / max(d2cam, 1e-12);
-    f *= fbX * imageToSurface;
+    // Fog: reconnected edge + camera segment transmittance.
+    f *= fbX * imageToSurface * FogTr(dist) * FogTr(dstG.posDepth.w);
 
     // omega at the destination anchor (identical to restir_shift.glsl).
     float omega = RS_BASE.rcInfo.z;
@@ -100,8 +116,8 @@ void WfLightReconnect(uint jobIdx, uint jb, uint baseSlot, uint dstIdx, bool isP
         }
         else
         {
-            nVC = (cosOut / pd) * (mVCM + pr * mVC) / cosRc;
-            nLW = (cosOut / pd) * ((s == 3u ? mVCM : 0.0) + pr * mLW) / cosRc;
+            nVC = (kOutP / pd) * (mVCM + pr * mVC) / cosRc;
+            nLW = (kOutP / pd) * ((s == 3u ? mVCM : 0.0) + pr * mLW) / cosRc;
         }
         float wL = (imageToSurface / float(BdptNumLightPaths()))
             * (RestirConnectionsEnabled()
@@ -144,6 +160,12 @@ void main()
     uint deltaMask = RestirFlagsDeltaMask(flags);
     g_rngSeed = floatBitsToUint(RS_BASE.fSeed.w);
 
+    // Naive-port baseline (volume mode 0): volume-bearing paths are not
+    // shiftable at all - a direct ReSTIR PT port has no distance replay or
+    // scatter classification.
+    if (!RestirVolShiftEnabled() && RestirFlagsVolMask(flags) != 0u)
+    { WfJobFail(jb); return; }
+
     bool misRecompute = RestirMisRecomputeEnabled();
     bool conn = RestirConnectionsEnabled();
 
@@ -154,12 +176,11 @@ void main()
         if (j == 0u)
         {
             // ---------------------------------------------- emission -----
+            // Power-CDF pick, identical to creation (see restir_common.glsl
+            // RestirSampleLightIndex): camera-independent, motion-stable.
             RngStream(0u, RNG_EMIT);
-            float pdfDescent, pdfLeaf;
-            uint leaf = LT_Descend(WfDstCamPos(isPrev), WfDstCamForward(isPrev), pdfDescent);
-            if (pdfDescent <= 0.0) { WfJobFail(jb); return; }
-            uint lightIdx = LT_SampleLeafTriangle(leaf, pdfLeaf);
-            float pickPdf = pdfDescent * pdfLeaf;
+            float pickPdf;
+            uint lightIdx = RestirSampleLightIndex(pickPdf);
             if (pickPdf <= 0.0) { WfJobFail(jb); return; }
             LightTri lt = lightTris[lightIdx];
             vec3 lightN = lt.normalArea.xyz;
@@ -199,42 +220,93 @@ void main()
 
         // ------------------------------------- walk vertex y_j (j >= 1) --
         vec4 hitA = wfArena[jb + 6u];
-        if (hitA.w < 0.0) { WfJobFail(jb); return; }
-        vec4 hitB = wfArena[jb + 7u];
-        vec3 x = hitA.xyz;
-        vec3 n = hitB.xyz;
-        uint matId = floatBitsToUint(hitB.w) >> 24;
-        Material mat = materials[matId];
         vec3 wi = wfArena[jb + 3u].xyz;
+        uint volMaskL = RestirFlagsVolMask(flags);
 
-        // Base subpaths have no interior emitters (bijectivity).
-        if (dot(mat.emissive.rgb, mat.emissive.rgb) > 0.0) { WfJobFail(jb); return; }
-        bool isDelta = MatIsDelta(mat);
-        if (isDelta != (((deltaMask >> (j - 1u)) & 1u) == 1u)) { WfJobFail(jb); return; }
-        float cosInJ = abs(dot(n, -wi));
-        if (cosInJ <= 1e-6) { WfJobFail(jb); return; }
+        // Fog free-flight replay (same stream as restir_light.comp) +
+        // scatter/pass classification invertibility against the volMask.
+        bool jVol = false;
+        if (FogEnabled())
+        {
+            RngStream(j, RNG_DIST);
+            float tS = FogSampleDist(RandomFloat());
+            float dSurf = (hitA.w < 0.0) ? 1e30 : hitA.w;
+            if (tS < dSurf) { jVol = true; hitA.w = tS; }
+        }
+        if (jVol != (((volMaskL >> (j - 1u)) & 1u) == 1u)) { WfJobFail(jb); return; }
+        if (hitA.w < 0.0) { WfJobFail(jb); return; }
 
+        vec3 x, n;
+        uint matId;
+        Material mat;
         vec3 f = wfArena[jb + 4u].xyz;
         float replayPdf = wfArena[jb + 4u].w;
+        float kInJ;
+        if (jVol)
+        {
+            x = wfArena[jb + 1u].xyz + (-wi) * hitA.w;
+            n = vec3(0.0, 0.0, 1.0);
+            matId = 0u;
+            mat = materials[0];
+            kInJ = FogSigmaT();
+            float trSeg = FogTr(hitA.w);
+            f *= trSeg;
+            replayPdf *= FogSigmaT() * trSeg;
+        }
+        else
+        {
+            vec4 hitB = wfArena[jb + 7u];
+            x = hitA.xyz;
+            n = hitB.xyz;
+            matId = floatBitsToUint(hitB.w) >> 24;
+            mat = materials[matId];
+
+            // Base subpaths have no interior emitters (bijectivity).
+            if (dot(mat.emissive.rgb, mat.emissive.rgb) > 0.0) { WfJobFail(jb); return; }
+            float cosInJ = abs(dot(n, -wi));
+            if (cosInJ <= 1e-6) { WfJobFail(jb); return; }
+            kInJ = cosInJ;
+            if (FogEnabled())
+            {
+                float trSeg = FogTr(hitA.w);
+                f *= trSeg;
+                replayPdf *= trSeg;
+            }
+        }
+        bool isDelta = !jVol && MatIsDelta(mat);
+        if (isDelta != (((deltaMask >> (j - 1u)) & 1u) == 1u)) { WfJobFail(jb); return; }
 
         // Arrival conversions for the light-side MIS recursion
         // (restir_shift.glsl's walk, kept in job slot 5).
         vec4 mis = wfArena[jb + 5u];
-        mis.x *= hitA.w * hitA.w / cosInJ; // mVCM
-        mis.y /= cosInJ;                   // mVC
-        mis.z /= cosInJ;                   // mLW
+        mis.x *= hitA.w * hitA.w / kInJ; // mVCM
+        mis.y /= kInJ;                   // mVC
+        mis.z /= kInJ;                   // mLW
         wfArena[jb + 5u] = mis;
 
         if (j + 2u == s)
         {
             WfLightReconnect(jobIdx, jb, jobBaseSlot, dstIdx, isPrev,
-                             x, n, wi, matId, false, 0u, f, replayPdf);
+                             x, n, wi, jVol ? MAT_VOLUME : matId, false, 0u, f, replayPdf);
             return;
         }
 
         // -------------------------------------------- replayed scatter ---
         RngStream(j, RNG_BSDF);
-        BsdfSample bs = SampleBsdf(mat, n, wi, true);
+        BsdfSample bs;
+        if (jVol)
+        {
+            float pdfPhase;
+            bs.dir = SamplePhaseHG(-wi, FogG(), RandomFloat2(), pdfPhase);
+            bs.weight = vec3(FogSigmaS());
+            bs.pdfDir = pdfPhase;
+            bs.pdfRev = pdfPhase;
+            bs.cosOut = FogSigmaT();
+            bs.choicePdf = 1.0;
+            bs.specular = false;
+        }
+        else
+            bs = SampleBsdf(mat, n, wi, true);
         if (bs.weight == vec3(0.0)) { WfJobFail(jb); return; }
         if (!bs.specular && bs.pdfDir <= 0.0) { WfJobFail(jb); return; }
         float pdfStep = bs.choicePdf * (bs.specular ? 1.0 : bs.pdfDir);
@@ -255,7 +327,7 @@ void main()
         }
         wfArena[jb + 5u] = mis;
 
-        wfArena[jb + 1u] = vec4(x, hitB.w);
+        wfArena[jb + 1u] = vec4(x, jVol ? uintBitsToFloat(MAT_VOLUME) : wfArena[jb + 7u].w);
         wfArena[jb + 2u] = vec4(n, 0.0);
         wfArena[jb + 3u] = vec4(-bs.dir, 0.0);
         wfArena[jb + 4u] = vec4(f * bs.weight * pdfStep, replayPdf * pdfStep);
@@ -274,6 +346,8 @@ void main()
     uint matId;
     uint triIdx = 0u;
     float lastD2 = 0.0;
+    bool isVol = false; // offset vertex i is a fog scattering vertex
+    uint volMask = RestirFlagsVolMask(flags);
     vec4 fSlot = wfArena[jb + 4u];
     vec3 f = fSlot.xyz;
     float replayPdf = fSlot.w;
@@ -288,11 +362,27 @@ void main()
         matId = floatBitsToUint(cur.w) >> 24;
         n = wfArena[jb + 2u].xyz;
         wi = wfArena[jb + 3u].xyz;
+        // Airlight family: vertex 1 is the replayed truncated in-scatter
+        // point (WfShiftCreateJob's volume-primary branch).
+        isVol = (volMask & 1u) != 0u;
     }
     else
     {
         vec4 hitA = wfArena[jb + 6u];
         wi = wfArena[jb + 3u].xyz; // already the new wi = -bs.dir
+
+        // Fog free-flight replay (same stream and draw count as creation);
+        // the offset path must reproduce the base's scatter/pass
+        // classification or the stored structure misaligns (volMask).
+        if (FogEnabled())
+        {
+            RngStream(i, RNG_DIST);
+            float tS = FogSampleDist(RandomFloat());
+            float dSurf = (hitA.w < 0.0) ? 1e30 : hitA.w;
+            if (tS < dSurf) { isVol = true; hitA.w = tS; }
+        }
+        if (isVol != (((volMask >> (i - 1u)) & 1u) == 1u)) { WfJobFail(jb); return; }
+
         if (hitA.w < 0.0)
         {
             // Environment terminal: the scatter happened at vertex i-1, so
@@ -307,13 +397,36 @@ void main()
         }
         if (envEnd && (i + 1u) == t) { WfJobFail(jb); return; } // base escaped, shift didn't
 
-        vec4 hitB = wfArena[jb + 7u];
-        x = hitA.xyz;
-        n = hitB.xyz;
-        matId = floatBitsToUint(hitB.w) >> 24;
-        triIdx = floatBitsToUint(hitB.w) & 0x00FFFFFFu;
         lastD2 = hitA.w * hitA.w;
-        float cosArr = max(abs(dot(n, -wi)), 1e-6);
+        float cosArr;
+        if (isVol)
+        {
+            // Synthetic volume vertex (true-value f/pdf convention:
+            // segment Tr to f, sigma_t*Tr to the replayed pdf).
+            x = wfArena[jb + 1u].xyz + (-wi) * hitA.w;
+            n = vec3(0.0, 0.0, 1.0);
+            matId = 0u;
+            triIdx = 0u;
+            cosArr = FogSigmaT();
+            float trSeg = FogTr(hitA.w);
+            f *= trSeg;
+            replayPdf *= FogSigmaT() * trSeg;
+        }
+        else
+        {
+            vec4 hitB = wfArena[jb + 7u];
+            x = hitA.xyz;
+            n = hitB.xyz;
+            matId = floatBitsToUint(hitB.w) >> 24;
+            triIdx = floatBitsToUint(hitB.w) & 0x00FFFFFFu;
+            cosArr = max(abs(dot(n, -wi)), 1e-6);
+            if (FogEnabled())
+            {
+                float trSeg = FogTr(hitA.w);
+                f *= trSeg;
+                replayPdf *= trSeg;
+            }
+        }
         dVCM *= lastD2 / cosArr;
         dVC /= cosArr;
         dT1 /= cosArr;
@@ -361,11 +474,11 @@ void main()
 
     // ------------------------------------------- vertex i loop body ------
     Material mat = materials[matId];
-    bool isDelta = MatIsDelta(mat);
+    bool isDelta = !isVol && MatIsDelta(mat);
     if (isDelta != (((deltaMask >> (i - 1u)) & 1u) == 1u)) { WfJobFail(jb); return; }
     // Premature emitter: every vertex processed here is a non-terminal
     // vertex of the base path (see the megakernel's comment).
-    if (dot(mat.emissive.rgb, mat.emissive.rgb) > 0.0) { WfJobFail(jb); return; }
+    if (!isVol && dot(mat.emissive.rgb, mat.emissive.rgb) > 0.0) { WfJobFail(jb); return; }
 
     // Reconnection-criteria invertibility (ReSTIR PT Enhanced sec. 4): if
     // the offset pair (x'_{i-1}, x'_i) passes the criteria at a vertex
@@ -373,13 +486,18 @@ void main()
     // would reconnect HERE instead of at the base's rc vertex - the shift
     // is not invertible, so reject. (The reconnection pair itself is
     // validated in its branch below; slot 10 carries the previous replayed
-    // scatter's pdf and eligibility.)
+    // scatter's pdf and eligibility. Volume vertices use the volumetric
+    // shift's criteria.)
     if (i >= 2u)
     {
         vec4 rcCrit = wfArena[jb + 10u];
-        if (floatBitsToUint(rcCrit.y) != 0u && MatRcCacheable(mat)
-            && RestirRcFootprintOk(lastD2, rcCrit.x, abs(dot(n, wi)), mat, false, rcCrit.z))
-        { WfJobFail(jb); return; }
+        bool wouldRc = floatBitsToUint(rcCrit.y) != 0u
+            && (isVol
+                    ? RestirRcFootprintOkVolume(lastD2, rcCrit.x, rcCrit.z)
+                    : (MatRcCacheable(mat)
+                       && RestirRcFootprintOk(lastD2, rcCrit.x, abs(dot(n, wi)),
+                                              mat, false, rcCrit.z)));
+        if (wouldRc) { WfJobFail(jb); return; }
     }
 
     if (lightRc && i == t - 1u)
@@ -395,35 +513,53 @@ void main()
         float distY = sqrt(d2y);
         vec3 dirY = toY / distY;
 
-        float cosY = dot(lyNrmW, -dirY);
+        uint lyMat = floatBitsToUint(RS_BASE.lyPosMat.w);
+        bool lyVolume = (lyMat == 0xFEu);
+        float cosY = lyVolume ? 1.0 : dot(lyNrmW, -dirY);
         if (cosY <= 1e-6) { WfJobFail(jb); return; } // wrong side of y_{s-1}
+        float kLy = lyVolume ? FogSigmaT() : cosY;
 
         // Stochastic-eval determinism (see restir_shift.glsl): align the
         // draw stream with creation's RNG_CONNECT sequence.
         RngStream(i, RNG_CONNECT);
         RandomFloat();
-        float pdfDirY, pdfRevY, cosOutY;
-        vec3 fbY = EvalBsdf(mat, n, wi, dirY, pdfDirY, pdfRevY, cosOutY);
+        float pdfDirY, pdfRevY, cosOutY, kOutY;
+        vec3 fbY;
+        if (isVol)
+        {
+            fbY = EvalPhase(-wi, dirY, pdfDirY, pdfRevY);
+            cosOutY = 1.0;
+            kOutY = FogSigmaT();
+        }
+        else
+        {
+            fbY = EvalBsdf(mat, n, wi, dirY, pdfDirY, pdfRevY, cosOutY);
+            kOutY = cosOutY;
+        }
         if (fbY == vec3(0.0)) { WfJobFail(jb); return; }
 
-        // Re-evaluate the ly BSDF toward the new camera vertex (identical
-        // to restir_shift.glsl: lyTput excludes it; true pdfs feed omega).
-        Material lmat = materials[floatBitsToUint(RS_BASE.lyPosMat.w)];
+        // Re-evaluate the ly scatter toward the new camera vertex
+        // (identical to restir_shift.glsl: lyTput excludes it).
         vec3 lyWiW = RestirObjToWorldNormal(lyInst, OctaDecode(RS_BASE.lyTput.w));
         float lightDirPdfW, lightRevPdfW, cosLyOut;
-        vec3 fLight = EvalBsdf(lmat, lyNrmW, lyWiW, -dirY,
-                               lightDirPdfW, lightRevPdfW, cosLyOut);
+        vec3 fLight;
+        if (lyVolume)
+            fLight = EvalPhase(-lyWiW, -dirY, lightDirPdfW, lightRevPdfW);
+        else
+            fLight = EvalBsdf(materials[lyMat], lyNrmW, lyWiW, -dirY,
+                              lightDirPdfW, lightRevPdfW, cosLyOut);
         if (fLight == vec3(0.0)) { WfJobFail(jb); return; }
 
         f *= fbY * (cosOutY * cosY / d2y); // fCam * geometry term
+        f *= FogTr(distY);                 // connection transmittance
         f *= fLight;                       // rho_y at the new direction
         f *= RS_BASE.lyTput.xyz;           // light prefix numerator
 
         float omega = RS_BASE.rcInfo.z;
         if (misRecompute)
         {
-            float camDirPdfA = pdfDirY * cosY / d2y;
-            float lightDirPdfA = lightDirPdfW * cosOutY / d2y;
+            float camDirPdfA = pdfDirY * kLy / d2y;
+            float lightDirPdfA = lightDirPdfW * kOutY / d2y;
             float denom = camDirPdfA
                               * (RS_BASE.misCache.x + RS_BASE.misCache.y * lightRevPdfW)
                         + 1.0
@@ -460,15 +596,29 @@ void main()
         float dist = sqrt(d2);
         vec3 dir = toRc / dist;
 
-        float cosRc = dot(rcNrmW, -dir);
+        uint rcMatBits = floatBitsToUint(RS_BASE.rcPosMat.w);
+        bool rcVolume = (rcMatBits == MAT_VOLUME);
+        // Volume anchors have no orientation; surfaces keep the observer-
+        // side test.
+        float cosRc = rcVolume ? 1.0 : dot(rcNrmW, -dir);
         if (cosRc <= 1e-6) { WfJobFail(jb); return; }
 
-        uint rcMatBits = floatBitsToUint(RS_BASE.rcPosMat.w);
         // s=1 light-point rc: align eval draws with creation's RNG_EVAL
         // stream (see restir_shift.glsl).
         if (rcMatBits == NO_MATERIAL) RngStream(i, RNG_EVAL);
-        float pdfDir, pdfRev, cosOut;
-        vec3 fb = EvalBsdf(mat, n, wi, dir, pdfDir, pdfRev, cosOut);
+        float pdfDir, pdfRev, cosOut, kOut;
+        vec3 fb;
+        if (isVol)
+        {
+            fb = EvalPhase(-wi, dir, pdfDir, pdfRev);
+            cosOut = 1.0;
+            kOut = FogSigmaT();
+        }
+        else
+        {
+            fb = EvalBsdf(mat, n, wi, dir, pdfDir, pdfRev, cosOut);
+            kOut = cosOut;
+        }
         if (fb == vec3(0.0)) { WfJobFail(jb); return; }
 
         if (RS_BASE.rcInfo.x <= 0.0 || RS_BASE.rcInfo.y <= 0.0) { WfJobFail(jb); return; }
@@ -482,41 +632,55 @@ void main()
         bool emitterRc = (s == 0u && r == t - 1u);
         if (rcMatBits != NO_MATERIAL && (emitterRc || r < t - 1u))
         {
-            bool prevOk = MatRcCacheable(mat)
-                          && MatRcRoughness(mat) >= RESTIR_RC_ALPHA_MIN;
-            if (!prevOk
-                || !RestirRcFootprintOk(d2, pdfDir, cosRc, materials[rcMatBits],
-                                        emitterRc, wfArena[jb + 10u].z))
-            { WfJobFail(jb); return; }
+            bool prevOk = isVol
+                ? (RestirVolRcEnabled() && abs(FogG()) <= 0.8)
+                : (MatRcCacheable(mat)
+                   && MatRcRoughness(mat) >= RESTIR_RC_ALPHA_MIN);
+            bool pairOk = rcVolume
+                ? RestirRcFootprintOkVolume(d2, pdfDir, wfArena[jb + 10u].z)
+                : RestirRcFootprintOk(d2, pdfDir, cosRc, materials[rcMatBits],
+                                      emitterRc, wfArena[jb + 10u].z);
+            if (!prevOk || !pairOk) { WfJobFail(jb); return; }
         }
         float pFwdRc = 0.0, pRevRc = 0.0;
         if (rcMatBits != NO_MATERIAL && !emitterRc)
         {
             vec3 suffixDirW = RestirObjToWorldNormal(rcInst, OctaDecode(RS_BASE.rcLsuf.w));
-            float cosSufRc;
-            vec3 rhoRc = EvalBsdf(materials[rcMatBits], rcNrmW, -dir, suffixDirW,
-                                  pFwdRc, pRevRc, cosSufRc);
+            vec3 rhoRc;
+            if (rcVolume)
+                rhoRc = EvalPhase(dir, suffixDirW, pFwdRc, pRevRc);
+            else
+            {
+                float cosSufRc;
+                rhoRc = EvalBsdf(materials[rcMatBits], rcNrmW, -dir, suffixDirW,
+                                 pFwdRc, pRevRc, cosSufRc);
+            }
             if (rhoRc == vec3(0.0) || pFwdRc <= 0.0) { WfJobFail(jb); return; }
             f *= rhoRc;
         }
 
         f *= fb * cosOut;          // rho*cos at x'_{r-1}
+        f *= FogTr(dist);          // reconnection edge transmittance
         f *= RS_BASE.rcLsuf.xyz;   // cached suffix radiance (sans rho_r)
-        J *= (cosRc / RS_BASE.rcInfo.x) * (RS_BASE.rcInfo.y / d2); // Eq. 55
+        // Eq. 55; for a volume anchor both cosines are 1 (volume measure)
+        // and the Jacobian reduces to the pure distance ratio.
+        J *= (cosRc / RS_BASE.rcInfo.x) * (RS_BASE.rcInfo.y / d2);
 
         float omega = RS_BASE.rcInfo.z;
         if (misRecompute)
         {
-            float dVCMr = (d2 / cosRc) / pdfDir;
-            float dVCr = (cosOut / pdfDir) * (dVCM + pdfRev * dVC) / cosRc;
-            float dT1r = (cosOut / pdfDir) * (i == 1u ? dT1 : pdfRev * dT1) / cosRc;
+            // kRc: the anchor's MIS measure factor (sigma_t for volume).
+            float kRc = rcVolume ? FogSigmaT() : cosRc;
+            float dVCMr = (d2 / kRc) / pdfDir;
+            float dVCr = (kOut / pdfDir) * (dVCM + pdfRev * dVC) / kRc;
+            float dT1r = (kOut / pdfDir) * (i == 1u ? dT1 : pdfRev * dT1) / kRc;
             float denom;
             if (rcMatBits == NO_MATERIAL)
             {
                 // s=1 with the sampled light point as rc vertex.
                 float directPdfW = RS_BASE.misCache.y * d2 / cosRc;
                 if (directPdfW <= 1e-20) { WfJobFail(jb); return; }
-                float prefac = RS_BASE.misCache.z * cosOut / (directPdfW * cosRc);
+                float prefac = RS_BASE.misCache.z * kOut / (directPdfW * cosRc);
                 float wCam = conn ? prefac * (dVCM + pdfRev * dVC)
                                   : prefac * (i == 1u ? dT1 : pdfRev * dT1);
                 denom = 1.0 + pdfDir / directPdfW + wCam;
@@ -555,7 +719,21 @@ void main()
 
     // ------------------------------------------------ replayed scatter ---
     RngStream(i, RNG_BSDF);
-    BsdfSample bs = SampleBsdf(mat, n, wi, false);
+    BsdfSample bs;
+    if (isVol)
+    {
+        // Phase scatter replay: same draws and factors as creation.
+        float pdfPhase;
+        bs.dir = SamplePhaseHG(-wi, FogG(), RandomFloat2(), pdfPhase);
+        bs.weight = vec3(FogSigmaS());
+        bs.pdfDir = pdfPhase;
+        bs.pdfRev = pdfPhase;
+        bs.cosOut = FogSigmaT();
+        bs.choicePdf = 1.0;
+        bs.specular = false;
+    }
+    else
+        bs = SampleBsdf(mat, n, wi, false);
     if (bs.weight == vec3(0.0)) { WfJobFail(jb); return; }
     if (!bs.specular && bs.pdfDir <= 0.0) { WfJobFail(jb); return; }
 
@@ -584,8 +762,10 @@ void main()
     wfArena[jb + 5u] = vec4(dVCM, dVC, dT1, J);
     // Criteria state for the next arrival's pair check (rc-eligible
     // materials are single-lobe, so bs.pdfDir is the edge's full pdf).
+    bool prevOkNext = isVol
+        ? (RestirVolRcEnabled() && abs(FogG()) <= 0.8)
+        : (MatRcCacheable(mat) && MatRcRoughness(mat) >= RESTIR_RC_ALPHA_MIN);
     wfArena[jb + 10u].x = bs.specular ? 0.0 : bs.pdfDir;
-    wfArena[jb + 10u].y = uintBitsToFloat(
-        (MatRcCacheable(mat) && MatRcRoughness(mat) >= RESTIR_RC_ALPHA_MIN) ? 1u : 0u);
+    wfArena[jb + 10u].y = uintBitsToFloat(prevOkNext ? 1u : 0u);
     WfAppend(WfCtrlShade(uWfRound + 1u), WfShiftStepQBase(uWfRound + 1u), jobIdx);
 }

@@ -43,7 +43,10 @@ void main()
     uint slot = RestirRegionOffset(RestirFinalRegion()) + idx;
 
     GBufferPixel gCur = RestirLoadGBuf(GBufCurOffset() + idx);
-    if (gCur.posDepth.w < 0.0) return; // canonical (empty) stands
+    // Miss pixels merge too when the fog scatters: their caustic
+    // reservoirs carry the t=1 airlight landings (Sec. 4.3 fix).
+    bool missPx = gCur.posDepth.w < 0.0;
+    if (missPx && !FogScatterEnabled()) return; // canonical (empty) stands
 
     // OCCUPANCY: field-wise reads by slot (see restir_caustic_shift.comp).
     vec4 canCore = pixelRes[slot].caustic.core;
@@ -56,14 +59,16 @@ void main()
         uint tech = floatBitsToUint(canCore.w);
         RestirCausticReplayResult back = RestirCausticReplay(
             floatBitsToUint(pixelRes[slot].caustic.fSeed.w), RestirTechS(tech),
-            RestirFlagsDeltaMask(RestirTechFlags(tech)),
+            RestirTechFlags(tech),
             uFrame.prevCamPos.xyz, uFrame.prevCamForward.xyz,
             uFrame.prevCamRight.xyz, uFrame.prevCamUp.xyz,
-            uFrame.prevCameraParams.x, uFrame.prevCameraParams.y);
+            uFrame.prevCameraParams.x, uFrame.prevCameraParams.y, GBufPrevOffset());
         if (back.ok)
         {
             uint vIdx = RestirPixelIndex(back.pixel);
-            if (gbuf[GBufPrevOffset() + vIdx].posDepth.w >= 0.0)
+            // Mirror of the forward landing gate: miss landings count as
+            // valid history sources when the fog scatters.
+            if (gbuf[GBufPrevOffset() + vIdx].posDepth.w >= 0.0 || FogScatterEnabled())
             {
                 // omega of T^-1(canonical) in the PREVIOUS domain:
                 // recomputed (Phase 5) or copied.
@@ -138,32 +143,63 @@ void main()
     // ------------------------------------------- confidence proxy --------
     // Motion-vector-mapped previous pixel with the same surface validation
     // as the regular temporal pass; disocclusions keep c at the canonical 1.
+    // Miss pixels (airlight only) reproject the representative fog depth
+    // (truncated-exponential mean along the pixel ray) and validate
+    // miss-to-miss, mirroring restir_wf_tinit.comp. Anchored pixels whose
+    // SURFACE validation fails fall back to the same fog reprojection:
+    // this reservoir's airlight content is continuous across silhouettes,
+    // and re-binned landings keep arriving parallax-correctly (the replay
+    // projects the actual path) - resetting confidence with the surface
+    // anchor made fog accumulation die under camera motion. Both proxies
+    // are sample-independent G-buffer functions.
     float cOut = cCan;
+    vec3 rayDir = RestirPrimaryRay(pixel).dir;
+    vec3 projPoint = missPx
+        ? uFrame.camPos.xyz + rayDir * FogRepDistance(-1.0)
+        : gCur.posDepth.xyz;
     vec2 prevPixF;
-    if (RestirPrevProject(gCur.posDepth.xyz, prevPixF))
+    bool histOk = false;
+    float cV = 0.0;
+    if (RestirPrevProject(projPoint, prevPixF))
     {
         ivec2 prevPix = ivec2(prevPixF);
         if (prevPix.x >= 0 && prevPix.y >= 0 && prevPix.x < size.x && prevPix.y < size.y)
         {
             uint pIdx = RestirPixelIndex(prevPix);
             GBufferPixel gPrev = RestirLoadGBuf(GBufPrevOffset() + pIdx);
-            // Same surface validation as the regular temporal pass,
-            // including the normal-agreement and depth-level tests.
-            float expPrevDepth = max(length(gCur.posDepth.xyz - uFrame.prevCamPos.xyz), 1e-3);
-            if (gPrev.posDepth.w >= 0.0 && GBufMaterial(gPrev) == GBufMaterial(gCur)
-                && dot(gPrev.normalMat.xyz, gCur.normalMat.xyz) >= 0.9
-                && abs(gPrev.posDepth.w - expPrevDepth) < 0.1 * expPrevDepth)
+            if (missPx)
             {
-                float depthScale = max(gCur.posDepth.w, 1e-3);
-                if (length(gPrev.posDepth.xyz - gCur.posDepth.xyz) < 0.02 * depthScale)
-                {
-                    float cV = min(pixelRes[RestirRegionOffset(RestirHistoryRegion()) + pIdx].caustic.core.z,
-                                   RestirConfidenceCap());
-                    cOut = min(cCan + cV, RestirConfidenceCap());
-                }
+                histOk = gPrev.posDepth.w < 0.0;
             }
+            else
+            {
+                // Same surface validation as the regular temporal pass,
+                // including the normal-agreement and depth-level tests.
+                float expPrevDepth = max(length(gCur.posDepth.xyz - uFrame.prevCamPos.xyz), 1e-3);
+                float depthScale = max(gCur.posDepth.w, 1e-3);
+                histOk = gPrev.posDepth.w >= 0.0 && GBufMaterial(gPrev) == GBufMaterial(gCur)
+                      && dot(gPrev.normalMat.xyz, gCur.normalMat.xyz) >= 0.9
+                      && abs(gPrev.posDepth.w - expPrevDepth) < 0.1 * expPrevDepth
+                      && length(gPrev.posDepth.xyz - gCur.posDepth.xyz) < 0.02 * depthScale;
+            }
+            if (histOk)
+                cV = min(pixelRes[RestirRegionOffset(RestirHistoryRegion()) + pIdx].caustic.core.z,
+                         RestirConfidenceCap());
         }
     }
+    // NOTE: no fog fallback HERE, deliberately - we measured it. Inheriting
+    // caustic confidence across surface-disagreeing pixels under camera
+    // translation drains energy progressively: the inflated cV discounts
+    // the canonical ~cap-fold through the backward map while the landed-
+    // entry supply in the sweeping disocclusion band cannot make up the
+    // difference, and the shortfall compounds along the history chain
+    // (dolly A/B: monotone mean decay 0.10 -> 0.05 over ~20 s). Surface-
+    // validated confidence resets in the band instead - mild, self-healing.
+    // The regular reservoir's fog pairing (restir_wf_tinit.comp) is the
+    // one that carries airlight across disocclusions; it re-pairs the
+    // actual REUSE (both MIS directions), not just a confidence scalar,
+    // and measures stable.
+    if (histOk) cOut = min(cCan + cV, RestirConfidenceCap());
 
     CausticReservoir outC = RestirEmptyCaustic();
     if (wSum > 0.0 && selPHat > 0.0)

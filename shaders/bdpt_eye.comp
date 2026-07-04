@@ -74,11 +74,169 @@ void main()
     for (uint iter = 0u; primaryValid && iter < BDPT_MAX_LIGHT_VERTS + 1u; ++iter)
     {
         Hit hit;
-        if (!IntersectScene(ray, hit))
+        bool surfHit = IntersectScene(ray, hit);
+
+        // Homogeneous fog: analytic free-flight sampling, one replayable
+        // draw per segment (RNG_DIST stream). The exponential pdf cancels
+        // the medium factors of the throughput exactly: pass-throughs
+        // change nothing, scatters multiply the albedo.
+        bool volScatter = false;
+        if (FogEnabled())
+        {
+            RngStream(pathLength, RNG_DIST);
+            float tS = FogSampleDist(RandomFloat());
+            if (tS < (surfHit ? hit.t : 1e30)) { volScatter = true; hit.t = tS; }
+        }
+
+        if (!surfHit && !volScatter)
         {
             // The environment is only reachable by eye paths - weight 1.
             radiance += throughput * uFrame.background.rgb * uFrame.background.a;
             break;
+        }
+
+        if (volScatter)
+        {
+            // ------------------------- volume scattering vertex ----------
+            // MIS conversions use the volume measure factor sigma_t in
+            // place of the surface cosine (see common.glsl fog notes).
+            vec3 vPos = ray.origin + ray.dir * hit.t;
+            float sigmaT = FogSigmaT();
+            if (pathLength == 1u)
+            {
+                vec3 v = vPos - uFrame.camPos.xyz;
+                float d2v = dot(v, v);
+                float cosAtCam = dot(v * inversesqrt(max(d2v, 1e-12)), uFrame.camForward.xyz);
+                if (cosAtCam <= 1e-3) break;
+                float ipd = BdptImagePlaneDist();
+                float ip2c = ipd / cosAtCam;
+                float cameraPdfW = (ip2c * ip2c) / cosAtCam;
+                dVCM = (numLightPaths / cameraPdfW) * (d2v / sigmaT);
+                dVC = 0.0;
+            }
+            else
+            {
+                dVCM *= hit.t * hit.t / sigmaT;
+                dVC /= sigmaT;
+            }
+            if (pathLength >= maxLen) break;
+
+            // Distance-sampling pdf sigma_t*Tr vs segment f-factor Tr: the
+            // 1/sigma_t applies at ARRIVAL (PBRT-style), so connections AT
+            // this vertex (which multiply sigma_s*phase themselves) see the
+            // correct throughput; the scatter below adds the remaining
+            // sigma_s (arrival * scatter = albedo, as before).
+            throughput /= sigmaT;
+
+            vec3 wProp = ray.dir;
+
+            // -------------------------------------------------- s = 1 ----
+            if (haveLights)
+            {
+                RngStream(pathLength, RNG_NEE);
+                float pickPdfTrue;
+                uint lightIdx = BdptSampleLightIndex(pickPdfTrue);
+                LightTri lt = lightTris[lightIdx];
+                vec3 lightPos = BdptSampleLightPoint(lightIdx, RandomFloat2());
+
+                vec3 toLight = lightPos - vPos;
+                float dist2 = dot(toLight, toLight);
+                float dist = sqrt(max(dist2, 1e-12));
+                vec3 L = toLight / dist;
+                float cosAtLight = dot(lt.normalArea.xyz, -L);
+
+                if (cosAtLight > 1e-6 && pickPdfTrue > 0.0)
+                {
+                    float invArea = 1.0 / max(lt.normalArea.w, 1e-10);
+                    float directPdfWTrue = pickPdfTrue * invArea * dist2 / cosAtLight;
+                    float directPdfA, emissionPdfW;
+                    BdptLightPdfs(lightIdx, cosAtLight, directPdfA, emissionPdfW);
+                    float directPdfW = directPdfA * dist2 / cosAtLight;
+
+                    float pDir, pRev;
+                    vec3 fp = EvalPhase(wProp, L, pDir, pRev);
+
+                    if (directPdfW > 1e-20 && directPdfWTrue > 1e-20)
+                    {
+                        float wLight = pDir / directPdfW;
+                        float wCamera = (emissionPdfW * sigmaT / (directPdfW * cosAtLight))
+                                        * (dVCM + dVC * pRev);
+                        float misWeight = 1.0 / (wLight + 1.0 + wCamera);
+
+                        Ray shadowRay = MakeRay(vPos, L);
+                        if (!IntersectSceneOccluded(shadowRay, ShadowTMax(dist)))
+                            radiance += throughput * lt.emissionWeight.rgb * fp
+                                        * (misWeight * FogTr(dist) / directPdfWTrue);
+                    }
+                }
+            }
+
+            // ------------------------------------------------- s >= 2 ----
+            uint nValidV = 0u;
+            for (uint k = 0u; k < lightVerts_n; ++k)
+            {
+                if (uint(lightVerts[lightVertBase + k].wiLen.w) + 1u + pathLength > maxLen) break;
+                nValidV++;
+            }
+            if (nValidV > 0u)
+            {
+                RngStream(pathLength, RNG_CONNECT);
+                uint k = min(uint(RandomFloat() * float(nValidV)), nValidV - 1u);
+                LightVertex lv = lightVerts[lightVertBase + k];
+
+                vec3 toL = lv.posDvcm.xyz - vPos;
+                float dist2 = dot(toL, toL);
+                float dist = sqrt(max(dist2, 1e-12));
+                vec3 dirCtoL = toL / dist;
+
+                float camDirPdfW, camRevPdfW;
+                vec3 fCam = EvalPhase(wProp, dirCtoL, camDirPdfW, camRevPdfW);
+
+                uint lvMat = floatBitsToUint(lv.tputMat.w);
+                float lightDirPdfW, lightRevPdfW, cosLightV, kLight;
+                vec3 fLight;
+                if (lvMat == MAT_VOLUME)
+                {
+                    fLight = EvalPhase(-lv.wiLen.xyz, -dirCtoL, lightDirPdfW, lightRevPdfW);
+                    cosLightV = 1.0;
+                    kLight = sigmaT;
+                }
+                else
+                {
+                    Material lmat = materials[lvMat];
+                    fLight = EvalBsdf(lmat, lv.normalDvc.xyz, lv.wiLen.xyz, -dirCtoL,
+                                      lightDirPdfW, lightRevPdfW, cosLightV);
+                    kLight = cosLightV;
+                }
+
+                if (dist2 > 1e-12 && fCam != vec3(0.0) && fLight != vec3(0.0))
+                {
+                    float geometryTerm = cosLightV / dist2; // cos at the volume end = 1
+                    float camDirPdfA = camDirPdfW * kLight / dist2;
+                    float lightDirPdfA = lightDirPdfW * sigmaT / dist2;
+
+                    float wLight = camDirPdfA * (lv.posDvcm.w + lv.normalDvc.w * lightRevPdfW);
+                    float wCamera = lightDirPdfA * (dVCM + dVC * camRevPdfW);
+                    float misWeight = 1.0 / (wLight + 1.0 + wCamera);
+
+                    Ray shadowRay = MakeRay(vPos, dirCtoL);
+                    if (!IntersectSceneOccluded(shadowRay, dist * 0.998))
+                        radiance += throughput * lv.tputMat.xyz * fCam * fLight
+                                    * (misWeight * geometryTerm * FogTr(dist) * float(nValidV));
+                }
+            }
+
+            // -------------------------------------------- phase bounce ---
+            RngStream(pathLength, RNG_BSDF);
+            float pdfPhase;
+            vec3 dir = SamplePhaseHG(wProp, FogG(), RandomFloat2(), pdfPhase);
+            if (pdfPhase <= 0.0) break;
+            dVC = (sigmaT / pdfPhase) * (dVC * pdfPhase + dVCM);
+            dVCM = 1.0 / pdfPhase;
+            throughput *= FogSigmaS(); // arrival carried 1/sigma_t already
+            pathLength++;
+            ray = MakeRay(vPos, dir);
+            continue;
         }
 
         vec3 hitPos = ray.origin + ray.dir * hit.t;
@@ -178,7 +336,7 @@ void main()
                         Ray shadowRay = MakeRay(hitPos + nf * 1e-4, L);
                         if (!IntersectSceneOccluded(shadowRay, ShadowTMax(dist)))
                             radiance += throughput * lt.emissionWeight.rgb * f
-                                        * (misWeight * cosToLight / directPdfWTrue);
+                                        * (misWeight * cosToLight * FogTr(dist) / directPdfWTrue);
                     }
                 }
             }
@@ -210,15 +368,27 @@ void main()
                 float camDirPdfW, camRevPdfW, cosCamera;
                 vec3 fCam = EvalBsdf(mat, hit.normal, wi, dirCtoL, camDirPdfW, camRevPdfW, cosCamera);
 
-                Material lmat = materials[floatBitsToUint(lv.tputMat.w)];
-                float lightDirPdfW, lightRevPdfW, cosLightV;
-                vec3 fLight = EvalBsdf(lmat, lv.normalDvc.xyz, lv.wiLen.xyz, -dirCtoL,
-                                       lightDirPdfW, lightRevPdfW, cosLightV);
+                uint lvMat = floatBitsToUint(lv.tputMat.w);
+                float lightDirPdfW, lightRevPdfW, cosLightV, kLight;
+                vec3 fLight;
+                if (lvMat == MAT_VOLUME)
+                {
+                    fLight = EvalPhase(-lv.wiLen.xyz, -dirCtoL, lightDirPdfW, lightRevPdfW);
+                    cosLightV = 1.0;
+                    kLight = FogSigmaT();
+                }
+                else
+                {
+                    Material lmat = materials[lvMat];
+                    fLight = EvalBsdf(lmat, lv.normalDvc.xyz, lv.wiLen.xyz, -dirCtoL,
+                                      lightDirPdfW, lightRevPdfW, cosLightV);
+                    kLight = cosLightV;
+                }
 
                 if (dist2 > 1e-12 && fCam != vec3(0.0) && fLight != vec3(0.0))
                 {
                     float geometryTerm = cosCamera * cosLightV / dist2;
-                    float camDirPdfA = camDirPdfW * cosLightV / dist2;
+                    float camDirPdfA = camDirPdfW * kLight / dist2;
                     float lightDirPdfA = lightDirPdfW * cosCamera / dist2;
 
                     float wLight = camDirPdfA * (lv.posDvcm.w + lv.normalDvc.w * lightRevPdfW);
@@ -229,7 +399,7 @@ void main()
                     Ray shadowRay = MakeRay(hitPos + nf * 1e-4, dirCtoL);
                     if (!IntersectSceneOccluded(shadowRay, dist * 0.998))
                         radiance += throughput * lv.tputMat.xyz * fCam * fLight
-                                    * (misWeight * geometryTerm * float(nValid));
+                                    * (misWeight * geometryTerm * FogTr(dist) * float(nValid));
                 }
             }
         }

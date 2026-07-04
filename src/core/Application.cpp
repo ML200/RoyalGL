@@ -9,8 +9,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 
 #ifndef ROYALGL_ASSET_DIR
 #define ROYALGL_ASSET_DIR "assets/"
@@ -91,6 +93,30 @@ namespace RoyalGL
             m_settings.restirSpatialNeighbors = std::max(std::atoi(v), 0);
         if (const char* v = std::getenv("ROYALGL_RESTIR_STRAT")) m_settings.restirStratified = (v[0] != '0');
         if (const char* v = std::getenv("ROYALGL_RESTIR_DECORR")) m_settings.restirDecorrelate = (v[0] != '0');
+        if (const char* v = std::getenv("ROYALGL_RESTIR_VOLMODE"))
+            m_settings.restirVolumeMode = std::clamp(std::atoi(v), 0, 2);
+        // Back-compat alias: VOLRC=0 = replay-only, 1 = volume-anchored.
+        if (const char* v = std::getenv("ROYALGL_RESTIR_VOLRC")) m_settings.restirVolumeMode = (v[0] != '0') ? 2 : 1;
+        if (const char* v = std::getenv("ROYALGL_RESTIR_FOGPAIR")) m_settings.restirFogPairing = (v[0] != '0');
+        // Moved from PathTracer: the caustic-pass switch is a RenderSettings
+        // field now (UI toggle), the env stays as the scripted override.
+        if (const char* v = std::getenv("ROYALGL_RESTIR_CAUSTIC")) m_settings.restirCausticReuse = (v[0] != '0');
+        if (const char* v = std::getenv("ROYALGL_RESTIR_NL"))
+            m_settings.restirLightPaths = std::max(std::atoi(v), 4096);
+        if (const char* v = std::getenv("ROYALGL_BOUNCES")) m_settings.maxBounces = std::max(std::atoi(v), 1);
+        if (const char* v = std::getenv("ROYALGL_RESTIR_CAP")) m_settings.restirConfidenceCap = static_cast<float>(std::max(std::atoi(v), 1));
+        // Homogeneous fog for volumetric soaks: ROYALGL_FOG="sigmaS,sigmaA,g".
+        if (const char* v = std::getenv("ROYALGL_FOG"))
+        {
+            float f[3] = {0.15f, 0.02f, 0.0f};
+            if (sscanf(v, "%f,%f,%f", &f[0], &f[1], &f[2]) >= 1)
+            {
+                m_settings.fogEnable = f[0] > 0.0f || f[1] > 0.0f;
+                m_settings.fogSigmaS = f[0];
+                m_settings.fogSigmaA = f[1];
+                m_settings.fogG = f[2];
+            }
+        }
         if (const char* v = std::getenv("ROYALGL_RESTIR_LIGHT")) m_settings.restirLightTracing = (v[0] != '0');
         if (const char* v = std::getenv("ROYALGL_RESTIR_CONN")) m_settings.restirConnections = (v[0] != '0');
         if (const char* v = std::getenv("ROYALGL_RESTIR_MISFIX")) m_settings.restirRecomputeMis = (v[0] != '0');
@@ -98,6 +124,7 @@ namespace RoyalGL
         // even if the window is focused or the mouse passes over it.
         m_cameraLocked = (std::getenv("ROYALGL_LOCK_CAMERA") != nullptr);
         if (const char* v = std::getenv("ROYALGL_ORBIT")) m_orbitSpeed = static_cast<float>(std::atof(v));
+        if (const char* v = std::getenv("ROYALGL_DOLLY")) m_dollySpeed = static_cast<float>(std::atof(v));
         if (const char* v = std::getenv("ROYALGL_MOVE")) m_moveTestSpeed = static_cast<float>(std::atof(v));
         if (const char* v = std::getenv("ROYALGL_LENS")) m_settings.cameraMode = (v[0] != '0') ? CameraMode::Lens : CameraMode::Pinhole;
         m_statsEnabled = (std::getenv("ROYALGL_STATS") != nullptr);
@@ -383,6 +410,20 @@ namespace RoyalGL
                 float sign = (std::fmod(m_orbitPhase, 4.0f) < 2.0f) ? 1.0f : -1.0f;
                 m_scene->camera.Look(m_orbitSpeed * dt * sign, 0.0f);
             }
+            // Scripted lateral truck (ROYALGL_DOLLY=<units/s>, flip every
+            // 2s): TRANSLATION, i.e. parallax - which a rocking yaw never
+            // produces. The repro case for reprojection-pairing losses
+            // (fog history vs surface anchors move differently on screen).
+            if (m_dollySpeed != 0.0f)
+            {
+                m_dollyPhase += dt;
+                float sign = (std::fmod(m_dollyPhase, 4.0f) < 2.0f) ? 1.0f : -1.0f;
+                glm::vec3 fwd = m_scene->camera.target - m_scene->camera.position;
+                glm::vec3 right = glm::normalize(glm::cross(fwd, glm::vec3(0.0f, 1.0f, 0.0f)));
+                glm::vec3 step = right * (m_dollySpeed * dt * sign);
+                m_scene->camera.position += step;
+                m_scene->camera.target += step;
+            }
             // Scripted instance move (ROYALGL_MOVE=<rad/s>): oscillates the
             // last instance's X position - exercises the async BLAS/TLAS
             // rebuild pipeline exactly like UI transform edits do.
@@ -433,13 +474,53 @@ namespace RoyalGL
                 // count every frame, so trigger on the wall-clock frame
                 // counter instead (per-frame estimate statistics).
                 ++m_statsFrame;
-                bool fire = (m_orbitSpeed != 0.0f || m_moveTestSpeed != 0.0f)
+                bool fire = (m_orbitSpeed != 0.0f || m_moveTestSpeed != 0.0f || m_dollySpeed != 0.0f)
                                 ? (m_statsFrame % static_cast<uint32_t>(m_statsInterval) == 0)
                                 : (n > 0 && n % m_statsInterval == 0 && n != m_lastStatsSample);
                 if (fire)
                 {
                     m_lastStatsSample = n;
+                    // Wall-clock stamp for equal-time comparisons (offline
+                    // plots divide sample deltas by time deltas).
+                    static const auto statsT0 = clock::now();
+                    ROYALGL_LOG_INFO("StatsTime @", n, " samples: ms=",
+                                     std::chrono::duration<double, std::milli>(clock::now() - statsT0).count());
                     LogAccumulationStats();
+                }
+            }
+
+            // Raw float frame series for offline convergence metrics:
+            // ROYALGL_EXPORT_SERIES=<prefix> dumps the averaged accum buffer
+            // as raw RGBA32F (<prefix>_<n>.f32) whenever the sample count
+            // reaches a multiple of ROYALGL_EXPORT_STRIDE (default 1), up to
+            // ROYALGL_EXPORT_FRAMES (default 32). 8-bit PNG exports quantize
+            // away exactly the low-variance differences convergence plots
+            // measure, hence raw floats.
+            static const char* seriesEnv = std::getenv("ROYALGL_EXPORT_SERIES");
+            if (seriesEnv)
+            {
+                static uint32_t seriesMax = [] {
+                    const char* v = std::getenv("ROYALGL_EXPORT_FRAMES");
+                    return v ? static_cast<uint32_t>(std::max(std::atoi(v), 1)) : 32u;
+                }();
+                static uint32_t seriesStride = [] {
+                    const char* v = std::getenv("ROYALGL_EXPORT_STRIDE");
+                    return v ? static_cast<uint32_t>(std::max(std::atoi(v), 1)) : 1u;
+                }();
+                static uint32_t seriesLast = 0;
+                uint32_t n = m_pathTracer->SampleCount();
+                if (n != seriesLast && n <= seriesMax && n % seriesStride == 0)
+                {
+                    seriesLast = n;
+                    std::vector<float> raw = m_pathTracer->AccumulationImage().ReadPixelsFloat();
+                    AverageInPlace(raw);
+                    char name[512];
+                    std::snprintf(name, sizeof(name), "%s_%05u.f32", seriesEnv, n);
+                    std::ofstream f(name, std::ios::binary);
+                    f.write(reinterpret_cast<const char*>(raw.data()),
+                            static_cast<std::streamsize>(raw.size() * sizeof(float)));
+                    ROYALGL_LOG_INFO("Application: series dump ", name, " (", m_pathTracer->Width(),
+                                     "x", m_pathTracer->Height(), " RGBA32F)");
                 }
             }
 

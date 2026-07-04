@@ -598,12 +598,21 @@ increasing risk.
 > Deferred: splitting the shift mega-kernel by technique class (the
 > paper's known divergence win — the next lever if Nsight still shows
 > divergence-bound warps), fp16 packing of normals/throughputs, workgroup
-> size tuning (8x8 kept; retest once register counts settle), the N_L and
-> resolution-scale sliders, a Vulkan/RT-core backend as the ultimate
+> size tuning (8x8 kept; retest once register counts settle), the
+> resolution-scale slider, a Vulkan/RT-core backend as the ultimate
 > answer to the software-traversal cost, and the "spatial-only offline
 > converge" preset (already reachable via the existing temporal/spatial
 > toggles — temporal correlation shows up in soaks as slower
-> accumulated-relNoise decay).
+> accumulated-relNoise decay). The N_L slider shipped later (see the
+> editor-settings round after Phase 10.3): RenderSettings::
+> restirLightPaths (env ROYALGL_RESTIR_NL, UI log-slider 4096-262144),
+> PathTracer::EnsureLightPathBuffers reallocates the LVC/count/LRM
+> buffers live and Reset()s; N_L=65536 soaks unbiased (0.09158).
+> The same round promoted every remaining env-only setting to the UI:
+> volumetric shift mode combo, fog-parallax pairing, stratified spatial
+> picks, and caustic temporal reuse (moved from PathTracer's
+> m_causticPassesEnabled into RenderSettings::restirCausticReuse; the
+> ROYALGL_RESTIR_CAUSTIC env now sets the setting in Application).
 
 - Profile with existing `ROYALGL_STATS=1` GL timer queries per pass.
 - Reservoir packing (fp16 normals/throughputs where safe), register pressure in the
@@ -881,6 +890,244 @@ increasing risk.
 > 0.0905 pre-criteria). All-on GPU total 31.1 ms at 1600x900 (spatial
 > 10.3, temporal 5.2, camera 10.2) - the criteria cost nothing
 > measurable and kill bad corner/glossy reconnections earlier.
+
+### Phase 10 — Volumetric ReSTIR BDPT (homogeneous media)
+
+> **Phase 10 status: DONE (airlight estimator redesigned in the 10.1
+> round below).** Full writeup with derivations, tables and figures:
+> **docs/volumetric_restir_paper.pdf** (6 pages). Summary: homogeneous
+> fog (analytic Beer-Lambert + exponential free-flight + HG phase;
+> ROYALGL_FOG="sS,sA,g") through the whole pipeline - BDPT reference
+> walks, ReSTIR candidate walks (camera + light), LVC volume vertices,
+> and the shifts. MIS convention: per-vertex cos -> sigma_t at volume
+> vertices, transmittance excluded from MIS ratios (valid partition,
+> approximate optimality); BDPT walks apply the distance pdf's 1/sigma_t
+> at ARRIVAL (albedo-at-scatter dims every volume-vertex connection by
+> sigma_t - the first bring-up bug). NEW SHIFT MAPPING: volume vertices
+> as reconnection anchors - fixed world-space point, volume-measure
+> Jacobian d^2/d'^2 (NO cosines: immune to grazing blow-ups), live Tr +
+> phase re-eval, phase-peak footprint criteria, and an 8-bit per-vertex
+> volume mask (tech word repacked s:4|t:4) that replay re-derives for
+> invertibility. ROYALGL_RESTIR_VOLMODE: 0 = naive ReSTIR PT port
+> (volume paths unshiftable), 1 = replay, 2 = anchored (default).
+> Anchored == replay in HOMOGENEOUS media (exponential distance replay
+> is exact) - the anchor's Jacobian is distance-density-free, which is
+> what heterogeneous media will need.
+
+### Phase 10.1 — The airlight estimator fix (the ω=1 design was wrong)
+
+> **Status: DONE.** The original Phase 10 design routed camera-segment
+> in-scatter (airlight) EXCLUSIVELY through light tracing at unit MIS
+> weight ("V-buffer anchoring means no camera competitor exists"). That
+> partition is valid - and the estimator it induces has INFINITE
+> VARIANCE: the t=1 camera-connection factor grows as 1/d² as the
+> in-scatter vertex approaches the camera, and with ω = 1 nothing damps
+> it (∫(1/d⁴)·d²dd diverges; classic BDPT is immune because its eye walk
+> also samples primary-segment in-scatter and MIS drives ω → 0 as
+> d → 0). Symptoms: correct means but accumulation that never visibly
+> converges (relNoise 0.45 @ 300 accumulated spp vs BDPT's 0.065; the
+> accumulated max decayed exactly as 1/N - single mega-spike events),
+> median pixel 12% dark, hot pixels persisting. 42% of the image energy
+> rode on that channel. The paper's original Table 3 numbers (per-frame
+> relNoise 0.68/0.91) were real but the "accumulation launders it"
+> reading was wrong - the user-visible failure.
+>
+> **Fix (two halves, both required):**
+> 1. **Camera-side airlight family (truncated split).** The camera pass
+>    runs a SECOND wavefront walk per pixel (restir_wf_caminit.comp,
+>    uniform uWfVolWalk=1; the host re-clears the queue ctrl and re-runs
+>    the shade/trace/shadow rounds before camfinal). Its first vertex is
+>    a volume in-scatter point on the primary segment sampled from the
+>    TRUNCATED free-flight pdf sigma_t·Tr(t)/(1−Tr(d₁)) - it always
+>    scatters, so the surface family keeps its deterministic
+>    probability-1 anchor (fog-off behavior bit-identical, zero
+>    classification-failure band at the primary segment). The walk
+>    continues through the normal candidate blocks (NEE / s≥2 / s=0 at
+>    and after the volume vertex) on a derived seed (volSeed, stored in
+>    fSeed.w) and continues the same per-pixel RIS chain; volMask bit 0
+>    marks the family. Shifts replay the truncated draw under the
+>    destination ray and depth (WfShiftCreateJob's volume-primary
+>    branch) - the paper's "distance-sliding re-anchoring", now shipped;
+>    the truncated pdfs enter both replay-pdf products so the Eq. 53
+>    ratio prices the src/dst depth difference and identity shifts stay
+>    J = 1. MIS seeds mirror bdpt_eye's volume branch with the
+>    truncation folded in: dVCM = (N_L/i2solid)·(t²/σt)·(1−Tr(d₁)).
+> 2. **Real MIS weight on volume t=1.** Airlight candidates keep the
+>    caustic-class free-landing reuse but their ω is now the true BDPT
+>    weight against the truncated camera family: wLight = i2solid·σt /
+>    (d²·(1−Tr(d_pix))·N_L) · (dVCM + p_rev·dVC | lightweight dLW form),
+>    at creation (restir_light.comp, landing-pixel depth from the
+>    G-buffer it already loads) and at replay (restir_caustic.glsl, new
+>    gbufBase parameter: current G-buffer for the forward shift, prev
+>    for the merge's backward map). ω ~ d² as d → 0 - singularity gone.
+>
+> **Bonus: the miss-pixel airlight limitation is LIFTED.** For a
+> primary miss d₁ = ∞ ⇒ pScat = 1 (plain exponential); caminit's walk-2
+> runs for miss pixels, camfinal finalizes them, t=1 landings on miss
+> pixels are accepted, and the resolve shades their reservoirs (RIS-only
+> - the temporal/spatial passes still skip anchor-less pixels; sinit
+> round 0 copies the canonical for them instead of zeroing). Exterior
+> fog views now match the reference (0.06572 vs BDPT 0.06568).
+>
+> **Third bug, caught by the temporal identity invariant** (temporal
+> mean == RIS mean at a locked camera - the sharpest bias detector in
+> the ladder; bisected with LIGHT/CONN/CAUSTIC/MISFIX toggles): the
+> camshade s≥2 at-rc misCache cached cosLightV/d² where the shift's
+> recompute pairing needs kLight/d² - for a VOLUME LVC end kLight = σt,
+> not the unit cosine, so recomputed ω disagreed with creation's and the
+> temporal partition broke (+0.17%, connections-mode only, fog only).
+>
+> **Validation (interior camera "0.85,1.35,1.55,-0.45,0.5,-0.9", fog
+> 0.15,0.02,0.3, decorr off):** BDPT truth 0.09154. ReSTIR RIS-only
+> 0.09156, temporal-only 0.09156 (= RIS: identity invariant restored),
+> spatial-only 0.09156, default T+S 0.09160-0.09161 (+0.07% - the same
+> temporal×spatial compounding class as the surface pipeline's
+> documented −0.02...−0.04%), mode 1 0.09159, mode 0 0.09138. Pure
+> absorption 0.08608 vs BDPT 0.08604. Fog-off default 0.116472 (in
+> band). Per-frame, all reuse on: naive port relNoise 0.672 / median
+> −27% / hot 0-1; replay AND anchored 0.148 / median −3% / hot 0 (the
+> honest tie stands) - 4.5× less per-frame noise than the naive port
+> and, more importantly, accumulation now works: default fog relNoise
+> 0.043 @ 160 accumulated spp, faster per sample than the BDPT
+> reference (0.065 @ 448). Orbit and moving-duck runs: hot 0-1.
+>
+> **Cost (the honest number):** fog all-on 71 ms at 1600×900 vs 38 ms
+> surface-only (camera pass 14 → 38 ms: the airlight walk's paths never
+> die early, so it's ~a full extra walk). Replayable Russian roulette
+> on the volume walk is the obvious next lever; correctness first.
+
+### Phase 10.2 — Miss-pixel reuse + motion-stable light pick
+
+> **Status: DONE.** Two user-visible gaps in the 10.1 state:
+> anchor-less (primary-miss) pixels sampled airlight but never reused
+> it (RIS-only → the fog around the box stayed per-frame noisy), and
+> fog noise rose under camera motion, most visibly in the bright glow
+> near the lights.
+>
+> **Miss-pixel temporal reuse.** tinit's miss branch now looks up
+> history by reprojecting a representative fog point (one mean free
+> path 1/σ_t along the pixel ray) through the previous camera and
+> reuses MISS-TO-MISS only; the airlight family's truncated replay
+> (volMask bit 0) needs no surface anchor - WfShiftCreateJob rejects
+> every surface-anchored class on a miss destination (new guards) and
+> gives miss destinations an unpassable rc-footprint threshold, so the
+> offset scan can never reconnect there (symmetric with creation,
+> which never sets rc on miss pixels). The caustic passes mirror it:
+> the shift keeps miss landings, the merge runs on miss pixels with
+> the same fog-representative proxy-confidence reprojection
+> (miss-to-miss validated). Exterior per-frame relNoise 0.545 → 0.188
+> with temporal on (2.9×), means identical (0.0657); the temporal
+> identity invariant now covers miss pixels too. Spatial reuse still
+> skips them (no cluster key) - visible as slightly coarser grain
+> outside the box, not as bias.
+>
+> **Replay-stable light pick (RestirSampleLightIndex).** The ReSTIR
+> light subpath's emission pick switched from the camera-anchored
+> light-tree descent to a binary search of the power CDF (binding 10)
+> - one uniform draw, camera- and frame-INDEPENDENT, in restir_light
+> + both replay sites (restir_caustic.glsl, shiftstep t=1 round 0).
+> Under camera motion a replayed caustic/airlight path is now an
+> EXACT world-space identity (all replayed pdfs camera-independent →
+> J = 1, only the deterministic camera connection re-projects); the
+> old tree replay could descend to a different light and turn history
+> into an unrelated path (J-guard rejection or arbitrary ratios =
+> churn where fog is brightest). Side benefit: the sampled pick pdf
+> now EQUALS the RestirLightPdfs eval pdf, removing the documented
+> sampled-vs-eval weight suboptimality. Camera-side NEE keeps the
+> tree (its light points are stored, never re-picked). Costs light-
+> selection importance (power-only vs camera-anchored) - a wash on
+> this scene; revisit for many-light scenes.
+>
+> Soaks after both: fog-off 0.116480-0.116488 (in band), interior RIS
+> 0.09155 / temporal 0.09156 (= RIS) / default 0.09159 (+0.05%,
+> slightly better than 10.1's +0.07%), exterior accumulated 0.06574,
+> moving duck hot=0 with improved tails. Remaining motion noise near
+> lights is standard temporal-reuse churn (disocclusion bands +
+> re-binning coverage), bounded by the confidence cap - the M-cap
+> slider is the user-facing dial (higher = smoother fog under motion,
+> longer-lived correlation).
+
+### Phase 10.3 — Fog-parallax temporal pairing + paper rewrite
+
+> **Status: DONE.** User observation: under camera TRANSLATION, fog
+> history dies wherever the surface-anchor validation fails
+> (disocclusion bands, silhouettes) - the airlight content in front of
+> the surface is continuous there and reusable in principle.
+>
+> **Fog-parallax pairing (`restirFogPairing`, ROYALGL_RESTIR_FOGPAIR,
+> default on).** Two constraints shape the design. (1) The history
+> PAIRING must be SAMPLE-INDEPENDENT (a pairing chosen from realized
+> reservoir content breaks E[sum of MIS weights] = 1 - same rule as
+> proxy confidence). On surface-validation FAILURE only, tinit re-pairs
+> by reprojecting the mean truncated free-flight depth
+> E[t] = 1/sigma_t - d1*Tr(d1)/(1-Tr(d1)) (FogRepDistance,
+> common.glsl - closed-form G-buffer function; -> 1/sigma_t for miss).
+> (2) The fog pairing reuses the AIRLIGHT FAMILY ONLY, symmetrically in
+> both merge directions (WfShiftCreateJob gained a volOnly flag; t>=2 &&
+> volMask bit0): airlight shifts re-anchor to the destination ray and
+> never touch the surface, while letting surface classes shift across
+> disagreeing anchors is exactly what validation prevents. Static
+> cameras never trigger the fallback - all identity invariants and
+> bands bit-unchanged. New ROYALGL_DOLLY=<u/s> scripted lateral truck
+> (rocking, 2s flips) provides the PARALLAX repro that ROYALGL_ORBIT
+> (pure rotation) cannot. Measured: image-wide tail percentiles improve
+> 5-15% under fast trucking; the benefit is local to the disocclusion
+> bands (band-local metrics = future harness work).
+>
+> **Negative result (kept in the paper, Sec. 4.4):** ALSO inheriting
+> the caustic reservoir's PROXY CONFIDENCE across the fog pairing
+> drains energy progressively under sustained trucking (image mean
+> 0.10 -> 0.05 over ~20 s, monotone): inflated cV discounts the
+> canonical ~cap-fold through the backward MIS term while the re-binned
+> landing supply in the sweeping band cannot compensate, and the
+> shortfall compounds along the history chain. REVERTED - the caustic
+> proxy stays surface-validated (miss-to-miss fog projection for miss
+> pixels only). Lesson: re-pairing the REUSE (both MIS directions
+> evaluated) is safe; inheriting a bare confidence scalar asserts reuse
+> that never happens.
+>
+> **Paper rewritten** (docs/volumetric_restir_paper.pdf, 6 pages):
+> explicit numbered contributions with provenance (new vs adapted),
+> a related-work comparison table and prose positioning against
+> Volumetric ReSTIR (Lin 2021, froxel RIS, no path-space shifts) and
+> ReSTIR SSS (Werner 2024, HPG - the closest prior art: unidirectional
+> shift-mapped SSS walks anchored at object surfaces with
+> reconnection/delayed-reconnection selection heuristics [+ Guo 2025]),
+> the airlight second-moment analysis, Sec. 4.4 fog pairing incl. the
+> confidence counterexample, and the honest cost/limitation notes.
+
+### Phase 10.4 — Convergence plots + paper v3 (snapshot rewrite)
+
+> **Status: DONE.** Measurement tooling: `ROYALGL_EXPORT_SERIES=<prefix>`
+> + `ROYALGL_EXPORT_FRAMES/STRIDE` dump the averaged accum buffer as raw
+> RGBA32F per sample count (8-bit PNGs would quantize the variance
+> floors away); stats lines carry wall-clock stamps (`StatsTime`);
+> `ROYALGL_DOLLY` from 10.3. Plot suite (docs/make_plots.py -> repo-root
+> plot_convergence/equal_time/ceiling.png + column variants for the
+> paper): EXTERIOR default camera (fog-dominated view incl. miss
+> pixels), static scene, relMSE vs a 4096-spp BDPT truth. Four
+> estimators: BDPT accumulated (24 ms/spp), unidirectional PT
+> accumulated (per-frame RIS, no reuse - the non-BDPT cross-reference,
+> 30 ms), ReSTIR PT unidirectional per-frame (light+conn OFF, 44 ms),
+> full ReSTIR BDPT per-frame (50 ms). Results: frame 1 relMSE 1.12
+> (ours) vs 11.9 (ReSTIR PT); frame 8: 0.21 vs 1.66 (7.9x); per-frame
+> floors 0.140 vs 0.847 (6.1x - the bidirectionality dividend in
+> media); accumulated PT needs 112 frames to reach our per-frame floor,
+> accumulated BDPT crosses it at frame 16 (static-scene accumulation
+> eventually wins, as expected). Diagram figures for the paper
+> (docs/make_diagrams.py): replay+mask shift, volume-anchor
+> reconnection, airlight family split.
+>
+> **Paper v3** (docs/make_paper.py, 7 pages): snapshot style per review
+> feedback - no project history or negative-result narration, no
+> em-dashes, professional register; explanatory diagrams (Figs. 2-4) +
+> two pseudocode listings that diff the volumetric additions against
+> the GRIS procedures; displayed equations with symbol lists (free
+> flight/truncated densities, volume-measure Jacobian derivation,
+> airlight second-moment divergence, the t=1 MIS weight); ONE numeric
+> table (unbiasedness) + the qualitative design-space comparison
+> (Lin 2021 / Werner 2024 / ours); teaser + all plots on the exterior
+> view; the naive mode-0 curve dropped from all figures.
 
 ---
 

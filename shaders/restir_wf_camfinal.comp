@@ -25,7 +25,9 @@ void main()
     if (idx >= RestirPixelCount()) return;
 
     GBufferPixel g = RestirLoadGBuf(GBufCurOffset() + idx);
-    if (g.posDepth.w < 0.0) return; // caminit already wrote the empty pair
+    // Miss pixels finalize too when the fog scatters: the airlight walk
+    // (caminit uWfVolWalk=1) ran for them and t=1 airlight lands there.
+    if (g.posDepth.w < 0.0 && !FogScatterEnabled()) return;
 
     uint base = WfCamBase(idx);
     uint outSlot = RestirRegionOffset(RestirCandidateOutRegion()) + idx;

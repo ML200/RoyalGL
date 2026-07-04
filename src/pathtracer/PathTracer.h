@@ -121,11 +121,6 @@ namespace RoyalGL
         Buffer m_wfArenaBuffer{BufferType::ShaderStorage, 16};
         Buffer m_wfQueueBuffer{BufferType::ShaderStorage, 17};
         bool m_restirSupported = true; // enough SSBO bindings for wavefront
-        // ROYALGL_RESTIR_CAUSTIC=0: skip the caustic temporal passes
-        // (shift + merge) - the caustic reservoir then holds only the
-        // per-frame canonical RIS result. Isolation switch for chasing
-        // temporal transients to the caustic vs the path reservoir.
-        bool m_causticPassesEnabled = true;
         uint32_t m_restirParity = 0;
         int m_restirWidth = 0;  // resolution the ReSTIR buffers were sized for
         int m_restirHeight = 0;
@@ -138,6 +133,10 @@ namespace RoyalGL
         uint32_t m_frameCounter = 0; // never reset - decorrelates ReSTIR frames
 
         void EnsureRestirBuffers();
+        // N_L is a live setting (RenderSettings::restirLightPaths); this
+        // clamps it and reallocates the N_L-sized buffers on change.
+        void EnsureLightPathBuffers(uint32_t requested);
+        uint32_t m_lightPathsRequested = 262144; // last requested N_L (pre-clamp)
 
         // GL_TIME_ELAPSED queries per pass, double-buffered so reading back
         // the previous frame's results never stalls. Enabled via

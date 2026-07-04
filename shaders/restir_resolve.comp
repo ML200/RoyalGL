@@ -34,7 +34,23 @@ void main()
     vec3 color;
     if (g.posDepth.w < 0.0)
     {
-        color = uFrame.background.rgb * uFrame.background.a;
+        if (FogScatterEnabled())
+        {
+            // Miss pixels carry the airlight family (untruncated primary
+            // in-scatter walk) + t=1 landings in the caustic reservoir; the
+            // environment itself is unreachable through infinite fog
+            // (Tr -> 0). RIS-only (no reuse passes touch miss pixels), so
+            // always the winner-only expression.
+            CausticReservoir c = pixelRes[RestirRegionOffset(RestirFinalRegion()) + idx].caustic;
+            PathReservoir r = pixelRes[RestirRegionOffset(RestirFinalRegion()) + idx].path;
+            color = r.rcInfo.z * r.fSeed.xyz * r.core.x
+                  + c.meta.x * c.fSeed.xyz * c.core.x;
+        }
+        else
+        {
+            color = FogEnabled() ? vec3(0.0)
+                                 : uFrame.background.rgb * uFrame.background.a;
+        }
     }
     else
     {

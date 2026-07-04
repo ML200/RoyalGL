@@ -74,6 +74,7 @@ const uint WF_CAMF_PREVCONN = 2u;
 uint WfCamFlagsDeltaMask(uint f) { return (f >> 8) & 0xFFu; }
 uint WfCamFlagsRcIdx(uint f) { return (f >> 16) & 0xFu; }
 uint WfCamFlagsRcInst(uint f) { return (f >> 20) & 0xFu; }
+uint WfCamFlagsVolMask(uint f) { return (f >> 24) & 0xFFu; }
 
 // Shade queue entries: pixel index | absorb-only flag in the top bit (the
 // path died at the BSDF sample but round k's candidates still await their
@@ -122,8 +123,8 @@ void WfCamAbsorb(uint base, uint cnd, uint outSlot, inout float wSum, inout uint
         vec4 rcExt = wfArena[base + 9u];
         uint rcInst = WfCamFlagsRcInst(floatBitsToUint(wfArena[base + 1u].w));
         uint tech = floatBitsToUint(meta.y);
-        uint rr = (tech >> 20) & 0xFu;      // rcIdx (flags bits 4-7 << 16)
-        uint tt = (tech >> 8) & 0xFFu;
+        uint rr = RestirFlagsRcIndex(RestirTechFlags(tech));
+        uint tt = RestirTechT(tech);
         pixelRes[outSlot].path.rcInfo = vec4(fArr.w, rcExt.x, omega, rcNrm.w);
         pixelRes[outSlot].path.rcPosMat = rcPos;
         pixelRes[outSlot].path.rcNormal = vec4(rcNrm.xyz, uintBitsToFloat(rcInst));

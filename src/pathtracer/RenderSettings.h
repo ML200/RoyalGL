@@ -51,6 +51,23 @@ namespace RoyalGL
         // typically) for much faster firefly/blob decay. Off = exactly
         // unbiased (soak mode). Env: ROYALGL_RESTIR_DECORR.
         bool restirDecorrelate = true;
+        // Fog-parallax temporal pairing (env ROYALGL_RESTIR_FOGPAIR): when
+        // the surface-anchor history validation fails under camera motion,
+        // re-pair with the pixel that saw the same FOG (representative
+        // in-scatter depth reprojection, sample-independent) and reuse the
+        // airlight family only. Off = ablation baseline (fog history dies
+        // with the surface anchor).
+        bool restirFogPairing = true;
+        // Volumetric shift mode (env ROYALGL_RESTIR_VOLMODE):
+        //  0 = naive ReSTIR PT port: paths containing volume vertices
+        //      cannot shift at all (single-frame candidates),
+        //  1 = replay-extended: distance replay + scatter-classification
+        //      masks make volume paths shiftable by random replay,
+        //  2 = volume-anchored (default, ours): additionally, volume
+        //      vertices qualify as reconnection anchors (volume-measure
+        //      Jacobians, phase-footprint criteria).
+        // All modes are unbiased; they differ in reuse efficiency.
+        int restirVolumeMode = 2;
         // Confidence (M) cap for all reuse passes (paper uses 20): bounds
         // the effective temporal sample count a reservoir can claim.
         // Lower = fresher (outliers and stale history wash out in fewer
@@ -62,6 +79,17 @@ namespace RoyalGL
         // into per-pixel reservoirs through the LRM, with caustic paths in
         // a second reservoir. Off = Phase 1 camera-side techniques only.
         bool restirLightTracing = true;
+        // Caustic temporal reuse (Phase 3 shift + merge passes). Off = the
+        // caustic reservoir holds only the per-frame canonical RIS result -
+        // the isolation switch for chasing temporal transients to the
+        // caustic vs the path reservoir. Env: ROYALGL_RESTIR_CAUSTIC.
+        bool restirCausticReuse = true;
+        // Light subpaths traced per frame (N_L, paper Alg. 1). Sizes the
+        // LVC / light-vertex-count / LRM buffers (PathTracer reallocates on
+        // change) and enters the t<=1 MIS weights as 1/N_L. Clamped to
+        // [4096, min(pixelCount, 262144)]. Lower = cheaper light pass but
+        // sparser t=1/LRM coverage per pixel. Env: ROYALGL_RESTIR_NL.
+        int restirLightPaths = 262144;
         // Phase 4 full BDPT: s>=2 vertex connections against the compacted
         // global LVC. Off = lightweight mode; the MIS weights track the
         // active technique set either way.
@@ -79,6 +107,15 @@ namespace RoyalGL
         // that recompute amplified - is gone since t=1 candidates are
         // anchored at creation.) See RESTIR_BDPT_PLAN.md.
         bool restirRecomputeMis = true;
+
+        // Homogeneous global medium ("fog"): analytic Beer-Lambert model
+        // with a Henyey-Greenstein phase function - exact for a homogeneous
+        // medium. Coefficients are per world unit; the Cornell box is ~2
+        // units across, so sigma ~0.1-0.3 gives thin-to-moderate fog.
+        bool fogEnable = false;
+        float fogSigmaS = 0.15f; // scattering coefficient
+        float fogSigmaA = 0.02f; // absorption coefficient
+        float fogG = 0.0f;       // HG anisotropy (-1..1, 0 = isotropic)
 
         // Global: off = every pipeline overwrites the image with its latest
         // sample instead of averaging, so naive PT / NEE / BDPT / ReSTIR
@@ -104,10 +141,18 @@ namespace RoyalGL
                    restirSpatialNeighbors == other.restirSpatialNeighbors &&
                    restirStratified == other.restirStratified &&
                    restirDecorrelate == other.restirDecorrelate &&
+                   restirVolumeMode == other.restirVolumeMode &&
+                   restirFogPairing == other.restirFogPairing &&
                    restirConfidenceCap == other.restirConfidenceCap &&
                    restirLightTracing == other.restirLightTracing &&
+                   restirCausticReuse == other.restirCausticReuse &&
+                   restirLightPaths == other.restirLightPaths &&
                    restirConnections == other.restirConnections &&
                    restirRecomputeMis == other.restirRecomputeMis &&
+                   fogEnable == other.fogEnable &&
+                   fogSigmaS == other.fogSigmaS &&
+                   fogSigmaA == other.fogSigmaA &&
+                   fogG == other.fogG &&
                    accumulate == other.accumulate &&
                    cameraMode == other.cameraMode &&
                    lens == other.lens;

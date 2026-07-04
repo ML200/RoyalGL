@@ -78,8 +78,8 @@ void ConnectLightToLens(vec3 pos, vec3 lightN, vec3 Le, float pdfA)
     }
 }
 
-void ConnectToCamera(vec3 pos, vec3 n, vec3 wi, Material mat, vec3 throughput,
-                     float dVCM, float dVC)
+void ConnectToCamera(vec3 pos, vec3 n, vec3 wi, Material mat, bool isVolume,
+                     vec3 throughput, float dVCM, float dVC)
 {
     vec3 toCam = uFrame.camPos.xyz - pos;
     float dist2 = dot(toCam, toCam);
@@ -95,29 +95,52 @@ void ConnectToCamera(vec3 pos, vec3 n, vec3 wi, Material mat, vec3 throughput,
         float cosAtCam;
         if (!BdptDirToPixel(-dirToCam, pixel, cosAtCam)) return;
 
-        float bsdfDirPdfW, bsdfRevPdfW, cosToCam;
-        vec3 f = EvalBsdf(mat, n, wi, dirToCam, bsdfDirPdfW, bsdfRevPdfW, cosToCam);
+        float bsdfDirPdfW, bsdfRevPdfW, cosToCam, kToCam;
+        vec3 f;
+        if (isVolume)
+        {
+            // Volume vertex: phase scatter, no cosine in the contribution;
+            // the eye pdf's measure factor at the vertex is sigma_t.
+            f = EvalPhase(-wi, dirToCam, bsdfDirPdfW, bsdfRevPdfW);
+            cosToCam = 1.0;
+            kToCam = FogSigmaT();
+        }
+        else
+        {
+            f = EvalBsdf(mat, n, wi, dirToCam, bsdfDirPdfW, bsdfRevPdfW, cosToCam);
+            kToCam = cosToCam;
+        }
         if (f == vec3(0.0)) return;
 
         // Pdf of the eye pass generating this vertex by tracing through
-        // that pixel, per unit surface area (SmallVCM imageToSurfaceFactor).
+        // that pixel, per unit surface area / volume (SmallVCM
+        // imageToSurfaceFactor; the volume variant carries sigma_t in the
+        // MIS conversion but NOT in the contribution).
         float ipd = BdptImagePlaneDist();
         float imagePointToCamDist = ipd / cosAtCam;
         float imageToSolidAngle = (imagePointToCamDist * imagePointToCamDist) / cosAtCam;
         float imageToSurface = imageToSolidAngle * cosToCam / dist2;
 
-        float wLight = (imageToSurface / numLightPaths) * (dVCM + dVC * bsdfRevPdfW);
+        float wLight = (imageToSolidAngle * kToCam / dist2 / numLightPaths)
+                       * (dVCM + dVC * bsdfRevPdfW);
         float misWeight = 1.0 / (wLight + 1.0);
 
-        vec3 nf = (dot(n, dirToCam) >= 0.0) ? n : -n;
-        Ray shadowRay = MakeRay(pos + nf * 1e-4, dirToCam);
+        Ray shadowRay;
+        if (isVolume)
+            shadowRay = MakeRay(pos, dirToCam);
+        else
+        {
+            vec3 nf = (dot(n, dirToCam) >= 0.0) ? n : -n;
+            shadowRay = MakeRay(pos + nf * 1e-4, dirToCam);
+        }
         if (IntersectSceneOccluded(shadowRay, ShadowTMax(dist))) return;
 
-        vec3 contrib = misWeight * throughput * f * imageToSurface / numLightPaths;
+        vec3 contrib = misWeight * throughput * f * FogTr(dist) * imageToSurface / numLightPaths;
         if (any(isnan(contrib)) || any(isinf(contrib))) return;
         BdptSplat(pixel, contrib);
         return;
     }
+    if (isVolume) return; // fog + physical lens: t=1 volume splats unsupported
 
     // -------------------------------------- lens camera (paper 4.3) ------
     // Deterministic connection to the lens: sample a point on the front
@@ -263,7 +286,60 @@ void main()
     for (uint iter = 0u; iter < BDPT_MAX_LIGHT_VERTS; ++iter)
     {
         Hit hit;
-        if (!IntersectScene(ray, hit)) break;
+        bool surfHit = IntersectScene(ray, hit);
+
+        // Homogeneous fog free-flight (identical scheme to the eye walk;
+        // RNG_DIST stream keyed by the light-side vertex index).
+        bool volScatter = false;
+        if (FogEnabled())
+        {
+            RngStream(pathLength, RNG_DIST);
+            float tS = FogSampleDist(RandomFloat());
+            if (tS < (surfHit ? hit.t : 1e30)) { volScatter = true; hit.t = tS; }
+        }
+        if (!surfHit && !volScatter) break;
+
+        if (volScatter)
+        {
+            // ------------------------- volume scattering vertex ----------
+            vec3 vPos = ray.origin + ray.dir * hit.t;
+            float sigmaT = FogSigmaT();
+            dVCM *= hit.t * hit.t / sigmaT;
+            dVC /= sigmaT;
+            // 1/sigma_t at arrival (see bdpt_eye.comp): connections at this
+            // vertex multiply sigma_s*phase themselves.
+            throughput /= sigmaT;
+
+            vec3 wiV = -ray.dir;
+            if (stored < BDPT_MAX_LIGHT_VERTS)
+            {
+                LightVertex v;
+                v.posDvcm = vec4(vPos, dVCM);
+                v.normalDvc = vec4(0.0, 0.0, 1.0, dVC); // no normal at a volume vertex
+                v.tputMat = vec4(throughput, uintBitsToFloat(MAT_VOLUME));
+                v.wiLen = vec4(wiV, float(pathLength));
+                lightVerts[pathIdx * BDPT_MAX_LIGHT_VERTS + stored] = v;
+                stored++;
+            }
+            if (pathLength + 1u <= maxLen)
+            {
+                RngStream(pathLength, RNG_CAMCONN);
+                ConnectToCamera(vPos, vec3(0.0, 0.0, 1.0), wiV, materials[0], true,
+                                throughput, dVCM, dVC);
+            }
+            if (pathLength + 2u > maxLen) break;
+
+            RngStream(pathLength, RNG_BSDF);
+            float pdfPhase;
+            vec3 dir = SamplePhaseHG(ray.dir, FogG(), RandomFloat2(), pdfPhase);
+            if (pdfPhase <= 0.0) break;
+            dVC = (sigmaT / pdfPhase) * (dVC * pdfPhase + dVCM);
+            dVCM = 1.0 / pdfPhase;
+            throughput *= FogSigmaS(); // arrival carried 1/sigma_t already
+            pathLength++;
+            ray = MakeRay(vPos, dir);
+            continue;
+        }
 
         vec3 hitPos = ray.origin + ray.dir * hit.t;
         float cosIn = abs(dot(hit.normal, ray.dir));
@@ -299,7 +375,7 @@ void main()
             if (pathLength + 1u <= maxLen)
             {
                 RngStream(pathLength, RNG_CAMCONN);
-                ConnectToCamera(hitPos, hit.normal, wi, mat, throughput, dVCM, dVC);
+                ConnectToCamera(hitPos, hit.normal, wi, mat, false, throughput, dVCM, dVC);
             }
         }
 

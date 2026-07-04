@@ -86,6 +86,12 @@ namespace RoyalGL
         // for temporal-reuse transients that locked-camera soaks can't see.
         float m_orbitSpeed = 0.0f;
         float m_orbitPhase = 0.0f;
+        // ROYALGL_DOLLY=<units/s>: scripted lateral truck (rocking along the
+        // camera right axis, flip every 2s) - PARALLAX, which pure rotation
+        // never produces: the repro case for reprojection-pairing losses
+        // (fog history vs surface anchors under translation).
+        float m_dollySpeed = 0.0f;
+        float m_dollyPhase = 0.0f;
         // ROYALGL_MOVE=<rad/s>: scripted oscillation of the last instance -
         // headless exercise of the async BLAS/TLAS rebuild path.
         float m_moveTestSpeed = 0.0f;

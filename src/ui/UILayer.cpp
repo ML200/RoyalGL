@@ -127,6 +127,17 @@ namespace RoyalGL
         }
 
         ImGui::Separator();
+        ImGui::Checkbox("Fog (homogeneous medium)", &settings.fogEnable);
+        if (settings.fogEnable)
+        {
+            ImGui::SliderFloat("Scattering sigma_s", &settings.fogSigmaS, 0.0f, 1.0f, "%.3f",
+                                ImGuiSliderFlags_Logarithmic);
+            ImGui::SliderFloat("Absorption sigma_a", &settings.fogSigmaA, 0.0f, 1.0f, "%.3f",
+                                ImGuiSliderFlags_Logarithmic);
+            ImGui::SliderFloat("Anisotropy g (HG)", &settings.fogG, -0.9f, 0.9f);
+        }
+
+        ImGui::Separator();
         ImGui::Checkbox("ReSTIR BDPT", &settings.enableRestir);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Off: plain progressive BDPT (the unbiased reference pipeline).");
@@ -137,6 +148,31 @@ namespace RoyalGL
             ImGui::Checkbox("Light tracing (t=1)", &settings.restirLightTracing);
             ImGui::Checkbox("Vertex connections (s>=2)", &settings.restirConnections);
             ImGui::Checkbox("Recompute shift MIS (unbiased)", &settings.restirRecomputeMis);
+            if (settings.restirLightTracing || settings.restirConnections)
+            {
+                ImGui::SliderInt("Light subpaths (N_L)", &settings.restirLightPaths, 4096, 262144,
+                                 "%d", ImGuiSliderFlags_Logarithmic);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Light subpaths traced per frame (paper Alg. 1). Enters the\n"
+                                      "t<=1 MIS weights as 1/N_L; sizes the LVC/LRM buffers\n"
+                                      "(reallocated live). Lower = cheaper light pass, sparser\n"
+                                      "t=1 coverage per pixel.");
+            }
+            if (settings.fogEnable)
+            {
+                int volIdx = settings.restirVolumeMode;
+                const char* volNames[] = {"Naive port (volume paths unshiftable)",
+                                          "Replay (masks + distance replay)",
+                                          "Volume-anchored (ours)"};
+                if (ImGui::Combo("Volumetric shifts", &volIdx, volNames, 3))
+                    settings.restirVolumeMode = volIdx;
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("How shift mappings treat paths with volume scattering\n"
+                                      "vertices (all modes unbiased, they differ in reuse):\n"
+                                      "naive = every volume-bearing shift fails (ReSTIR PT port),\n"
+                                      "replay = free-flight replay + classification masks,\n"
+                                      "anchored = + volume vertices as reconnection anchors.");
+            }
             ImGui::Checkbox("Temporal reuse", &settings.restirTemporal);
             if (settings.restirTemporal)
             {
@@ -145,6 +181,23 @@ namespace RoyalGL
                     ImGui::SetTooltip("Adaptively lowers the temporal confidence cap where many\n"
                                       "pixels share one sample (ReSTIR PT Enhanced). Kills firefly\n"
                                       "blobs/streaks at the cost of a small bias; off = unbiased.");
+                if (settings.restirLightTracing)
+                {
+                    ImGui::Checkbox("Caustic temporal reuse", &settings.restirCausticReuse);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Replay + re-bin the caustic/airlight reservoirs across\n"
+                                          "frames (Phase 3). Off = per-frame canonical RIS only -\n"
+                                          "the isolation switch for temporal transients.");
+                }
+                if (settings.fogEnable)
+                {
+                    ImGui::Checkbox("Fog-parallax history pairing", &settings.restirFogPairing);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("When the surface-anchor validation fails (disocclusion\n"
+                                          "under camera motion), re-pair history by reprojecting the\n"
+                                          "mean in-scatter depth and reuse the airlight family only.\n"
+                                          "Keeps fog history alive across silhouettes; off = ablation.");
+                }
             }
             ImGui::Checkbox("Spatial reuse", &settings.restirSpatial);
             if (settings.restirSpatial)
@@ -154,6 +207,11 @@ namespace RoyalGL
                     ImGui::SetTooltip("Antithetic stratified picks from the 16x16-block sorted\n"
                                       "candidate histogram (Salaün 2025). Even counts pair\n"
                                       "antithetically; the paper recommends 4.");
+                ImGui::Checkbox("Stratified candidate picks", &settings.restirStratified);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Histogram-stratified antithetic selection (Salaün 2025).\n"
+                                      "Off = uniform random picks from the same clustered pool\n"
+                                      "(A/B isolation of the stratification benefit; both unbiased).");
             }
             if (settings.restirTemporal || settings.restirSpatial)
             {

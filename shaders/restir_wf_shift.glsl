@@ -107,7 +107,15 @@ void WfJobComplete(uint jb, vec3 f, float replayPdf, float J,
 // here is ray-free; jobs that need replay work are enqueued into step
 // round 0, trivial and impossible shifts complete immediately. The caller
 // guarantees the destination anchor exists (non-miss G-buffer entry).
-void WfShiftCreateJob(uint jobIdx, uint baseSlot, uint dstIdx, bool isPrev)
+//
+// volOnly = fog-paired merges (restir_wf_tinit.comp's fog-fallback and
+// miss-pixel pairings): only the AIRLIGHT family (t>=2, volMask bit 0)
+// shifts - it re-anchors to the destination ray and never references the
+// surface anchor. Every surface-anchored class fails SYMMETRICALLY in both
+// merge directions, so the partition stays exact: a fog pairing must not
+// let surface paths random-walk across anchors that failed (or never had)
+// surface validation.
+void WfShiftCreateJob(uint jobIdx, uint baseSlot, uint dstIdx, bool isPrev, bool volOnly)
 {
     uint jb = WfShiftJobBase(jobIdx);
     uint jobBaseSlot = baseSlot;
@@ -124,12 +132,17 @@ void WfShiftCreateJob(uint jobIdx, uint baseSlot, uint dstIdx, bool isPrev)
     uint t = RestirTechT(tech);
     uint flags = RestirTechFlags(tech);
 
+    if (volOnly && !(t >= 2u && (RestirFlagsVolMask(flags) & 1u) != 0u))
+        return; // fog pairing: airlight family only (t=1 masks cover the
+                // LIGHT subpath - bit 0 means y_1 there, not this family)
+
     if (t == 1u)
     {
         // Reverse hybrid shift prologue (RestirShiftLightPath's early
         // rejections); the light replay itself starts in step round 0.
         if ((flags & RESTIR_FLAG_CAUSTIC) != 0u) return; // caustics never here
         if (s < 2u) return;
+        if (dstG.posDepth.w < 0.0) return; // anchored t=1 needs a surface
         Material mX1 = materials[GBufMaterial(dstG)];
         if (MatIsDelta(mX1)) return;
         if (dot(mX1.emissive.rgb, mX1.emissive.rgb) > 0.0) return;
@@ -146,6 +159,7 @@ void WfShiftCreateJob(uint jobIdx, uint baseSlot, uint dstIdx, bool isPrev)
     {
         // Directly visible emitter: the shifted path is just the new
         // primary hit - no rays, complete inline.
+        if (dstG.posDepth.w < 0.0) return; // no emitter on a miss pixel
         uint matId = GBufMaterial(dstG);
         Material m1 = materials[matId];
         if (dot(m1.emissive.rgb, m1.emissive.rgb) <= 0.0) return;
@@ -153,9 +167,67 @@ void WfShiftCreateJob(uint jobIdx, uint baseSlot, uint dstIdx, bool isPrev)
         vec3 lightN = (lightIdx != LT_SENTINEL) ? lightTris[lightIdx].normalArea.xyz : dstG.normalMat.xyz;
         if (dot(lightN, dstWi) <= 1e-6) return;
         // omega: 1 either way (s=0 is the only sampler of this path).
-        WfJobComplete(jb, m1.emissive.rgb, 1.0, 1.0, 0.0, 0.0, RS_BASE.rcInfo.z, false);
+        WfJobComplete(jb, m1.emissive.rgb * FogTr(dstG.posDepth.w), 1.0, 1.0,
+                      0.0, 0.0, RS_BASE.rcInfo.z, false);
         return;
     }
+
+    if ((RestirFlagsVolMask(flags) & 1u) != 0u)
+    {
+        // ------------------- airlight family: volume-primary replay ------
+        // The base path's first vertex is a truncated primary in-scatter
+        // point (restir_wf_caminit.comp walk 2). The shift replays the
+        // SAME free-flight draw under the destination pixel's ray and
+        // depth ("distance-sliding re-anchoring"): the truncated draw
+        // always scatters, so this family has NO classification-failure
+        // band at the primary segment; the truncated pdfs enter the
+        // replayed-pdf product on both sides, pricing the src/dst depth
+        // difference through the Eq. 53 ratio (identity shifts stay J=1).
+        if (!RestirVolShiftEnabled()) return; // mode 0: not shiftable
+        float pScat = FogScatterProb(dstG.posDepth.w);
+        if (pScat <= 1e-7) return;
+
+        g_rngSeed = floatBitsToUint(RS_BASE.fSeed.w); // the stored volSeed
+        RngStream(1u, RNG_DIST);
+        float tS = FogSampleDistTrunc(RandomFloat(), pScat);
+        vec3 rayDir = -dstWi;
+        vec3 x1 = WfDstCamPos(isPrev) + rayDir * tS;
+        float trSeg = FogTr(tS);
+
+        float dVCM = 0.0, dT1 = 0.0;
+        if (RestirLightTracingEnabled())
+        {
+            float cosAtCam = dot(WfDstCamForward(isPrev), rayDir);
+            if (cosAtCam > 1e-3)
+            {
+                float imagePointToCamDist = WfDstIpd(isPrev) / cosAtCam;
+                float cameraPdfW = (imagePointToCamDist * imagePointToCamDist) / cosAtCam;
+                dVCM = (float(uFrame.lightInfo.z) / cameraPdfW)
+                     * (tS * tS / max(FogSigmaT(), 1e-8)) * pScat;
+                dT1 = dVCM;
+            }
+        }
+
+        wfArena[jb + 1u] = vec4(x1, uintBitsToFloat(0u));
+        wfArena[jb + 2u] = vec4(0.0, 0.0, 1.0, 0.0);
+        wfArena[jb + 3u] = vec4(dstWi, 0.0);
+        wfArena[jb + 4u] = vec4(vec3(trSeg), FogSigmaT() * trSeg / pScat);
+        wfArena[jb + 5u] = vec4(dVCM, 0.0, dT1, 1.0);
+        // Miss destinations have no primary footprint: an unpassable
+        // threshold keeps the offset scan from ever reconnecting there,
+        // matching creation (camshade never sets rc on a miss pixel) and
+        // rejecting interior-rc paths symmetrically.
+        float cosPrim = abs(dot(dstG.normalMat.xyz, dstWi));
+        float rcT = (dstG.posDepth.w < 0.0)
+                        ? 1e30 : RestirRcFootThreshold(dstG.posDepth.w, cosPrim);
+        wfArena[jb + 10u] = vec4(0.0, uintBitsToFloat(0u), rcT, 0.0);
+        wfArena[jb].z = uintBitsToFloat(WF_JOB_RUNNING);
+        WfAppend(WfCtrlShade(0u), WfShiftStepQBase(0u), jobIdx);
+        return;
+    }
+
+    // Every remaining class replays from the destination's SURFACE anchor.
+    if (dstG.posDepth.w < 0.0) return;
 
     // Camera-side replay from the destination anchor: seed the state the
     // megakernel sets up before its vertex loop.
@@ -180,7 +252,9 @@ void WfShiftCreateJob(uint jobIdx, uint baseSlot, uint dstIdx, bool isPrev)
     wfArena[jb + 1u] = vec4(dstG.posDepth.xyz, dstG.normalMat.w);
     wfArena[jb + 2u] = vec4(dstG.normalMat.xyz, 0.0);
     wfArena[jb + 3u] = vec4(dstWi, 0.0);
-    wfArena[jb + 4u] = vec4(1.0, 1.0, 1.0, 1.0);
+    // f starts at the destination's primary-segment transmittance (mirrors
+    // caminit: the deterministic anchor segment contributes Tr to f only).
+    wfArena[jb + 4u] = vec4(vec3(FogTr(dstG.posDepth.w)), 1.0);
     wfArena[jb + 5u] = vec4(dVCM, dVC, dT1, 1.0);
     // Reconnection-criteria state for the camera replay (slot 10): the
     // destination pixel's footprint threshold; pdf/eligibility of the

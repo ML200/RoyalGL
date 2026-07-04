@@ -66,6 +66,12 @@ namespace RoyalGL
                                    // bit2 spatial, bit3 accumulate, bit4 light tracing),
                                    // z=frame counter (never reset), w=ping-pong parity
 
+        // Homogeneous global medium ("fog"): scattering / absorption
+        // coefficients (1/world unit), Henyey-Greenstein anisotropy g, and
+        // the enable flag. Analytic Beer-Lambert model - exact for a
+        // homogeneous medium (no tracking needed).
+        glm::vec4 fogParams;       // x=sigma_s, y=sigma_a, z=HG g, w=enabled (0/1)
+
         // Instance transforms for OBJECT-SPACE reservoir / G-buffer surface
         // storage: positions that persist across frames (G-buffer halves,
         // reservoir reconnection vertices, cached light-subpath ends, NEE
