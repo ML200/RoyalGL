@@ -235,6 +235,61 @@ bool RestirVolShiftEnabled()     { return (uFrame.restirParams.y & 1024u) != 0u;
 // in-scatter depth and reuse the airlight family only. Off = fog history
 // dies with the surface anchor (ablation baseline).
 bool RestirFogPairingEnabled()   { return (uFrame.restirParams.y & 2048u) != 0u; }
+// Spatial candidate selection & MIS family (ROYALGL_RESTIR_SPMODE, carried
+// in the free prevCameraParams.z): 0 = pair mixture over rank-selected
+// candidates (linear over rounds), 1 = SPMIS baseline (Hedstrom et al.
+// 2026: with-replacement draws proportional to c*pHat(X)*W from the
+// cluster-run CDF, one reservoir chain with stochastic pairwise MIS),
+// 2 = history-guided (SPMIS weights x learned shift-survival ratio;
+//     ablation arm - measured a wash on our scenes, see the research log).
+uint RestirSpatialMode()         { return uint(uFrame.prevCameraParams.z + 0.5); }
+// Mode 2 ablation (ROYALGL_RESTIR_VSCORE=0): drop the learned
+// shift-survival factor - mode 2 then degenerates to exactly mode 1.
+bool RestirShiftScoreEnabled()   { return (uFrame.restirParams.y & 4096u) != 0u; }
+// SPMIS cell search (ROYALGL_RESTIR_CELLSEARCH, modes >= 1): growing-radius
+// WRS over probed pixels' cluster runs, weighted by run confidence mass
+// (Hedstrom et al. 2026 Sec. 5.1). Off = own-block run only.
+bool RestirCellSearchEnabled()   { return (uFrame.restirParams.y & 8192u) != 0u; }
+// Cell-search shape (ROYALGL_RESTIR_SEARCH_ITERS/_RADIUS), packed in the
+// upper flag bits by PathTracer: probe count and initial radius in pixels.
+uint  RestirSearchIters()        { return (uFrame.restirParams.y >> 16) & 31u; }
+float RestirSearchRadius()       { return float((uFrame.restirParams.y >> 21) & 255u); }
+// Starvation gate (ROYALGL_RESTIR_SEARCH_GATE): 0 = the paper's
+// unconditional probe, 1 = probe only near-empty runs (count <= 2),
+// 2 = additionally probe on the tinit no-usable-history flag, 3 = probe
+// zero-selection-mass runs with probes weighted by THEIR selection mass -
+// BIASED ablation arm (see restir_wf_sinit.comp for the branch-accounting
+// argument), never a default. Measured: unconditional probing replaces
+// close partners with distant ones and costs 20-45% whole-image noise
+// under motion at steady state; even wide fresh disocclusion strips reuse
+// better among themselves than from distant high-confidence runs, so only
+// genuinely partnerless pixels should ever search.
+uint RestirSearchGateMode()      { return (uFrame.restirParams.y >> 29) & 3u; }
+// Mode-2 history-guided selection knobs (ROYALGL_RESTIR_EMA/_DEFMIX).
+float RestirScoreEmaRate()       { return uFrame.spmisParams.x; }
+float RestirScoreDefMix()        { return uFrame.spmisParams.y; }
+// Quantized-normal cluster term (ROYALGL_RESTIR_CLUSTER_NORMAL): key
+// cluster runs on the normal octant in addition to instance+material
+// (paper Sec. 5.1 faithfulness; affects ALL spatial modes' clustering).
+bool RestirClusterNormalEnabled(){ return (uFrame.restirParams.y & 0x80000000u) != 0u; }
+// Dual-direction shift diagnostic (ROYALGL_RESTIR_SHIFTDIAG, mode 1,
+// temporal off, K >= 5): round 1 re-uses the idle backward job slot to
+// run the FORWARD shift of the SAME (canonical, z') pair round 0 shifted
+// backward, and smerge tallies support/value asymmetries between the two
+// directions into the learn region (never the estimator). Sub-modes pick
+// the two accumulated quantities (see restir_wf_smerge.comp).
+uint RestirShiftDiagMode()       { return uint(uFrame.spmisParams.z + 0.5); }
+// Diagnostic involutive pair distance in pixels (0 = own-run pairs).
+float RestirShiftDiagDist()      { return uFrame.spmisParams.w; }
+// Probe-guided selection (ROYALGL_RESTIR_PSEL, mode 1): per-block probe
+// shifts measure the ideal selection weight w^_r = S_r * rho* * m* per
+// (target block, source run); candidates then draw from the union of the
+// own and probed runs through a two-level CDF whose EXACT mixed
+// probability rides jb.w - value dependence lives inside the compensated
+// per-draw P, membership is value-independent (no gate-3 trap). Replaces
+// the cell search while active. (Bit 16384 previously belonged to the
+// removed two-stage experiment.)
+bool RestirPselEnabled()         { return (uFrame.restirParams.y & 16384u) != 0u; }
 
 // ---------------------------------------------- MIS eval light pdfs ------
 // EVAL pick pdf for every ReSTIR MIS quantity: the power-proportional CDF

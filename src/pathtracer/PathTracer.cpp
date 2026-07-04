@@ -62,6 +62,8 @@ namespace RoyalGL
           m_wfSInitShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_wf_sinit.comp")),
           m_wfSMergeShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_wf_smerge.comp")),
           m_wfSSortShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_wf_ssort.comp")),
+          m_wfPSelShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_wf_psel.comp")),
+          m_wfPFinShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_wf_pfin.comp")),
           m_wfDupMapShader(Shader::CreateCompute(std::filesystem::path(ROYALGL_SHADER_DIR) / "restir_wf_dupmap.comp"))
     {
         m_timersEnabled = (std::getenv("ROYALGL_STATS") != nullptr);
@@ -167,6 +169,32 @@ namespace RoyalGL
                                            GL_UNSIGNED_INT, nullptr));
     }
 
+    std::vector<float> PathTracer::ReadLearnRegion() const
+    {
+        if (!m_restirSupported || m_width <= 0 || m_height <= 0 || !m_wfArenaBuffer.IsValid())
+            return {};
+        size_t pixelCount = size_t(m_width) * size_t(m_height);
+        // Arena region [63N, 64N): one vec4 per pixel (score EMA,
+        // disocclusion flag, chosen run, debug identity accumulator - see
+        // restir_wf_common.glsl).
+        std::vector<float> region(pixelCount * 4);
+        GL_CALL(glGetNamedBufferSubData(m_wfArenaBuffer.Id(),
+                                        GLintptr(pixelCount) * 63 * 16,
+                                        GLsizeiptr(pixelCount) * 16, region.data()));
+        return region;
+    }
+
+    std::vector<float> PathTracer::ReadDisocclusionMask() const
+    {
+        std::vector<float> region = ReadLearnRegion();
+        if (region.empty()) return {};
+        size_t pixelCount = region.size() / 4;
+        std::vector<float> mask(pixelCount);
+        for (size_t i = 0; i < pixelCount; ++i)
+            mask[i] = region[i * 4 + 1];
+        return mask;
+    }
+
     void PathTracer::EnsureRestirBuffers()
     {
         if (m_restirWidth == m_width && m_restirHeight == m_height) return;
@@ -189,9 +217,17 @@ namespace RoyalGL
         // score region), and 32 dispatch-control entries + 6 uints per
         // pixel of work-item queues in one buffer. The arena starts zeroed
         // so the first frame reads duplication score 0, not garbage.
-        m_wfArenaBuffer.Upload(nullptr, pixelCount * 27 * 16, GL_DYNAMIC_COPY);
+        // 65 vec4s/pixel: header [0,N) + batched shift jobs [N,61N) (5 jobs
+        // x 12 vec4, aliased by the camera pass's idx*26 strided layout) +
+        // sort [61N,62N) + shade acc / dup score [62N,63N) + spatial-
+        // selection learning state [63N,64N) + probe-guided selection
+        // table [64N,65N) (2 vec4 x 16 probes per sort block) - must match
+        // WF_ARENA_VEC4_PER_PIXEL / WF_JOBS_PER_PIXEL / WF_PSEL_MAX_PROBES
+        // in restir_wf_common.glsl.
+        m_wfArenaBuffer.Upload(nullptr, size_t(pixelCount) * 65 * 16, GL_DYNAMIC_COPY);
         GL_CALL(glClearNamedBufferData(m_wfArenaBuffer.Id(), GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr));
-        m_wfQueueBuffer.Upload(nullptr, 512 + pixelCount * 6 * sizeof(uint32_t), GL_DYNAMIC_COPY);
+        // Queues: step ping-pong (2x) + shadow, each sized for 5 jobs/pixel.
+        m_wfQueueBuffer.Upload(nullptr, 512 + size_t(pixelCount) * 15 * sizeof(uint32_t), GL_DYNAMIC_COPY);
         // Zero-filled: a zeroed reservoir is a valid empty reservoir
         // (W=0, confidence=0).
         GL_CALL(glClearNamedBufferData(m_reservoirBuffer.Id(), GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr));
@@ -255,7 +291,9 @@ namespace RoyalGL
         // z/w of prevCameraParams are unused by the projection helpers and
         // carry spatial reuse parameters instead; prevCamPos.w carries
         // the confidence cap (RestirConfidenceCap() in restir_common.glsl).
-        frame.prevCameraParams.z = 0.0f; // free (was the disk-sampling radius)
+        // Spatial candidate selection & MIS family (RestirSpatialMode() in
+        // restir_common.glsl): 0 = pair mixture, 1 = SPMIS baseline, 2 = ours.
+        frame.prevCameraParams.z = static_cast<float>(settings.restirSpatialMode);
         frame.prevCameraParams.w = static_cast<float>(settings.restirSpatialNeighbors);
         frame.prevCamPos.w = std::max(settings.restirConfidenceCap, 1.0f);
         uint32_t restirFlags = (restirActive ? 1u : 0u)
@@ -269,7 +307,21 @@ namespace RoyalGL
                              | (settings.restirDecorrelate ? 256u : 0u)
                              | (settings.restirVolumeMode >= 2 ? 512u : 0u)
                              | (settings.restirVolumeMode >= 1 ? 1024u : 0u)
-                             | (settings.restirFogPairing ? 2048u : 0u);
+                             | (settings.restirFogPairing ? 2048u : 0u)
+                             | (settings.restirShiftScore ? 4096u : 0u)
+                             | (settings.restirCellSearch ? 8192u : 0u)
+                             | (settings.restirProbeSelection ? 16384u : 0u)
+                             // Cell-search shape rides the upper flag bits:
+                             // 16..20 probe count, 21..28 initial radius px,
+                             // 29..30 starvation gate mode.
+                             | (static_cast<uint32_t>(std::clamp(settings.restirSearchIters, 1, 31)) << 16)
+                             | (static_cast<uint32_t>(std::clamp(settings.restirSearchRadius, 1, 255)) << 21)
+                             | (static_cast<uint32_t>(std::clamp(settings.restirSearchGate, 0, 3)) << 29)
+                             | (settings.restirClusterNormal ? 0x80000000u : 0u);
+        frame.spmisParams = glm::vec4(settings.restirScoreEmaRate,
+                                      settings.restirScoreDefMix,
+                                      static_cast<float>(settings.restirShiftDiag),
+                                      static_cast<float>(settings.restirShiftDiagDist));
         frame.restirParams = glm::uvec4(static_cast<uint32_t>(settings.restirDebugView),
                                         restirFlags, m_frameCounter, m_restirParity);
         frame.fogParams = glm::vec4(settings.fogSigmaS, settings.fogSigmaA,
@@ -549,17 +601,7 @@ namespace RoyalGL
             {
                 rtBegin(6, "restir spatial");
                 uint32_t nbrs = uint32_t(std::max(settings.restirSpatialNeighbors, 0));
-                if (nbrs > 0)
-                {
-                    // Histogram construction (Salaün 2025): sort each
-                    // jittered 16x16 block's candidates into per-cluster
-                    // inverse CDFs. One extra block per axis covers every
-                    // jitter offset; fully-outside groups exit immediately.
-                    m_wfSSortShader.Use();
-                    m_wfSSortShader.Dispatch(GLuint(m_width + 15) / 16u + 1u,
-                                             GLuint(m_height + 15) / 16u + 1u, 1u);
-                    GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));
-                }
+                uint32_t iters = uint32_t(std::clamp(settings.restirSpatialIterations, 1, 8));
                 if (nbrs == 0)
                 {
                     // sinit round 0 still runs: it copies the
@@ -567,20 +609,78 @@ namespace RoyalGL
                     wfClearCtrl();
                     m_wfSInitShader.Use();
                     m_wfSInitShader.SetUint("uWfRound", 0u);
+                    m_wfSInitShader.SetUint("uWfPass", 0u);
                     m_wfSInitShader.Dispatch(groupsN, 1u, 1u);
                 }
-                for (uint32_t nbrRound = 0; nbrRound < nbrs; ++nbrRound)
+                // Iterated spatial reuse: pass p > 0 feeds on pass p-1's
+                // outputs (final -> scratch copy), so reused candidates
+                // carry aggregates and effective sample counts compound
+                // multiplicatively across passes - the spatial-only
+                // substitute for temporal accumulation, with all
+                // correlation resetting every frame.
+                for (uint32_t pass = 0; pass < (nbrs > 0 ? iters : 0u); ++pass)
                 {
-                    wfClearCtrl();
-                    m_wfSInitShader.Use();
-                    m_wfSInitShader.SetUint("uWfRound", nbrRound);
-                    m_wfSInitShader.Dispatch(groupsN, 1u, 1u);
-                    wfBarrier();
-                    wfShiftRounds();
-                    m_wfSMergeShader.Use();
-                    m_wfSMergeShader.SetUint("uWfRound", nbrRound);
-                    m_wfSMergeShader.Dispatch(groupsN, 1u, 1u);
-                    wfBarrier();
+                    if (pass > 0)
+                    {
+                        // The previous pass's aggregates become this
+                        // pass's canonical inputs. Region layout: 3 x
+                        // pixelCount x 224 bytes (restir_common.glsl);
+                        // final = parity region, scratch = region 2.
+                        constexpr GLintptr kRes = 224;
+                        GLintptr regionBytes = GLintptr(pixelCount) * kRes;
+                        GL_CALL(glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT));
+                        GL_CALL(glCopyNamedBufferSubData(
+                            m_reservoirBuffer.Id(), m_reservoirBuffer.Id(),
+                            GLintptr(m_restirParity) * regionBytes,
+                            GLintptr(2) * regionBytes, regionBytes));
+                        GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));
+                    }
+                    // Histogram construction (Salaün 2025): sort each
+                    // jittered 16x16 block's candidates into per-cluster
+                    // inverse CDFs (rebuilt per pass - selection then
+                    // importance-samples the current aggregates). One
+                    // extra block per axis covers every jitter offset.
+                    m_wfSSortShader.Use();
+                    m_wfSSortShader.Dispatch(GLuint(m_width + 15) / 16u + 1u,
+                                             GLuint(m_height + 15) / 16u + 1u, 1u);
+                    GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));
+                    // Probe-guided selection: measure per-run ideal weights
+                    // with one representative shift per (block, probed run)
+                    // BEFORE the candidate rounds (restir_wf_psel/pfin).
+                    if (settings.restirProbeSelection && settings.restirSpatialMode == 1)
+                    {
+                        uint32_t blocksX = uint32_t(m_width) / 16u + 2u;
+                        uint32_t blocksY = uint32_t(m_height) / 16u + 2u;
+                        uint32_t probes = uint32_t(std::clamp(settings.restirSearchIters, 1, 16));
+                        uint32_t threads = blocksX * blocksY * probes;
+                        wfClearCtrl();
+                        m_wfPSelShader.Use();
+                        m_wfPSelShader.Dispatch((threads + 63u) / 64u, 1u, 1u);
+                        wfBarrier();
+                        wfShiftRounds();
+                        m_wfPFinShader.Use();
+                        m_wfPFinShader.Dispatch((threads + 63u) / 64u, 1u, 1u);
+                        GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));
+                    }
+                    // SPMIS modes batch up to WF_SPATIAL_BATCH=4 candidates
+                    // per shift-pipeline sweep; mode 0 keeps one per round.
+                    uint32_t dispatches = (settings.restirSpatialMode >= 1)
+                                              ? (nbrs + 3u) / 4u : nbrs;
+                    for (uint32_t nbrRound = 0; nbrRound < dispatches; ++nbrRound)
+                    {
+                        wfClearCtrl();
+                        m_wfSInitShader.Use();
+                        m_wfSInitShader.SetUint("uWfRound", nbrRound);
+                        m_wfSInitShader.SetUint("uWfPass", pass);
+                        m_wfSInitShader.Dispatch(groupsN, 1u, 1u);
+                        wfBarrier();
+                        wfShiftRounds();
+                        m_wfSMergeShader.Use();
+                        m_wfSMergeShader.SetUint("uWfRound", nbrRound);
+                        m_wfSMergeShader.SetUint("uWfPass", pass);
+                        m_wfSMergeShader.Dispatch(groupsN, 1u, 1u);
+                        wfBarrier();
+                    }
                 }
                 rtEnd();
                 GL_CALL(glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT));

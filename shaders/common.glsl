@@ -57,6 +57,7 @@ layout(std140, binding = 0) uniform FrameUBO
     uvec4 restirParams;    // x=debug view, y=flags (bit0 restir, bit1 temporal, bit2 spatial,
                            //   bit3 accumulate frames), z=frame counter, w=ping-pong parity
     vec4 fogParams;        // homogeneous medium: x=sigma_s, y=sigma_a, z=HG g, w=enabled
+    vec4 spmisParams;      // x=mode-2 score EMA rate, y=mode-2 defensive mix, z/w diagnostics
     // Instance transforms for object-space surface storage (see
     // GPUTypes.h): frame-persistent positions (G-buffer, reservoir
     // reconnection data) are stored in instance object space and converted

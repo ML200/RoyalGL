@@ -24,6 +24,8 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 shared uvec2 sKey[256]; // x = cluster key, y = float bits of pHat (both asc)
 shared uint  sPix[256]; // payload: linear pixel index
+shared vec2  sCum[256]; // SPMIS modes: (selection weight s, capped conf c),
+                        // segmented-inclusive-scanned per cluster run
 
 bool KeyLess(uvec2 a, uvec2 b) { return a.x < b.x || (a.x == b.x && a.y < b.y); }
 
@@ -46,16 +48,15 @@ void main()
         ivec2 p = origin + lo + ivec2(int(t) % sz.x, int(t) / sz.x);
         myIdx = RestirPixelIndex(p);
         GBufferPixel g = RestirLoadGBuf(GBufCurOffset() + myIdx);
-        bool isMiss = g.posDepth.w < 0.0;
         // Miss pixels under a scattering medium form one dedicated fog
         // cluster (the medium-aware analog of the object-id mask): their
         // reservoirs hold only the airlight family, which re-anchors to the
         // destination ray, so any two miss pixels can exchange it. Without
-        // scattering fog (or with shifts off) they stay out of the sort.
-        if (!isMiss || (FogScatterEnabled() && RestirVolShiftEnabled()))
+        // scattering fog (or with shifts off) they stay out of the sort
+        // (WfClusterKey returns the invalid key).
+        uint cluster = WfClusterKey(g);
+        if (cluster != 0xFFFFFFFFu)
         {
-            uint cluster = isMiss ? 0xFFFFFF00u
-                                  : (InstanceOfTriangle(GBufTriangle(g)) << 8u) | GBufMaterial(g);
             float pHat = pixelRes[RestirRegionOffset(RESTIR_SCRATCH_REGION) + myIdx].path.core.y;
             key = uvec2(cluster, floatBitsToUint(max(pHat, 0.0)));
             mine = true;
@@ -87,12 +88,64 @@ void main()
     }
     barrier();
 
+    // SPMIS modes (1 = baseline, 2 = ours): build the per-run inclusive CDF
+    // of the selection weights s_i = min(c_i,cap)*pHat(X_i)*W_i (Hedstrom
+    // et al. 2026 Eq. 17) plus the run confidence sums c_Sigma, by a
+    // segmented Hillis-Steele scan over the sorted list. Contiguity of
+    // equal keys makes the naive same-key check exact: an entry only ever
+    // accumulates values from its own run. All 256 threads participate
+    // (invalid entries carry s = c = 0 under the max key); the branch is
+    // workgroup-uniform, so the barriers inside are legal.
+    bool spmis = RestirSpatialMode() >= 1u;
+    if (spmis)
+    {
+        vec2 sc = vec2(0.0);
+        if (sKey[t].x != 0xFFFFFFFFu)
+        {
+            vec4 core = pixelRes[RestirRegionOffset(RESTIR_SCRATCH_REGION) + sPix[t]].path.core;
+            float c = min(max(core.z, 0.0), RestirConfidenceCap());
+            float s = c * max(core.y, 0.0) * max(core.x, 0.0);
+            // Mode 2 (history-guided): attenuate the SPMIS source weight
+            // by the pixel's learned shift-survival ratio (bounded EMA of
+            // pHat(T(X))*|J|/pHat(X), reprojected with history, reset on
+            // disocclusion) - approximating the ideal density
+            // m*pHat(Y)*W*|J| = (pHat(X)*W) * survival, without re-
+            // counting source brightness. The defensive mix bounds the
+            // attenuation at dm (so 1/P inflation <= 1/dm of baseline and
+            // P > 0 stays guaranteed on the contribution support);
+            // unlearned pixels (score 0) stay neutral.
+            if (RestirSpatialMode() >= 2u && RestirShiftScoreEnabled())
+            {
+                float A = WfShiftScore(sPix[t]);
+                if (A > 0.0)
+                {
+                    float dm = RestirScoreDefMix();
+                    s *= dm + (1.0 - dm) * min(A, 1.0);
+                }
+            }
+            if (isnan(s) || isinf(s)) s = 0.0;
+            if (isnan(c) || isinf(c)) c = 0.0;
+            sc = vec2(s, c);
+        }
+        sCum[t] = sc;
+        barrier();
+        for (uint d = 1u; d < 256u; d <<= 1u)
+        {
+            vec2 add = (t >= d && sKey[t - d].x == sKey[t].x) ? sCum[t - d] : vec2(0.0);
+            barrier();
+            sCum[t] += add;
+            barrier();
+        }
+    }
+
     if (int(t) >= validCount) return;
 
-    // Rank map: rank t's winner, stored at this thread's own pixel slot.
-    // Component stores stay disjoint per thread - no races.
+    // Rank map: rank t's winner (and its inclusive CDF value), stored at
+    // this thread's own pixel slot. Component stores stay disjoint per
+    // thread - no races.
     uint slot = WfSortSlotBase() + myIdx;
     wfArena[slot].x = uintBitsToFloat(sPix[t]);
+    wfArena[slot].w = spmis ? sCum[t].x : 0.0;
 
     // This pixel's cluster run [start, start+count): binary search the
     // sorted keys for the cluster's lower/upper bound.
@@ -115,6 +168,6 @@ void main()
         }
         count = loIdx - start;
     }
-    wfArena[slot].y = uintBitsToFloat(start);
-    wfArena[slot].z = uintBitsToFloat(count);
+    wfArena[slot].y = uintBitsToFloat(WfSortPackRun(start, count));
+    wfArena[slot].z = (spmis && count > 0u) ? sCum[start + count - 1u].y : 0.0;
 }

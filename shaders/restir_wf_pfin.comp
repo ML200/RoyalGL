@@ -1,0 +1,67 @@
+#version 460 core
+#include "common.glsl"
+#include "restir_common.glsl"
+#include "restir_wf_common.glsl"
+#include "restir_wf_shift.glsl"
+
+// Probe-guided selection, stage 2: after the probe shift pipeline, fold
+// each probe's result into the measured ideal run weight
+//     w^_r = S_r * rho* * m*,
+//     rho* = pHat(Y*) |J*| / pHat(X*)          (survival, clamped [0,8])
+//     m*   = cS p^<- / (cS p^<- + cC pHat(Y*)) (the pairwise MIS factor
+//            at the block-center receiver; p^<- = pHat(X*)/J*,
+//            cS ~ N~ * mean run confidence as the pool-scale stand-in)
+// - all four factors of the ideal selection density, at run granularity,
+// measured THIS frame against THIS block. Failed probes leave w^ = 0:
+// the run stays reachable through the defensive baseline share of P.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void main()
+{
+    uint probes = min(RestirSearchIters(), WF_PSEL_MAX_PROBES);
+    uint tid = gl_GlobalInvocationID.x;
+    uint blockLinear = tid / probes;
+    uint r = tid - blockLinear * probes;
+    if (blockLinear >= WfPselBlocksX() * WfPselBlocksY()) return;
+
+    uint slotA = WfPselSlot(blockLinear, r);
+    if (wfArena[slotA].y != -1.0) return; // empty / analytic / no probe
+
+    ivec2 blockCoord = ivec2(int(blockLinear % WfPselBlocksX()),
+                             int(blockLinear / WfPselBlocksX()));
+    ivec2 origin, lo, sz;
+    WfSortBlockRect(blockCoord, origin, lo, sz);
+    uint jb = WfShiftJobBase(
+        RestirPixelIndex(origin + lo + ivec2(int(r) % sz.x, int(r) / sz.x))
+        * WF_JOBS_PER_PIXEL);
+
+    float w = 0.0;
+    float pHatX = wfArena[slotA + 1u].z;
+    if (WfJobOk(jb) && pHatX > 1e-12)
+    {
+        float J = WfJobJacobian(jb);
+        if (RestirJacobianValid(J))
+        {
+            float pHatY = WfJobOmega(jb) * RestirLum(WfJobF(jb));
+            float rho = clamp(pHatY * J / pHatX, 0.0, 8.0);
+            if (rho > 0.0)
+            {
+                uint enc = floatBitsToUint(wfArena[slotA].x);
+                float countR = float(enc >> 21u);
+                float cSigma = wfArena[slotA].z;
+                float Nt = max(uFrame.prevCameraParams.w, 1.0);
+                float cSg = (countR > 0.0) ? Nt * cSigma / countR : Nt;
+                uint recvIdx = WfPselReceiver(blockCoord);
+                vec4 cCore = pixelRes[RestirRegionOffset(RESTIR_SCRATCH_REGION)
+                                      + recvIdx].path.core;
+                float cC = min(max(cCore.z, 0.0), RestirConfidenceCap());
+                float pBack = pHatX / max(J, 1e-12);
+                float mStar = (cSg * pBack) / max(cSg * pBack + cC * pHatY, 1e-20);
+                w = wfArena[slotA].w * rho * mStar;
+                if (isnan(w) || isinf(w)) w = 0.0;
+            }
+        }
+    }
+    wfArena[slotA].y = w;
+}

@@ -48,7 +48,9 @@ namespace RoyalGL
     }
 
     UIFrameResult UILayer::Draw(RenderSettings& settings, Scene& scene, uint32_t sampleCount, float frameTimeMs,
-                                 bool oidnAvailable, const std::vector<std::string>& lensPresetNames)
+                                 bool oidnAvailable, const std::vector<std::string>& lensPresetNames,
+                                 const std::vector<std::string>& sceneNames, int sceneIndex,
+                                 int& duckCount, int& duckMaterial)
     {
         UIFrameResult result;
 
@@ -58,6 +60,45 @@ namespace RoyalGL
         ImGui::Text("Samples: %u", sampleCount);
         ImGui::Text("Frame time: %.2f ms (%.1f FPS)", frameTimeMs, 1000.0f / std::max(frameTimeMs, 0.001f));
         ImGui::Text("Triangles: %zu", scene.triangles.size());
+
+        ImGui::Separator();
+
+        // Scene picker: built-in Cornell + the bundled assets/scenes .glbs.
+        // Switching is deferred by Application to a safe frame boundary
+        // (full BVH/light-tree rebuild + ReSTIR history reset).
+        if (!sceneNames.empty())
+        {
+            int idx = std::clamp(sceneIndex, 0, static_cast<int>(sceneNames.size()) - 1);
+            if (ImGui::BeginCombo("Scene", sceneNames[idx].c_str()))
+            {
+                for (int i = 0; i < static_cast<int>(sceneNames.size()); ++i)
+                {
+                    if (ImGui::Selectable(sceneNames[i].c_str(), i == idx) && i != idx)
+                        result.sceneSelected = i;
+                }
+                ImGui::EndCombo();
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Bundled scenes load with their recommended camera (and fog,\n"
+                                  "for LensFog). Switching rebuilds the BVH and restarts\n"
+                                  "accumulation and ReSTIR history.");
+            if (idx == 0)
+            {
+                // Built-in scene composition - takes effect via a reload.
+                bool comp = false;
+                comp |= ImGui::SliderInt("Clutter ducks", &duckCount, 0, 8);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Extra ducks with varied materials (the spatial-reuse\n"
+                                      "clutter stress scene). 0 = the recorded-soak-reference\n"
+                                      "scene. Applies by reloading the scene.");
+                const char* duckMats[] = {"Glass", "Conductor (copper)", "Rough glass",
+                                          "Layered coat", "Layered + medium"};
+                comp |= ImGui::Combo("Duck material", &duckMaterial, duckMats, 5);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Main duck material preset (the ROYALGL_MAT soak presets).");
+                result.sceneCompositionChanged = comp;
+            }
+        }
 
         ImGui::Separator();
 
@@ -202,16 +243,84 @@ namespace RoyalGL
             ImGui::Checkbox("Spatial reuse", &settings.restirSpatial);
             if (settings.restirSpatial)
             {
-                ImGui::SliderInt("Spatial candidates", &settings.restirSpatialNeighbors, 1, 8);
+                ImGui::SliderInt("Spatial candidates", &settings.restirSpatialNeighbors, 1, 24);
                 if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Antithetic stratified picks from the 16x16-block sorted\n"
-                                      "candidate histogram (Salaün 2025). Even counts pair\n"
-                                      "antithetically; the paper recommends 4.");
+                    ImGui::SetTooltip("Reuse candidates per pixel per frame. SPMIS modes batch 4\n"
+                                      "per shift-pipeline sweep, so 16-24 is affordable (the\n"
+                                      "temporal-free wide-reuse regime); mode 0 costs one sweep\n"
+                                      "per candidate.");
                 ImGui::Checkbox("Stratified candidate picks", &settings.restirStratified);
                 if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Histogram-stratified antithetic selection (Salaün 2025).\n"
-                                      "Off = uniform random picks from the same clustered pool\n"
-                                      "(A/B isolation of the stratification benefit; both unbiased).");
+                    ImGui::SetTooltip("Histogram-stratified antithetic selection (Salaün 2025) in\n"
+                                      "mode 0, antithetic CDF positions in mode 2. Off = uniform\n"
+                                      "random picks (A/B isolation; both unbiased).");
+                const char* spatialModes[] = {"Pair mixture (stratified ranks)",
+                                              "SPMIS (Hedstrom 2026)",
+                                              "History-guided SPMIS (ablation)"};
+                ImGui::Combo("Selection & MIS", &settings.restirSpatialMode, spatialModes, 3);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Spatial candidate selection & MIS family (all unbiased):\n"
+                                      "pair mixture = one candidate/round vs frozen canonical;\n"
+                                      "SPMIS = with-replacement draws prop. to c*pHat*W from the\n"
+                                      "cluster-run CDF, one chain w/ stochastic pairwise MIS;\n"
+                                      "history-guided = SPMIS weights attenuated by a learned\n"
+                                      "shift-survival ratio (ablation arm; a wash on these scenes).");
+                ImGui::Checkbox("Normal-octant cluster keys", &settings.restirClusterNormal);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Split reuse clusters by the world-normal octant in addition\n"
+                                      "to instance+material (paper-faithful cells; small consistent\n"
+                                      "win on curved geometry).");
+                if (settings.restirSpatialMode >= 1)
+                {
+                    ImGui::Checkbox("Neighborhood search", &settings.restirCellSearch);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Probe foreign cluster runs when the own run cannot serve\n"
+                                          "(Hedstrom Sec. 5.1 machinery; the gate below decides WHEN).");
+                }
+                if (settings.restirCellSearch && settings.restirSpatialMode >= 1)
+                {
+                    const char* gateNames[] = {"Unconditional (paper, taxes motion)",
+                                               "Tiny-run gate (default)",
+                                               "Tiny-run + disocclusion flag",
+                                               "Contribution-aware (BIASED ablation)"};
+                    ImGui::Combo("Search gate", &settings.restirSearchGate, gateNames, 4);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("When the search may replace the local run. Unconditional\n"
+                                          "probing measures 23-45% noise tax under motion; the\n"
+                                          "tiny-run gate (count <= 2) equals no-search everywhere\n"
+                                          "measured while keeping rescue. Gate 3 is a deliberately\n"
+                                          "kept NEGATIVE RESULT: it brightens sparse scenes +16%.");
+                    ImGui::SliderInt("Search probes", &settings.restirSearchIters, 1, 16);
+                    ImGui::SliderInt("Search radius (px)", &settings.restirSearchRadius, 4, 128);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Initial probe radius; grows x1.25 per probe. Also the\n"
+                                          "probe schedule of probe-guided selection below.");
+                }
+                if (settings.restirSpatialMode == 1)
+                {
+                    ImGui::Checkbox("Probe-guided selection (PSEL)", &settings.restirProbeSelection);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Research: per-block probe shifts measure the ideal\n"
+                                          "selection weight per candidate run; draws span the union\n"
+                                          "of own + probed runs with exact compensated P. Unbiased;\n"
+                                          "currently SLOWER than plain SPMIS (the chain functional\n"
+                                          "dilutes heterogeneous pools - see the research log).");
+                }
+                if (settings.restirSpatialMode >= 2 || settings.restirProbeSelection)
+                {
+                    ImGui::SliderFloat("Defensive mix", &settings.restirScoreDefMix, 0.0f, 1.0f);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Share of plain luminance selection mixed into guided\n"
+                                          "draws (bounds worst-case weight inflation at 1/mix;\n"
+                                          "keeps P > 0 on the contribution support).");
+                }
+                if (settings.restirSpatialMode >= 2)
+                {
+                    ImGui::SliderFloat("Survival-score EMA", &settings.restirScoreEmaRate, 0.01f, 1.0f);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Learning rate of the per-pixel shift-survival score\n"
+                                          "(mode 2's history-guided attenuation).");
+                }
             }
             if (settings.restirTemporal || settings.restirSpatial)
             {

@@ -20,6 +20,12 @@ namespace RoyalGL
         // frame (-1 = none). Application coalesces these into async BVH
         // rebuilds.
         int instanceMoved = -1;
+        // Scene combo pick this frame (-1 = no change) and whether the
+        // built-in scene's composition controls (clutter ducks / duck
+        // material) changed - both need a full scene reload, which
+        // Application defers to a safe frame boundary.
+        int sceneSelected = -1;
+        bool sceneCompositionChanged = false;
         std::string exportPath;
     };
 
@@ -40,7 +46,9 @@ namespace RoyalGL
         void EndFrame() const;
 
         UIFrameResult Draw(RenderSettings& settings, Scene& scene, uint32_t sampleCount, float frameTimeMs,
-                            bool oidnAvailable, const std::vector<std::string>& lensPresetNames);
+                            bool oidnAvailable, const std::vector<std::string>& lensPresetNames,
+                            const std::vector<std::string>& sceneNames, int sceneIndex,
+                            int& duckCount, int& duckMaterial);
 
     private:
         GLFWwindow* m_window = nullptr;

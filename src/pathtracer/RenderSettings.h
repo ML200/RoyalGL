@@ -44,6 +44,108 @@ namespace RoyalGL
         // random picks from the same sorted/clustered pool - isolates the
         // benefit of the antithetic stratification itself.
         bool restirStratified = true;
+        // Spatial candidate selection & MIS family (env ROYALGL_RESTIR_SPMODE):
+        //  0 = pair mixture (default): each round pair-merges one
+        //      rank-selected candidate against the frozen canonical and the
+        //      rounds mix linearly (restir_wf_smerge.comp header).
+        //  1 = SPMIS baseline (Hedstrom et al. 2026, "Stochastic Pairwise
+        //      MIS"): candidates drawn with replacement from the cluster
+        //      run proportionally to c_i*pHat(X_i)*W_i (source luminance),
+        //      folded into ONE reservoir chain with stochastic pairwise MIS
+        //      weights m~_i = 1/(N~ P(i)) * m_i; canonical MIS weight
+        //      estimated with N~c=1; non-canonical confidences scaled N~/M.
+        //  2 = history-guided SPMIS: the SPMIS weight additionally
+        //      attenuated by a learned per-pixel shift-survival ratio
+        //      (bounded EMA, reprojected with history). Measured a WASH
+        //      on our scenes (kept as the paper's ablation arm - see
+        //      docs/NEIGHBOR_SELECTION_PLAN.md "KILLED with full
+        //      attribution").
+        // All modes are unbiased; they differ in reuse efficiency.
+        int restirSpatialMode = 0;
+        // Mode 2 ablation (env ROYALGL_RESTIR_VSCORE, no UI): fold the
+        // online-learned shift-survival score into the selection weights.
+        // Off = mode 2 degenerates to exactly mode 1.
+        bool restirShiftScore = true;
+        // Iterated spatial reuse (env ROYALGL_RESTIR_SPATIAL_ITERS): run
+        // the whole spatial pass family (sort + K candidate rounds) J
+        // times per frame, feeding each pass the previous pass's outputs.
+        // Reused candidates then carry AGGREGATES, so effective sample
+        // counts compound multiplicatively (~(K+1)^J) instead of linearly
+        // in K - the spatial-only substitute for temporal accumulation,
+        // with all correlation resetting every frame. The marginalized
+        // shading averages the passes' estimates (running mean).
+        int restirSpatialIterations = 1;
+        // SPMIS cell search (env ROYALGL_RESTIR_CELLSEARCH, modes >= 1):
+        // per pixel, WRS over probed pixels' cluster runs (own and
+        // neighboring blocks) weighted by run confidence mass, with
+        // growing probe radius (Hedstrom et al. 2026 Sec. 5.1). Recovers
+        // reuse partners when a disocclusion swallows the whole local
+        // block. Off = reuse only from the pixel's own block run.
+        bool restirCellSearch = true;
+        // Cell-search shape (envs ROYALGL_RESTIR_SEARCH_ITERS/_RADIUS):
+        // probe count and initial radius in pixels (growth fixed x1.25).
+        // Paper Sec. 5.1 uses 12/30; the older tune was 8/24.
+        int restirSearchIters = 12;
+        int restirSearchRadius = 30;
+        // Starvation gate (env ROYALGL_RESTIR_SEARCH_GATE): 0 = the
+        // paper's unconditional probe, 1 = probe only near-empty runs
+        // (count <= 2), 2 = additionally probe pixels whose temporal
+        // history vanished (tinit disocclusion flag), 3 = probe runs with
+        // ZERO selection mass, probes weighted by their selection mass -
+        // BIASED (+12-16% bright on sparse scenes, ablation only): the
+        // value-dependent trigger fires exactly where the estimator's
+        // accounting needs a zero, see restir_wf_sinit.comp.
+        // Measured (dolly + orbit, deterministic fixed-dt, 2026-07-04):
+        // unconditional probing costs 23-45% whole-image noise under
+        // motion (the WRS keeps the own run with probability
+        // ~1/(1+iters), so probing replaces close partners with distant
+        // ones), and even wide fresh disocclusion strips reuse better
+        // among their own run's same-frame candidates than from distant
+        // converged runs (gate 2 masked 0.328 vs 0.298 no-search). Gate 1
+        // = no measurable cost vs no-search anywhere, keeps rescue for
+        // partnerless pixels.
+        int restirSearchGate = 1;
+        // Quantized-normal cluster term (env ROYALGL_RESTIR_CLUSTER_NORMAL):
+        // key cluster runs on the world-normal octant in addition to
+        // instance+material (paper Sec. 5.1 hashes objectID + quantized
+        // normal). Splits curved geometry by orientation in every spatial
+        // mode's clustering; off = the pre-2026-07-04 instance+material key.
+        bool restirClusterNormal = true;
+        // Dual-direction shift-asymmetry diagnostic (env
+        // ROYALGL_RESTIR_SHIFTDIAG, 0 = off): for the same (canonical, z')
+        // pair, run BOTH shift directions each frame (mode 1, temporal
+        // off, K >= 5 so round 1 exists) and accumulate per-pixel tallies
+        // in the learn region. Sub-mode semantics (exact formulas in
+        // restir_wf_smerge.comp): 1 = paired support-asymmetry counts,
+        // 2 = valid/both-ok context counts, 3 = sum log(rF/rB), 4 = sum
+        // rB / sum rF, 5 = the m~_c beta channel evaluated through both
+        // directions (the direct bias channel). Chasing the SPMIS-chain
+        // residual's forward/backward shift asymmetry.
+        int restirShiftDiag = 0;
+        // Diagnostic reuse distance (env ROYALGL_RESTIR_SHIFTDIAG_DIST,
+        // pixels; 0 = own-run pairs): overrides the reuse run with an
+        // INVOLUTIVE fixed-stride partner (x-cells pair mutually at
+        // +-stride), so the distant-pair ensemble stays exchangeable and
+        // direction comparisons remain clean at any distance - unlike the
+        // cell search, whose chosen runs are role-asymmetric. Input-set
+        // selection, so the chain stays unbiased; the run's soak mean
+        // under this pairing is itself a distance dose-response probe.
+        int restirShiftDiagDist = 0;
+        // Probe-guided union selection (env ROYALGL_RESTIR_PSEL, mode 1):
+        // once per frame each 16x16 block probes SearchIters source runs
+        // (value-independent positions) and runs ONE representative shift
+        // per probed run into the block center; the measured ideal weight
+        // w^_r = S_r * survival * MIS-factor guides a two-level draw over
+        // the union of own + probed runs with exact per-draw P. The
+        // sparse-carrier rescue (LightMaze class) with dense-scene safety
+        // via the defensive DEFMIX share of plain luminance selection.
+        bool restirProbeSelection = false;
+        // Mode-2 history-guided selection knobs (envs ROYALGL_RESTIR_EMA /
+        // ROYALGL_RESTIR_DEFMIX): score EMA rate for the realized-shift
+        // observations, and the defensive source-luminance fraction of the
+        // selection weight (1 - it goes to the learned score).
+        float restirScoreEmaRate = 0.125f;
+        float restirScoreDefMix = 0.25f;
         // Duplication-map temporal decorrelation (ReSTIR PT Enhanced
         // sec. 5): end-of-frame same-seed counting adaptively lowers the
         // temporal confidence cap in correlated regions. Trades a small,
@@ -140,6 +242,19 @@ namespace RoyalGL
                    restirSpatial == other.restirSpatial &&
                    restirSpatialNeighbors == other.restirSpatialNeighbors &&
                    restirStratified == other.restirStratified &&
+                   restirSpatialMode == other.restirSpatialMode &&
+                   restirShiftScore == other.restirShiftScore &&
+                   restirCellSearch == other.restirCellSearch &&
+                   restirSearchIters == other.restirSearchIters &&
+                   restirSearchRadius == other.restirSearchRadius &&
+                   restirSearchGate == other.restirSearchGate &&
+                   restirClusterNormal == other.restirClusterNormal &&
+                   restirShiftDiag == other.restirShiftDiag &&
+                   restirShiftDiagDist == other.restirShiftDiagDist &&
+                   restirScoreEmaRate == other.restirScoreEmaRate &&
+                   restirScoreDefMix == other.restirScoreDefMix &&
+                   restirProbeSelection == other.restirProbeSelection &&
+                   restirSpatialIterations == other.restirSpatialIterations &&
                    restirDecorrelate == other.restirDecorrelate &&
                    restirVolumeMode == other.restirVolumeMode &&
                    restirFogPairing == other.restirFogPairing &&

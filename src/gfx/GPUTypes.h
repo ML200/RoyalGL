@@ -72,6 +72,12 @@ namespace RoyalGL
         // homogeneous medium (no tracking needed).
         glm::vec4 fogParams;       // x=sigma_s, y=sigma_a, z=HG g, w=enabled (0/1)
 
+        // SPMIS spatial-reuse research knobs (RenderSettings mirrors, all
+        // env-tunable): x = mode-2 score EMA rate, y = mode-2 defensive
+        // selection mix (source-luminance fraction), z/w reserved for
+        // diagnostics.
+        glm::vec4 spmisParams;
+
         // Instance transforms for OBJECT-SPACE reservoir / G-buffer surface
         // storage: positions that persist across frames (G-buffer halves,
         // reservoir reconnection vertices, cached light-subpath ends, NEE

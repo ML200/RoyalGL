@@ -36,7 +36,14 @@ namespace RoyalGL
         void Run();
 
     private:
-        void LoadScene(const std::string& path);
+        bool LoadScene(const std::string& path);
+        // Recommended camera/fog preset for the bundled scenes (LightMaze,
+        // LensFog, built-in) - applied on scene switches and, before the
+        // env overrides, at startup.
+        void ApplyScenePreset(const std::filesystem::path& path);
+        // Full scene swap at a safe frame boundary: reload + BLAS/TLAS +
+        // light tree rebuilds + path tracer reset + ReSTIR history clear.
+        void PerformSceneSwitch(int index);
         void HandleCameraInput(float dt);
         void OnFramebufferResize(int width, int height);
         void ExportPNG(const std::string& path);
@@ -66,11 +73,38 @@ namespace RoyalGL
         // file paths and display names for the UI preset dropdown.
         std::vector<std::filesystem::path> m_lensPresetPaths;
         std::vector<std::string> m_lensPresetNames;
+        // Scene picker: entry 0 is the built-in Cornell fallback (empty
+        // path), the rest are assets/scenes/*.glb (Duck.glb excluded - it
+        // is a prop merged into the fallback, not a standalone scene) plus
+        // an optional custom startup path. Parallel arrays for the UI.
+        std::vector<std::filesystem::path> m_scenePaths;
+        std::vector<std::string> m_sceneNames;
+        int m_sceneIndex = 0;
+        // Built-in scene composition (UI-editable; initialized from the
+        // ROYALGL_DUCKS / ROYALGL_MAT envs): clutter duck count and the
+        // main duck's material preset (0 glass, 1 conductor, 2 rough
+        // glass, 3 layered coat, 4 layered + medium).
+        int m_duckCount = 0;
+        int m_duckMaterial = 0;
+        // Scene switches requested by the UI are deferred to the next
+        // frame boundary where no async BVH rebuild is in flight.
+        int m_pendingSceneIndex = -1;
+        bool m_pendingSceneReload = false;
+        // ROYALGL_SWITCH_TEST="index,frame": scripted runtime scene switch
+        // through the UI's deferred path (headless verification hook).
+        int m_switchTestIndex = -1;
+        int m_switchTestFrame = 0;
+        int m_switchTestTick = 0;
         bool m_dirty = true; // forces an accumulation reset next frame
 
         // ROYALGL_STATS=1: periodically log luminance tail statistics of the
         // raw accumulation buffer - the tool for chasing fireflies.
         bool m_statsEnabled = false;
+        // ROYALGL_STATS_MASK=1: additionally log the same statistics
+        // restricted to pixels the temporal pass flagged as disoccluded
+        // (no usable history) - the region where spatial candidate
+        // selection strategies actually differ. Needs temporal reuse on.
+        bool m_statsMaskEnabled = false;
         uint32_t m_lastStatsSample = 0;
         uint32_t m_statsFrame = 0;
         // One dirty flag per scene instance: set when the UI edits its
@@ -92,6 +126,10 @@ namespace RoyalGL
         // (fog history vs surface anchors under translation).
         float m_dollySpeed = 0.0f;
         float m_dollyPhase = 0.0f;
+        // ROYALGL_FIXED_DT=<s>: constant per-frame step for the scripted
+        // motions (orbit/dolly/move) - frame-deterministic A/B comparisons
+        // between configs with different frame costs.
+        float m_fixedDt = 0.0f;
         // ROYALGL_MOVE=<rad/s>: scripted oscillation of the last instance -
         // headless exercise of the async BLAS/TLAS rebuild path.
         float m_moveTestSpeed = 0.0f;

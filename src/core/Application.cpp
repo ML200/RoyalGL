@@ -44,7 +44,64 @@ namespace RoyalGL
         m_window = std::make_unique<Window>(m_windowDesc);
 
         m_scene = std::make_unique<Scene>();
-        LoadScene(desc.startupScenePath);
+        // Built-in scene composition (UI-editable later): seed from the
+        // headless test envs BEFORE the first load so soak recipes keep
+        // working unchanged.
+        if (const char* v = std::getenv("ROYALGL_DUCKS"))
+            m_duckCount = std::clamp(std::atoi(v), 0, 8);
+        if (const char* v = std::getenv("ROYALGL_MAT"))
+        {
+            std::string m = v;
+            m_duckMaterial = (m == "conductor")  ? 1
+                           : (m == "roughglass") ? 2
+                           : (m == "layered")    ? 3
+                           : (m == "layeredmed") ? 4 : 0;
+        }
+        bool startupLoaded = LoadScene(desc.startupScenePath);
+
+        // Scene picker list: built-in first, then the bundled .glb scenes.
+        m_sceneNames.push_back("Cornell box + duck (built-in)");
+        m_scenePaths.push_back({});
+        {
+            std::vector<std::filesystem::path> found;
+            std::error_code ec;
+            for (const auto& entry : std::filesystem::directory_iterator(
+                     std::filesystem::path(ROYALGL_ASSET_DIR) / "scenes", ec))
+            {
+                if (entry.path().extension() != ".glb") continue;
+                if (entry.path().stem() == "Duck") continue; // prop, not a scene
+                found.push_back(entry.path());
+            }
+            std::sort(found.begin(), found.end());
+            for (const auto& p : found)
+            {
+                m_sceneNames.push_back(p.stem().string());
+                m_scenePaths.push_back(p);
+            }
+        }
+        if (startupLoaded)
+        {
+            std::filesystem::path sp = desc.startupScenePath;
+            m_sceneIndex = -1;
+            std::error_code eqec;
+            for (size_t i = 1; i < m_scenePaths.size(); ++i)
+            {
+                if (std::filesystem::equivalent(m_scenePaths[i], sp, eqec))
+                {
+                    m_sceneIndex = static_cast<int>(i);
+                    break;
+                }
+            }
+            if (m_sceneIndex < 0) // custom path outside assets/scenes
+            {
+                m_sceneNames.push_back(sp.stem().string() + " (custom)");
+                m_scenePaths.push_back(sp);
+                m_sceneIndex = static_cast<int>(m_scenePaths.size()) - 1;
+            }
+            // Recommended framing for the bundled scenes; the env camera
+            // override below still wins for scripted runs.
+            ApplyScenePreset(sp);
+        }
 
         m_bvh = std::make_unique<BVHBuilder>();
         m_bvh->Build(*m_scene);
@@ -92,6 +149,30 @@ namespace RoyalGL
         if (const char* v = std::getenv("ROYALGL_RESTIR_SPATIAL_NBRS"))
             m_settings.restirSpatialNeighbors = std::max(std::atoi(v), 0);
         if (const char* v = std::getenv("ROYALGL_RESTIR_STRAT")) m_settings.restirStratified = (v[0] != '0');
+        if (const char* v = std::getenv("ROYALGL_RESTIR_SPMODE"))
+            m_settings.restirSpatialMode = std::clamp(std::atoi(v), 0, 2);
+        if (const char* v = std::getenv("ROYALGL_RESTIR_VSCORE")) m_settings.restirShiftScore = (v[0] != '0');
+        if (const char* v = std::getenv("ROYALGL_RESTIR_CELLSEARCH")) m_settings.restirCellSearch = (v[0] != '0');
+        if (const char* v = std::getenv("ROYALGL_RESTIR_SEARCH_ITERS"))
+            m_settings.restirSearchIters = std::clamp(std::atoi(v), 1, 31);
+        if (const char* v = std::getenv("ROYALGL_RESTIR_SEARCH_RADIUS"))
+            m_settings.restirSearchRadius = std::clamp(std::atoi(v), 1, 255);
+        if (const char* v = std::getenv("ROYALGL_RESTIR_SEARCH_GATE"))
+            m_settings.restirSearchGate = std::clamp(std::atoi(v), 0, 3);
+        if (const char* v = std::getenv("ROYALGL_EXPOSURE"))
+            m_settings.exposure = std::clamp(static_cast<float>(std::atof(v)), 0.01f, 100.0f);
+        if (const char* v = std::getenv("ROYALGL_RESTIR_CLUSTER_NORMAL")) m_settings.restirClusterNormal = (v[0] != '0');
+        if (const char* v = std::getenv("ROYALGL_RESTIR_PSEL")) m_settings.restirProbeSelection = (v[0] != '0');
+        if (const char* v = std::getenv("ROYALGL_RESTIR_SHIFTDIAG"))
+            m_settings.restirShiftDiag = std::clamp(std::atoi(v), 0, 6);
+        if (const char* v = std::getenv("ROYALGL_RESTIR_SHIFTDIAG_DIST"))
+            m_settings.restirShiftDiagDist = std::clamp(std::atoi(v), 0, 512);
+        if (const char* v = std::getenv("ROYALGL_RESTIR_EMA"))
+            m_settings.restirScoreEmaRate = std::clamp(static_cast<float>(std::atof(v)), 0.01f, 1.0f);
+        if (const char* v = std::getenv("ROYALGL_RESTIR_DEFMIX"))
+            m_settings.restirScoreDefMix = std::clamp(static_cast<float>(std::atof(v)), 0.0f, 1.0f);
+        if (const char* v = std::getenv("ROYALGL_RESTIR_SPATIAL_ITERS"))
+            m_settings.restirSpatialIterations = std::clamp(std::atoi(v), 1, 8);
         if (const char* v = std::getenv("ROYALGL_RESTIR_DECORR")) m_settings.restirDecorrelate = (v[0] != '0');
         if (const char* v = std::getenv("ROYALGL_RESTIR_VOLMODE"))
             m_settings.restirVolumeMode = std::clamp(std::atoi(v), 0, 2);
@@ -126,10 +207,25 @@ namespace RoyalGL
         if (const char* v = std::getenv("ROYALGL_ORBIT")) m_orbitSpeed = static_cast<float>(std::atof(v));
         if (const char* v = std::getenv("ROYALGL_DOLLY")) m_dollySpeed = static_cast<float>(std::atof(v));
         if (const char* v = std::getenv("ROYALGL_MOVE")) m_moveTestSpeed = static_cast<float>(std::atof(v));
+        if (const char* v = std::getenv("ROYALGL_FIXED_DT")) m_fixedDt = static_cast<float>(std::atof(v));
         if (const char* v = std::getenv("ROYALGL_LENS")) m_settings.cameraMode = (v[0] != '0') ? CameraMode::Lens : CameraMode::Pinhole;
         m_statsEnabled = (std::getenv("ROYALGL_STATS") != nullptr);
+        if (const char* v = std::getenv("ROYALGL_STATS_MASK")) m_statsMaskEnabled = (v[0] != '0');
         if (const char* v = std::getenv("ROYALGL_STATS_INTERVAL")) m_statsInterval = std::max(std::atoi(v), 1);
         if (const char* v = std::getenv("ROYALGL_ACCUM")) m_settings.accumulate = (v[0] != '0');
+
+        // Headless test hook for the runtime scene-switch path (the same
+        // deferred path UI clicks take): ROYALGL_SWITCH_TEST="index,frame"
+        // requests scene <index> once the frame counter passes <frame>.
+        if (const char* v = std::getenv("ROYALGL_SWITCH_TEST"))
+        {
+            int i = 0, f = 0;
+            if (sscanf(v, "%d,%d", &i, &f) == 2)
+            {
+                m_switchTestIndex = i;
+                m_switchTestFrame = f;
+            }
+        }
 
         // Scripted camera pose for headless artifact repros:
         // ROYALGL_CAM="px,py,pz,tx,ty,tz"
@@ -157,7 +253,57 @@ namespace RoyalGL
 
     Application::~Application() = default;
 
-    void Application::LoadScene(const std::string& path)
+    void Application::ApplyScenePreset(const std::filesystem::path& path)
+    {
+        std::string stem = path.stem().string();
+        if (stem == "LightMaze")
+        {
+            // Sparse-carrier stress scene (docs/make_maze_scene.py): the
+            // recommended dark-end framing; no medium.
+            m_scene->camera.position = glm::vec3(1.45f, 1.25f, 1.5f);
+            m_scene->camera.target = glm::vec3(-1.2f, 0.7f, -1.0f);
+            m_settings.fogEnable = false;
+        }
+        else if (stem == "LensFog")
+        {
+            // Volumetric caustic showcase (docs/make_lens_scene.py): the
+            // paper's camera and fog recipe.
+            m_scene->camera.position = glm::vec3(2.2f, 1.4f, 3.2f);
+            m_scene->camera.target = glm::vec3(0.0f, 1.2f, 0.0f);
+            m_settings.fogEnable = true;
+            m_settings.fogSigmaS = 0.30f;
+            m_settings.fogSigmaA = 0.02f;
+            m_settings.fogG = 0.5f;
+        }
+        else if (path.empty())
+        {
+            // Built-in Cornell: LoadFallbackScene set its own camera.
+            m_settings.fogEnable = false;
+        }
+        // Unknown custom scenes: keep whatever the file/loader provided.
+    }
+
+    void Application::PerformSceneSwitch(int index)
+    {
+        if (index < 0 || index >= static_cast<int>(m_scenePaths.size())) return;
+        m_sceneIndex = index;
+        LoadScene(m_scenePaths[index].string());
+        ApplyScenePreset(m_scenePaths[index]);
+        m_bvh->Build(*m_scene);
+        m_lightTree->Build(*m_scene);
+        // Cross-scene reservoirs/G-buffers reference dead geometry in
+        // object space - both the accumulation and the ReSTIR history must
+        // restart from scratch.
+        m_pathTracer->Reset();
+        m_pathTracer->ClearRestirHistory();
+        m_lastMaterials = m_scene->materials;
+        m_lastCamera = m_scene->camera;
+        m_lastSettings = m_settings;
+        ROYALGL_LOG_INFO("Application: switched to scene '", m_sceneNames[index],
+                         "' (", m_scene->triangles.size(), " triangles).");
+    }
+
+    bool Application::LoadScene(const std::string& path)
     {
         bool loaded = false;
         if (!path.empty())
@@ -192,54 +338,113 @@ namespace RoyalGL
                 glass.type = MaterialType::Glass;
                 glass.ior = 1.5f;
 
-                // Headless BSDF test hook: ROYALGL_MAT overrides the duck's
-                // material so soak tests can exercise the new lobes
-                // (integrator cross-checks - all integrators must agree).
-                if (const char* v = std::getenv("ROYALGL_MAT"))
+                // Main duck material preset (UI "Duck material" combo /
+                // ROYALGL_MAT env; the presets soak tests exercise -
+                // integrator cross-checks must agree on every lobe).
+                switch (m_duckMaterial)
                 {
-                    std::string m = v;
-                    if (m == "conductor")
-                    {
-                        glass = Material{};
-                        glass.type = MaterialType::Conductor;
-                        glass.baseColor = glm::vec3(0.95f, 0.64f, 0.54f); // copper-ish F0
-                        glass.roughness = 0.3f;
-                    }
-                    else if (m == "roughglass")
-                    {
-                        glass = Material{};
-                        glass.type = MaterialType::RoughDielectric;
-                        glass.baseColor = glm::vec3(0.98f);
-                        glass.roughness = 0.2f;
-                        glass.ior = 1.5f;
-                    }
-                    else if (m == "layered")
-                    {
-                        glass = Material{}; // clear coat over rough copper
-                        glass.type = MaterialType::Layered;
-                        glass.baseColor = glm::vec3(0.95f, 0.64f, 0.54f);
-                        glass.metallic = 1.0f;
-                        glass.roughness = 0.4f;
-                        glass.coatRoughness = 0.1f;
-                        glass.coatIor = 1.5f;
-                        glass.coatDepth = 0.0f;
-                    }
-                    else if (m == "layeredmed")
-                    {
-                        glass = Material{}; // coat + blue-tinted scattering medium over diffuse
-                        glass.type = MaterialType::Layered;
-                        glass.baseColor = glm::vec3(0.8f);
-                        glass.metallic = 0.0f;
-                        glass.roughness = 0.5f;
-                        glass.coatRoughness = 0.15f;
-                        glass.coatIor = 1.5f;
-                        glass.coatDepth = 1.0f;
-                        glass.coatG = 0.4f;
-                        glass.coatAlbedo = glm::vec3(0.4f, 0.6f, 0.9f);
-                    }
-                    ROYALGL_LOG_INFO("Application: ROYALGL_MAT=", m, " overrides the duck material.");
+                case 1: // conductor
+                    glass = Material{};
+                    glass.type = MaterialType::Conductor;
+                    glass.baseColor = glm::vec3(0.95f, 0.64f, 0.54f); // copper-ish F0
+                    glass.roughness = 0.3f;
+                    break;
+                case 2: // rough glass
+                    glass = Material{};
+                    glass.type = MaterialType::RoughDielectric;
+                    glass.baseColor = glm::vec3(0.98f);
+                    glass.roughness = 0.2f;
+                    glass.ior = 1.5f;
+                    break;
+                case 3: // clear coat over rough copper
+                    glass = Material{};
+                    glass.type = MaterialType::Layered;
+                    glass.baseColor = glm::vec3(0.95f, 0.64f, 0.54f);
+                    glass.metallic = 1.0f;
+                    glass.roughness = 0.4f;
+                    glass.coatRoughness = 0.1f;
+                    glass.coatIor = 1.5f;
+                    glass.coatDepth = 0.0f;
+                    break;
+                case 4: // coat + blue-tinted scattering medium over diffuse
+                    glass = Material{};
+                    glass.type = MaterialType::Layered;
+                    glass.baseColor = glm::vec3(0.8f);
+                    glass.metallic = 0.0f;
+                    glass.roughness = 0.5f;
+                    glass.coatRoughness = 0.15f;
+                    glass.coatIor = 1.5f;
+                    glass.coatDepth = 1.0f;
+                    glass.coatG = 0.4f;
+                    glass.coatAlbedo = glm::vec3(0.4f, 0.6f, 0.9f);
+                    break;
+                default: break; // 0 = glass
                 }
                 m_scene->MergeInstance(duck, glm::vec3(0.4f, 0.0f, 0.2f), 1.0f, glass, "Glass duck");
+
+                // Clutter ducks (UI slider / ROYALGL_DUCKS env): up to 8
+                // extra ducks with varied materials/positions - a clutter
+                // variant of the fallback scene for spatial-reuse stress
+                // tests (fragmented reuse clusters, many silhouettes,
+                // glossy shift failures). Default 0 keeps every recorded
+                // soak reference valid.
+                // Instance cap: box + duck + 8 = 10 <= kMaxRestirInstances.
+                {
+                    int extra = std::clamp(m_duckCount, 0, 8);
+                    struct DuckSpec { glm::vec3 pos; float scale; int mat; };
+                    static const DuckSpec specs[8] = {
+                        {{-0.55f, 0.00f, -0.35f}, 0.85f, 0}, // rough copper
+                        {{ 0.10f, 0.00f, -0.55f}, 0.70f, 1}, // shiny conductor
+                        {{-0.20f, 0.00f,  0.45f}, 0.60f, 2}, // green diffuse
+                        {{ 0.65f, 0.00f, -0.25f}, 0.75f, 3}, // rough glass
+                        {{-0.70f, 0.00f,  0.25f}, 0.65f, 4}, // layered coat
+                        {{ 0.30f, 0.35f,  0.55f}, 0.55f, 1}, // floating, shiny
+                        {{-0.15f, 0.45f, -0.15f}, 0.50f, 0}, // floating, copper
+                        {{ 0.72f, 0.00f,  0.50f}, 0.60f, 2}, // blue diffuse
+                    };
+                    for (int i = 0; i < extra; ++i)
+                    {
+                        const DuckSpec& d = specs[i];
+                        Material mat;
+                        switch (d.mat)
+                        {
+                        case 0:
+                            mat.type = MaterialType::Conductor;
+                            mat.baseColor = glm::vec3(0.95f, 0.64f, 0.54f);
+                            mat.roughness = 0.35f;
+                            break;
+                        case 1:
+                            mat.type = MaterialType::Conductor;
+                            mat.baseColor = glm::vec3(0.9f, 0.9f, 0.92f);
+                            mat.roughness = 0.08f;
+                            break;
+                        case 2:
+                            mat.baseColor = (i == 7) ? glm::vec3(0.25f, 0.35f, 0.8f)
+                                                     : glm::vec3(0.25f, 0.7f, 0.3f);
+                            break;
+                        case 3:
+                            mat.type = MaterialType::RoughDielectric;
+                            mat.baseColor = glm::vec3(0.98f);
+                            mat.roughness = 0.2f;
+                            mat.ior = 1.5f;
+                            break;
+                        default:
+                            mat.type = MaterialType::Layered;
+                            mat.baseColor = glm::vec3(0.95f, 0.64f, 0.54f);
+                            mat.metallic = 1.0f;
+                            mat.roughness = 0.4f;
+                            mat.coatRoughness = 0.1f;
+                            mat.coatIor = 1.5f;
+                            mat.coatDepth = 0.0f;
+                            break;
+                        }
+                        m_scene->MergeInstance(duck, d.pos, d.scale, mat,
+                                               ("Clutter duck " + std::to_string(i)).c_str());
+                    }
+                    if (extra > 0)
+                        ROYALGL_LOG_INFO("Application: ", extra,
+                                         " clutter ducks merged into the fallback scene.");
+                }
             }
             else
             {
@@ -247,6 +452,7 @@ namespace RoyalGL
             }
         }
         m_instanceDirty.assign(m_scene->instances.size(), false);
+        return loaded;
     }
 
     void Application::OnFramebufferResize(int width, int height)
@@ -348,6 +554,96 @@ namespace RoyalGL
         ROYALGL_LOG_INFO("Stats @", n, " samples: mean=", mean, " relNoise=", relNoise,
                          " p50=", pct(0.5), " p99=", pct(0.99), " p99.9=", pct(0.999),
                          " p99.99=", pct(0.9999), " max=", lum.back(), " hot=", hot);
+
+        // ROYALGL_STATS_SPMIS: per-frame check of the stochastic-MIS
+        // selection identity E[sum 1/(N~ P count)] = 1 (accumulated by
+        // smerge into the learning region's .w). Systematic deviation of
+        // the pixel-mean from 1 localizes a selection-probability
+        // accounting error.
+        static const bool spmisDebug = (std::getenv("ROYALGL_STATS_SPMIS") != nullptr);
+        if (spmisDebug)
+        {
+            std::vector<float> region = m_pathTracer->ReadLearnRegion();
+            if (!region.empty())
+            {
+                double sum = 0.0, sum2 = 0.0;
+                size_t cnt = 0;
+                for (size_t i = 3; i < region.size(); i += 4)
+                {
+                    float v = region[i];
+                    if (v > 0.0f && std::isfinite(v))
+                    {
+                        sum += v; sum2 += double(v) * v; cnt++;
+                    }
+                }
+                if (cnt)
+                {
+                    double m = sum / cnt;
+                    ROYALGL_LOG_INFO("SpmisIdent: mean=", m, " rms=",
+                                     std::sqrt(sum2 / cnt), " n=", cnt);
+                }
+            }
+        }
+
+        if (m_statsMaskEnabled)
+        {
+            // Same noise measure restricted to pixels the temporal pass
+            // flagged as disoccluded (mask == 1): the region where spatial
+            // candidate selection quality shows. NOTE: lum was sorted above
+            // for percentiles, so re-derive the unsorted luminances here.
+            std::vector<float> mask = m_pathTracer->ReadDisocclusionMask();
+            if (mask.size() == static_cast<size_t>(w) * static_cast<size_t>(h))
+            {
+                std::vector<float> lu;
+                lu.reserve(mask.size());
+                for (size_t i = 0; i + 3 < raw.size(); i += 4)
+                    lu.push_back((raw[i] + raw[i + 1] + raw[i + 2]) / (3.0f * std::max(raw[i + 3], 1.0f)));
+                double mSum = 0.0, mNoise = 0.0;
+                size_t mCount = 0, mNoiseCount = 0;
+                for (int y = 1; y < h - 1; ++y)
+                {
+                    for (int x = 1; x < w - 1; ++x)
+                    {
+                        size_t i = static_cast<size_t>(y) * w + x;
+                        if (mask[i] < 0.5f) continue;
+                        float c = lu[i];
+                        mSum += c;
+                        mCount++;
+                        if (c > 5.0f) continue;
+                        float nb = 0.25f * (lu[i - 1] + lu[i + 1] + lu[i - w] + lu[i + w]);
+                        mNoise += std::abs(c - nb);
+                        mNoiseCount++;
+                    }
+                }
+                double mMean = mCount ? mSum / mCount : 0.0;
+                double mRel = (mNoiseCount && mMean > 0.0) ? (mNoise / mNoiseCount) / mMean : 0.0;
+                ROYALGL_LOG_INFO("MaskStats @", n, " samples: frac=",
+                                 static_cast<double>(mCount) / (static_cast<double>(w) * h),
+                                 " mean=", mMean, " relNoise=", mRel);
+            }
+        }
+
+        if (m_settings.restirShiftDiag != 0)
+        {
+            // Dual-direction shift diagnostic: reduce the cross-frame
+            // tallies smerge accumulates in the learn region (.y / .w -
+            // semantics per sub-mode, see restir_wf_smerge.comp).
+            std::vector<float> lr = m_pathTracer->ReadLearnRegion();
+            if (!lr.empty())
+            {
+                double sumY = 0.0, sumW = 0.0;
+                size_t nz = 0;
+                for (size_t i = 0; i + 3 < lr.size(); i += 4)
+                {
+                    sumY += lr[i + 1];
+                    sumW += lr[i + 3];
+                    if (lr[i + 1] != 0.0f || lr[i + 3] != 0.0f) nz++;
+                }
+                ROYALGL_LOG_INFO("ShiftDiag mode=", m_settings.restirShiftDiag,
+                                 " @", n, " samples: sumY=", sumY,
+                                 " sumW=", sumW, " pixels=", nz);
+            }
+        }
     }
 
     void Application::RunDenoiser()
@@ -400,6 +696,26 @@ namespace RoyalGL
 
             m_window->PollEvents();
             HandleCameraInput(dt);
+            // Scripted switch test fires through the exact UI path.
+            if (m_switchTestIndex >= 0 && ++m_switchTestTick >= m_switchTestFrame)
+            {
+                m_pendingSceneIndex = m_switchTestIndex;
+                m_switchTestIndex = -1;
+            }
+            // Deferred scene switches from the UI: only at a frame boundary
+            // with no async BVH rebuild in flight (the worker still owns
+            // scene-derived buffers while busy).
+            if ((m_pendingSceneIndex >= 0 || m_pendingSceneReload) && !m_bvh->AsyncBusy())
+            {
+                PerformSceneSwitch(m_pendingSceneIndex >= 0 ? m_pendingSceneIndex : m_sceneIndex);
+                m_pendingSceneIndex = -1;
+                m_pendingSceneReload = false;
+            }
+            // ROYALGL_FIXED_DT=<seconds>: advance the scripted motions below
+            // by a constant per-frame step instead of wall-clock time, so
+            // A/B runs of configs with different frame costs see IDENTICAL
+            // per-frame scene changes (same disocclusion widths etc.).
+            if (m_fixedDt > 0.0f) dt = m_fixedDt;
             // Scripted rocking yaw (works with LOCK_CAMERA - that only mutes
             // input): direction flips every 2s, so scene walls repeatedly
             // enter the frame edges at grazing angles - the repro case for
@@ -566,9 +882,14 @@ namespace RoyalGL
 
             m_ui->BeginFrame();
             UIFrameResult result = m_ui->Draw(m_settings, *m_scene, m_pathTracer->SampleCount(),
-                                               dt * 1000.0f, Denoiser::IsAvailable(), m_lensPresetNames);
+                                               dt * 1000.0f, Denoiser::IsAvailable(), m_lensPresetNames,
+                                               m_sceneNames, m_sceneIndex, m_duckCount, m_duckMaterial);
             if (result.denoiseRequested) RunDenoiser();
             if (result.exportRequested) ExportPNG(result.exportPath);
+            if (result.sceneSelected >= 0 && result.sceneSelected != m_sceneIndex)
+                m_pendingSceneIndex = result.sceneSelected;
+            if (result.sceneCompositionChanged && m_sceneIndex == 0)
+                m_pendingSceneReload = true;
             m_ui->EndFrame();
 
             // ----------------------- async instance-move BVH rebuilds -----

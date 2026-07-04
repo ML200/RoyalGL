@@ -26,6 +26,18 @@ void main()
     uint outSlot = RestirRegionOffset(RestirTemporalOutRegion()) + idx;
 
     wfArena[idx] = vec4(0.0); // header: invalid until proven otherwise
+    // Disocclusion flag for offline masked stats (ROYALGL_STATS_MASK) and
+    // the shift-aware selection's learning state: 1 = this pixel PARTAKES
+    // in reuse but the temporal pass found no usable history this frame.
+    // Anchor-less pixels without a shiftable airlight family never reuse,
+    // so they stay 0 and don't pollute the disocclusion statistics.
+    wfArena[WfShiftScoreSlot(idx)].y = 0.0;
+    // The learned shift-success score follows the SURFACE, not the pixel:
+    // it reprojects with the history pairing below (benign read race with
+    // other threads' owner writes - either frame's score is a valid
+    // heuristic) and resets to unlearned on disocclusion, where the old
+    // surface's statistics are meaningless and a stale low score would
+    // starve the only contributing sources of selection probability.
 
     GBufferPixel gCur = RestirLoadGBuf(GBufCurOffset() + idx);
     if (gCur.posDepth.w < 0.0)
@@ -54,6 +66,8 @@ void main()
                     if (gPrev.posDepth.w < 0.0)
                     {
                         wfArena[idx] = vec4(uintBitsToFloat(prevIdx), uintBitsToFloat(1u), 1.0, 0.0);
+                        if (prevIdx != idx)
+                            wfArena[WfShiftScoreSlot(idx)].x = wfArena[WfShiftScoreSlot(prevIdx)].x;
                         uint bSlot = RestirRegionOffset(RestirHistoryRegion()) + prevIdx;
                         vec4 bCore = pixelRes[bSlot].path.core;
                         vec4 aCore = pixelRes[inSlot].path.core;
@@ -70,6 +84,10 @@ void main()
                 }
             }
         }
+        // Fog-cluster pixels that reached here failed their fog pairing -
+        // that IS a disocclusion for the airlight reuse chain.
+        if (FogScatterEnabled()) wfArena[WfShiftScoreSlot(idx)].y = 1.0;
+        wfArena[WfShiftScoreSlot(idx)].x = 0.0; // unlearned
         if (outSlot != inSlot) pixelRes[outSlot].path = pixelRes[inSlot].path;
         return;
     }
@@ -138,6 +156,8 @@ void main()
     if (!histValid)
     {
         // Disocclusion / off-screen: the candidate stands alone, m_A = 1.
+        wfArena[WfShiftScoreSlot(idx)].y = 1.0;
+        wfArena[WfShiftScoreSlot(idx)].x = 0.0; // unlearned (new surface)
         if (outSlot != inSlot) pixelRes[outSlot].path = pixelRes[inSlot].path;
         return;
     }
@@ -145,6 +165,8 @@ void main()
     uint prevIdx = RestirPixelIndex(prevPix);
     if (!volOnly) histFade *= RestirReuseRoughFade(GBufMaterial(gCur));
     wfArena[idx] = vec4(uintBitsToFloat(prevIdx), uintBitsToFloat(1u), histFade, 0.0);
+    if (prevIdx != idx)
+        wfArena[WfShiftScoreSlot(idx)].x = wfArena[WfShiftScoreSlot(prevIdx)].x;
 
     uint bSlot = RestirRegionOffset(RestirHistoryRegion()) + prevIdx;
     vec4 bCore = pixelRes[bSlot].path.core;

@@ -46,6 +46,15 @@ namespace RoyalGL
         int Width() const { return m_width; }
         int Height() const { return m_height; }
 
+        // Per-pixel disocclusion flags (1 = the last temporal pass found no
+        // usable history), read back from the wavefront arena's learning
+        // region for the ROYALGL_STATS_MASK stats. Empty when the wavefront
+        // pipeline is unsupported; meaningful only with temporal reuse on.
+        std::vector<float> ReadDisocclusionMask() const;
+        // The raw learning region [27N,28N): pixelCount vec4s flattened
+        // (score EMA, disocclusion flag, chosen run, debug accumulator).
+        std::vector<float> ReadLearnRegion() const;
+
     private:
         Shader m_bdptLightSelShader;
         Shader m_bdptLightShader;
@@ -78,6 +87,11 @@ namespace RoyalGL
         // candidate sort into cluster-masked inverse CDFs, consumed by the
         // antithetic selection in restir_wf_sinit.comp.
         Shader m_wfSSortShader;
+        // Probe-guided selection (ROYALGL_RESTIR_PSEL): per-block probe
+        // shifts measure the ideal selection weight per candidate run
+        // (psel creates probe jobs, pfin folds the pipeline results).
+        Shader m_wfPSelShader;
+        Shader m_wfPFinShader;
         // Sample duplication map (ReSTIR PT Enhanced sec. 5): end-of-frame
         // 17x17 same-seed counting; next frame's temporal merge lowers the
         // confidence cap where duplication is high.

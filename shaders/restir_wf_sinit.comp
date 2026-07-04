@@ -5,7 +5,7 @@
 #include "restir_wf_shift.glsl"
 
 // Wavefront spatial reuse, stage 1 of candidate round uWfRound: histogram-
-// stratified candidate selection (Salaün et al. 2025) + shift-job creation.
+// stratified candidate selection (Sala??n et al. 2025) + shift-job creation.
 // Round 0 also initializes the running aggregate in the final-region slot.
 //
 // Candidate selection replaces the historical uniform-disk neighbor draw:
@@ -81,7 +81,7 @@ void main()
             // dedicated fog cluster (restir_wf_ssort.comp) and run the
             // rounds like any surface pixel, airlight family only.
             pixelRes[outSlot].path = pixelRes[canonSlot].path;
-            wfArena[WfShadeAccSlot(idx)].xyz = vec3(0.0);
+            if (uWfPass == 0u) wfArena[WfShadeAccSlot(idx)].xyz = vec3(0.0);
             wfArena[idx] = vec4(0.0, uintBitsToFloat(0u), uintBitsToFloat(0u), 0.0);
             return;
         }
@@ -105,24 +105,494 @@ void main()
             pixelRes[outSlot].path = empty;
         }
         // Marginalized RGB shading accumulator (component write: .w holds
-        // the frame-persistent duplication score).
-        wfArena[WfShadeAccSlot(idx)].xyz = vec3(0.0);
-        uint rng = WangHash(idx * 26699u + uFrame.restirParams.z * 30323u + 0x8DA6B343u);
+        // the frame-persistent duplication score). Iterated passes keep a
+        // RUNNING MEAN over the passes' estimates: pass p rescales the
+        // accumulated content by p/(p+1) here, and smerge adds this pass's
+        // terms scaled by 1/(p+1) - each pass estimates the same integral,
+        // so the mean is unbiased with lower variance than any single one.
+        if (uWfPass == 0u)
+            wfArena[WfShadeAccSlot(idx)].xyz = vec3(0.0);
+        else
+            wfArena[WfShadeAccSlot(idx)].xyz *= float(uWfPass) / float(uWfPass + 1u);
+        uint rng = WangHash(idx * 26699u + uFrame.restirParams.z * 30323u
+                            + uWfPass * 0x68E31DA4u + 0x8DA6B343u);
         if (rng == 0u) rng = 0x9E3779B9u;
         // Every pixel reaching this point runs candidate rounds (miss
         // pixels without fog-cluster reuse returned above).
         wfArena[idx] = vec4(uintBitsToFloat(rng),
                             uintBitsToFloat(1u),
                             uintBitsToFloat(0u),
-                            WfSobolSel(uFrame.restirParams.z, idx));
+                            WfSobolSel(uFrame.restirParams.z, idx ^ (uWfPass * 0x517CC1B7u)));
     }
     if (floatBitsToUint(wfArena[idx].y) == 0u) return;
 
     // This pixel's cluster run in its block's sorted candidate list.
     uint sortSlot = WfSortSlotBase() + idx;
-    uint start = floatBitsToUint(wfArena[sortSlot].y);
-    uint count = floatBitsToUint(wfArena[sortSlot].z);
+    uint runPacked = floatBitsToUint(wfArena[sortSlot].y);
+    uint start = WfSortRunStart(runPacked);
+    uint count = WfSortRunCount(runPacked);
+    uint mode = RestirSpatialMode();
 
+    uint job0 = idx * 2u;
+    uint job1 = idx * 2u + 1u;
+
+    // Fog-cluster pairs (this pixel is a miss => the whole cluster is miss
+    // pixels) restrict both merge directions to the airlight family, the
+    // same symmetric volOnly restriction as the fog pairings of tinit.
+    bool fogCluster = gCur.posDepth.w < 0.0;
+    vec4 cCore = pixelRes[canonSlot].path.core;
+
+    if (mode >= 1u)
+    {
+        // ---- SPMIS candidate selection (Hedstrom et al. 2026) ----------
+        // BATCHED: sweep uWfRound draws up to WF_SPATIAL_BATCH candidates
+        // from the reuse run's selection CDF (built by
+        // restir_wf_ssort.comp; P(z) = s_z / S exactly) and traces them
+        // through ONE shift-pipeline pass - the per-sweep fixed cost
+        // amortizes over the batch. All sweeps' draws together form the
+        // paper's N~ = K multiset; smerge folds every pick into ONE
+        // reservoir chain with stochastic pairwise MIS weights
+        // m~_z = 1/(N~ P(z)) * m_z. Job slot b of this pixel carries
+        // candidate b: meta .x = source slot (encodes the neighbor;
+        // scratch+idx = self-draw, synthesized without a shift),
+        // .w = P(z) (0 = no candidate).
+        uint kTotal = uint(K + 0.5);
+        uint bBase = uWfRound * WF_SPATIAL_BATCH;
+        uint batch = min(WF_SPATIAL_BATCH, kTotal - min(bBase, kTotal));
+        for (uint b = 0u; b < WF_SPATIAL_BATCH; ++b)
+        {
+            uint jb = WfShiftJobBase(idx * WF_JOBS_PER_PIXEL + b);
+            wfArena[jb].z = uintBitsToFloat(WF_JOB_FAIL);
+            wfArena[jb].w = 0.0;
+        }
+        if (uWfRound == 0u)
+        {
+            uint jbB = WfShiftJobBase(idx * WF_JOBS_PER_PIXEL + WF_SPATIAL_BATCH);
+            wfArena[jbB].z = uintBitsToFloat(WF_JOB_FAIL);
+            wfArena[jbB].w = 0.0; // z'+1; 0 = none
+        }
+        wfArena[idx].z = uintBitsToFloat(idx + 1u);
+        // Debug identity accumulator (ROYALGL_STATS_SPMIS): smerge adds
+        // 1/(N~ P(z) count) per draw; E over a frame is exactly 1. The
+        // shift diagnostic accumulates its cross-frame tallies in the
+        // same channel instead - do not reset under it.
+        if (uWfRound == 0u && RestirShiftDiagMode() == 0u)
+            wfArena[WfShiftScoreSlot(idx)].w = 0.0;
+
+        uint rng = floatBitsToUint(wfArena[idx].x);
+        ivec2 size = ivec2(uFrame.frameInfo.xy);
+
+        // ---- Probe-guided union selection (ROYALGL_RESTIR_PSEL) --------
+        // The pool is the pixel's own run UNION the block's key-matching
+        // probed runs (psel/pfin passes); draws use a two-level CDF whose
+        // EXACT mixed probability P(z) = dm s_z/S_pool
+        //                            + (1-dm) (w^_r/W_pool)(s_z/S_r)
+        // rides jb.w - the measured ideal weights only shape a compensated
+        // P, membership is value-independent, and an all-dead pool draws
+        // nothing (the zero branch stays zero: no gate-3 trap).
+        if (mode == 1u && RestirPselEnabled())
+        {
+            if (uWfRound == 0u)
+                wfArena[WfShiftScoreSlot(idx)].z = uintBitsToFloat(idx + 1u);
+            if (count == 0u)
+            {
+                wfArena[idx].x = uintBitsToFloat(rng);
+                return;
+            }
+            uint myKey = WfClusterKey(gCur);
+            uint myBlockLin = WfPselBlockLinear(WfSortBlockOf(pixel));
+            ivec2 origin, lo, sz;
+            WfSortBlockRect(WfSortBlockOf(pixel), origin, lo, sz);
+            float S_own = WfSortRankCdf(origin, lo, sz, start + count - 1u);
+            float cSigOwn = max(wfArena[sortSlot].z, 0.0);
+            // Own-run analytic guided weight: rho = 1 (local shifts),
+            // pairwise factor at equal target values = cS/(cS+cC).
+            float cCc = min(max(cCore.z, 0.0), RestirConfidenceCap());
+            float cSgOwn = K * cSigOwn / float(count);
+            float wOwn = S_own * (cSgOwn / max(cSgOwn + cCc, 1e-12));
+
+            uint probes = min(RestirSearchIters(), WF_PSEL_MAX_PROBES);
+            // Pass 1: pool sums (deterministic; identical every round).
+            float S_pool = S_own, W_pool = wOwn, cSigPool = cSigOwn;
+            uint M_pool = count;
+            for (uint r = 0u; r < probes; ++r)
+            {
+                uint sa = WfPselSlot(myBlockLin, r);
+                uint encA = floatBitsToUint(wfArena[sa].x);
+                if (encA == 0u) continue;
+                if (floatBitsToUint(wfArena[sa + 1u].x) != myKey) continue;
+                uint sb = floatBitsToUint(wfArena[sa + 1u].w);
+                if ((sb & 511u) == start && (sb >> 9u) == myBlockLin)
+                    continue; // the pixel's own run
+                S_pool += wfArena[sa].w;
+                W_pool += max(wfArena[sa].y, 0.0);
+                cSigPool += wfArena[sa].z;
+                M_pool += encA >> 21u;
+            }
+            if (uWfRound == 0u)
+            {
+                // smerge sources the pool scale from here (countF, cS).
+                wfArena[WfShiftScoreSlot(idx)].x = cSigPool;
+                wfArena[WfShiftScoreSlot(idx)].w = float(M_pool);
+            }
+            if (M_pool <= 1u)
+            {
+                wfArena[idx].x = uintBitsToFloat(rng);
+                return; // no partners anywhere: deterministic canonical fold
+            }
+
+            // Sweep 0: backward z' uniform over the WHOLE pool
+            // (Pc = 1/M_pool; smerge multiplies beta by countF = M_pool).
+            if (uWfRound == 0u && cCore.x > 0.0 && cCore.y > 0.0)
+            {
+                uint jobB = idx * WF_JOBS_PER_PIXEL + WF_SPATIAL_BATCH;
+                uint t = min(uint(RestirRand(rng) * float(M_pool)), M_pool - 1u);
+                uint zIdx = idx;
+                if (t < count) zIdx = WfSortRankPixel(origin, lo, sz, start + t);
+                else
+                {
+                    t -= count;
+                    for (uint r = 0u; r < probes; ++r)
+                    {
+                        uint sa = WfPselSlot(myBlockLin, r);
+                        uint encA = floatBitsToUint(wfArena[sa].x);
+                        if (encA == 0u) continue;
+                        if (floatBitsToUint(wfArena[sa + 1u].x) != myKey) continue;
+                        uint sb = floatBitsToUint(wfArena[sa + 1u].w);
+                        if ((sb & 511u) == start && (sb >> 9u) == myBlockLin) continue;
+                        uint cnt = encA >> 21u;
+                        if (t < cnt)
+                        {
+                            uint zs = (encA & 0x1FFFFFu) - 1u;
+                            ivec2 zp = ivec2(int(zs % uFrame.frameInfo.x),
+                                             int(zs / uFrame.frameInfo.x));
+                            ivec2 eo, el, es;
+                            WfSortBlockRect(WfSortBlockOf(zp), eo, el, es);
+                            zIdx = WfSortRankPixel(eo, el, es, (sb & 511u) + t);
+                            break;
+                        }
+                        t -= cnt;
+                    }
+                }
+                if (zIdx != idx)
+                    WfShiftCreateJob(jobB, canonSlot, zIdx, false, fogCluster);
+                wfArena[WfShiftJobBase(jobB)].w = float(zIdx + 1u);
+            }
+
+            // Forward draws: two-level with the exact mixed P.
+            if (S_pool > 0.0)
+            {
+                float dm = RestirScoreDefMix(); // defensive baseline share
+                for (uint b = 0u; b < batch; ++b)
+                {
+                    bool baseline = (W_pool <= 0.0) || (RestirRand(rng) < dm);
+                    float total1 = baseline ? S_pool : W_pool;
+                    float target1 = RestirRand(rng) * total1;
+                    // Level 1: pick the run (own first, then entries -
+                    // the same deterministic order as pass 1).
+                    bool found = true;
+                    float S_r = S_own, w_r = wOwn;
+                    uint eStart = start, eCount = count;
+                    ivec2 ro = origin, rl = lo, rs = sz;
+                    float acc = baseline ? S_own : wOwn;
+                    if (target1 >= acc)
+                    {
+                        found = false;
+                        for (uint r = 0u; r < probes; ++r)
+                        {
+                            uint sa = WfPselSlot(myBlockLin, r);
+                            uint encA = floatBitsToUint(wfArena[sa].x);
+                            if (encA == 0u) continue;
+                            if (floatBitsToUint(wfArena[sa + 1u].x) != myKey) continue;
+                            uint sb = floatBitsToUint(wfArena[sa + 1u].w);
+                            if ((sb & 511u) == start && (sb >> 9u) == myBlockLin) continue;
+                            float wr = baseline ? wfArena[sa].w
+                                                : max(wfArena[sa].y, 0.0);
+                            if (wr <= 0.0) continue;
+                            acc += wr;
+                            if (target1 < acc)
+                            {
+                                S_r = wfArena[sa].w;
+                                w_r = max(wfArena[sa].y, 0.0);
+                                eCount = encA >> 21u;
+                                eStart = sb & 511u;
+                                uint zs = (encA & 0x1FFFFFu) - 1u;
+                                ivec2 zp = ivec2(int(zs % uFrame.frameInfo.x),
+                                                 int(zs / uFrame.frameInfo.x));
+                                WfSortBlockRect(WfSortBlockOf(zp), ro, rl, rs);
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!found || S_r <= 0.0) continue;
+                    // Level 2: entry within the run, prop. to s_z / S_r.
+                    float t2 = RestirRand(rng) * S_r;
+                    uint loR = eStart, hiR = eStart + eCount - 1u;
+                    while (loR < hiR)
+                    {
+                        uint mid = (loR + hiR) >> 1u;
+                        if (WfSortRankCdf(ro, rl, rs, mid) > t2) hiR = mid;
+                        else loR = mid + 1u;
+                    }
+                    float cdfHi = WfSortRankCdf(ro, rl, rs, loR);
+                    float cdfLo = (loR > eStart) ? WfSortRankCdf(ro, rl, rs, loR - 1u) : 0.0;
+                    float sZ = cdfHi - cdfLo;
+                    if (!(cdfHi > t2 && sZ > 0.0)) continue;
+                    uint nIdx = WfSortRankPixel(ro, rl, rs, loR);
+                    uint nSlot = RestirRegionOffset(RESTIR_SCRATCH_REGION) + nIdx;
+                    uint jobIdx = idx * WF_JOBS_PER_PIXEL + b;
+                    if (nIdx != idx)
+                    {
+                        vec4 nCore = pixelRes[nSlot].path.core;
+                        if (nCore.x > 0.0 && nCore.y > 0.0)
+                            WfShiftCreateJob(jobIdx, nSlot, idx, false, fogCluster);
+                        else
+                            wfArena[WfShiftJobBase(jobIdx)].x = uintBitsToFloat(nSlot);
+                    }
+                    else
+                    {
+                        wfArena[WfShiftJobBase(jobIdx)].x = uintBitsToFloat(nSlot);
+                    }
+                    // Exact mixed per-draw probability -> complete scale.
+                    float Pz = (W_pool > 0.0)
+                        ? sZ * (dm / S_pool + (1.0 - dm) * w_r / (W_pool * S_r))
+                        : sZ / S_pool;
+                    wfArena[WfShiftJobBase(jobIdx)].w = 1.0 / max(K * Pz, 1e-24);
+                }
+            }
+            wfArena[idx].x = uintBitsToFloat(rng);
+            return;
+        }
+
+        // Round 0: cell search (paper Sec. 5.1) - WRS over probed pixels'
+        // same-cluster runs weighted by run confidence mass, with growing
+        // probe radius, seeded by the pixel's own run. Recovers reuse
+        // partners when a disocclusion swallows the whole local block.
+        // The choice depends only on confidences and G-buffer data, never
+        // on sample values, so it is input-SET selection and needs no MIS
+        // compensation. The winner is stored for the later rounds.
+        if (uWfRound == 0u)
+        {
+            uint runPix = idx;
+            // Starvation gate: probing replaces close partners with
+            // distant ones, so at steady state it is a pure noise tax;
+            // even wide fresh strips reuse better among their own run's
+            // 256 same-frame candidates. Only pixels whose run is
+            // near-empty (mode 1) or history-less (mode 2) stand to gain
+            // from a foreign run.
+            // Mode 3 (contribution-aware: trigger on own-run S == 0,
+            // probes weighted by THEIR selection mass) is a MEASURED
+            // NEGATIVE RESULT - keep for the ablation, never as default:
+            // it brightens the LightMaze mean +12-16%. The estimator's
+            // accounting needs dead-run realizations to contribute ZERO
+            // (E[est] = P(dead)*0 + P(live)*E[est|live] = I); swapping
+            // the pool exactly on the dead branch injects energy the
+            // live branches already carry at full weight, and no
+            // branch-local compensation exists. This is the pool-level
+            // form of the chained-merge value-correlation trap, and the
+            // reason the paper's search weights by CONFIDENCE (value-
+            // blind) rather than contribution. The unbiased road to
+            // sparse-carrier rescue is an ALWAYS-ON union pool with the
+            // union's exact selection CDF (value dependence inside the
+            // compensated per-draw P) - see the research log.
+            uint gateMode = RestirSearchGateMode();
+            float sOwn = 0.0;
+            ivec2 oOwn, lOwn, szOwn;
+            if (gateMode == 3u && count > 0u)
+            {
+                WfSortBlockRect(WfSortBlockOf(pixel), oOwn, lOwn, szOwn);
+                sOwn = WfSortRankCdf(oOwn, lOwn, szOwn, start + count - 1u);
+            }
+            bool starved = count <= 2u
+                || (gateMode == 3u && sOwn <= 0.0)
+                || (gateMode == 2u && RestirTemporalEnabled()
+                    && wfArena[WfShiftScoreSlot(idx)].y > 0.5);
+            if (RestirCellSearchEnabled() && (gateMode == 0u || starved))
+            {
+                uint myKey = WfClusterKey(gCur);
+                float total = (gateMode == 3u) ? max(sOwn, 0.0)
+                                               : max(wfArena[sortSlot].z, 0.0);
+                float radius = RestirSearchRadius(); // paper Sec. 5.1: 12 iters, 30px, x1.25
+                uint iters = RestirSearchIters();
+                for (uint i = 0u; i < iters; ++i)
+                {
+                    float r = sqrt(RestirRand(rng)) * radius;
+                    float phi = 6.2831853 * RestirRand(rng);
+                    ivec2 q = pixel + ivec2(r * cos(phi), r * sin(phi));
+                    radius *= 1.25;
+                    if (q.x < 0 || q.y < 0 || q.x >= size.x || q.y >= size.y) continue;
+                    uint qIdx = RestirPixelIndex(q);
+                    if (qIdx == runPix) continue;
+                    GBufferPixel gq = RestirLoadGBuf(GBufCurOffset() + qIdx);
+                    if (WfClusterKey(gq) != myKey) continue;
+                    float wq;
+                    if (gateMode == 3u)
+                    {
+                        uint qPacked = floatBitsToUint(wfArena[WfSortSlotBase() + qIdx].y);
+                        uint qCount = WfSortRunCount(qPacked);
+                        if (qCount == 0u) continue;
+                        ivec2 oq, lq, sq;
+                        WfSortBlockRect(WfSortBlockOf(q), oq, lq, sq);
+                        wq = WfSortRankCdf(oq, lq, sq,
+                                           WfSortRunStart(qPacked) + qCount - 1u);
+                    }
+                    else wq = max(wfArena[WfSortSlotBase() + qIdx].z, 0.0);
+                    if (wq <= 0.0) continue;
+                    total += wq;
+                    if (RestirRand(rng) * total <= wq) runPix = qIdx;
+                }
+            }
+            // Shift-diagnostic distance probe: replace the run with an
+            // INVOLUTIVE fixed-stride partner (x-cells pair mutually at
+            // +-stride, cluster test symmetric), so the distant-pair
+            // ensemble stays exchangeable for the direction tallies.
+            // Input-set selection - the chain stays unbiased.
+            if (RestirShiftDiagMode() != 0u && RestirShiftDiagDist() > 0.5)
+            {
+                int stride = int(RestirShiftDiagDist() + 0.5);
+                int cx = pixel.x / stride;
+                ivec2 q = pixel + ivec2(((cx & 1) == 0) ? stride : -stride, 0);
+                if (q.x >= 0 && q.x < size.x)
+                {
+                    uint qIdx = RestirPixelIndex(q);
+                    GBufferPixel gq = RestirLoadGBuf(GBufCurOffset() + qIdx);
+                    if (WfClusterKey(gq) == WfClusterKey(gCur)
+                        && WfSortRunCount(floatBitsToUint(
+                               wfArena[WfSortSlotBase() + qIdx].y)) > 0u)
+                        runPix = qIdx;
+                }
+            }
+            wfArena[WfShiftScoreSlot(idx)].z = uintBitsToFloat(runPix + 1u);
+        }
+
+        // Resolve the chosen run (own or foreign block).
+        uint runPix = WfSpmisRunPixel(idx);
+        ivec2 runPixel = ivec2(int(runPix % uFrame.frameInfo.x), int(runPix / uFrame.frameInfo.x));
+        uint runSlot = WfSortSlotBase() + runPix;
+        uint runPacked2 = floatBitsToUint(wfArena[runSlot].y);
+        start = WfSortRunStart(runPacked2);
+        count = WfSortRunCount(runPacked2);
+
+        // No reuse partners at all (own single-pixel run): smerge round 0
+        // folds the canonical with weight 1 (deterministic pairwise MIS
+        // with zero non-canonical inputs).
+        if (runPix == idx && count <= 1u)
+        {
+            wfArena[idx].x = uintBitsToFloat(rng);
+            return;
+        }
+        if (count == 0u)
+        {
+            wfArena[idx].x = uintBitsToFloat(rng);
+            return;
+        }
+
+        ivec2 origin, lo, sz;
+        WfSortBlockRect(WfSortBlockOf(runPixel), origin, lo, sz);
+
+        // Sweep 0: the canonical MIS weight m~_c is estimated with N~c = 1
+        // by shifting the canonical to ONE uniform pixel z' of the run
+        // (Pc = 1/count over ALL run pixels, contributing or not).
+        if (uWfRound == 0u && cCore.x > 0.0 && cCore.y > 0.0)
+        {
+            uint jobB = idx * WF_JOBS_PER_PIXEL + WF_SPATIAL_BATCH;
+            uint zRank = start + min(uint(RestirRand(rng) * float(count)), count - 1u);
+            uint zIdx = WfSortRankPixel(origin, lo, sz, zRank);
+            if (zIdx != idx) // self: identity shift, synthesized in smerge
+                WfShiftCreateJob(jobB, canonSlot, zIdx, false, fogCluster);
+            wfArena[WfShiftJobBase(jobB)].w = float(zIdx + 1u);
+        }
+
+        // Weighted forward draws: invert the run's inclusive CDF once per
+        // batched candidate. Strict comparison makes zero-weight ranks
+        // unselectable (their CDF interval is empty) - exactly
+        // P(z) = s_z / S.
+        float S = WfSortRankCdf(origin, lo, sz, start + count - 1u);
+        if (S > 0.0)
+        {
+            for (uint b = 0u; b < batch; ++b)
+            {
+                // Mode 1 keeps SPMIS's i.i.d. draws (faithful baseline).
+                // Mode 2 draws at antithetic stratified positions on the
+                // selection CDF - licensed by the first-moment lemma:
+                // the K strata partition [0,1), so E[K(z)] = N~ P(z)
+                // holds for any P while successive draws stratify the
+                // selection mass and pair antithetically.
+                float pos;
+                if (mode >= 2u && RestirStratifiedEnabled())
+                {
+                    float u = wfArena[idx].w / K;
+                    float k = float(bBase + b);
+                    pos = (((bBase + b) & 1u) == 0u) ? (k / K + u)
+                                                     : ((k + 1.0) / K - u);
+                }
+                else pos = RestirRand(rng); // baseline: independent draws
+                float target = pos * S;
+                uint loR = start, hiR = start + count - 1u;
+                while (loR < hiR) // first rank with cdf > target
+                {
+                    uint mid = (loR + hiR) >> 1u;
+                    if (WfSortRankCdf(origin, lo, sz, mid) > target) hiR = mid; else loR = mid + 1u;
+                }
+                float cdfHi = WfSortRankCdf(origin, lo, sz, loR);
+                float cdfLo = (loR > start) ? WfSortRankCdf(origin, lo, sz, loR - 1u) : 0.0;
+                float sZ = cdfHi - cdfLo;
+                if (cdfHi > target && sZ > 0.0)
+                {
+                    uint nIdx = WfSortRankPixel(origin, lo, sz, loR);
+                    uint nSlot = RestirRegionOffset(RESTIR_SCRATCH_REGION) + nIdx;
+                    uint jobIdx = idx * WF_JOBS_PER_PIXEL + b;
+                    if (nIdx != idx) // self-draws synthesize in smerge (J = 1)
+                    {
+                        vec4 nCore = pixelRes[nSlot].path.core;
+                        if (nCore.x > 0.0 && nCore.y > 0.0)
+                            WfShiftCreateJob(jobIdx, nSlot, idx, false, fogCluster);
+                        else
+                            wfArena[WfShiftJobBase(jobIdx)].x = uintBitsToFloat(nSlot);
+                    }
+                    else
+                    {
+                        // Self-draw: record the source slot for smerge's
+                        // identity synthesis, no shift job.
+                        wfArena[WfShiftJobBase(jobIdx)].x = uintBitsToFloat(nSlot);
+                    }
+                    // Complete stochastic-MIS scale 1/(N~ P(z)), stored
+                    // directly (jb.w always carries the full scale).
+                    wfArena[WfShiftJobBase(jobIdx)].w = S / (sZ * float(kTotal));
+                }
+            }
+        }
+        // Dual-direction diagnostic: round 1 re-uses the (otherwise idle)
+        // backward job slot to run the FORWARD shift z' -> c of the SAME
+        // pair whose backward shift c -> z' ran in round 0 (z' survives in
+        // the slot's meta .w). Tally-only - smerge round 1 never merges
+        // slot WF_SPATIAL_BATCH, so the estimator is untouched.
+        if (RestirShiftDiagMode() != 0u && uWfRound == 1u && mode == 1u)
+        {
+            uint jobB = idx * WF_JOBS_PER_PIXEL + WF_SPATIAL_BATCH;
+            uint jbB = WfShiftJobBase(jobB);
+            uint zPlus1 = uint(wfArena[jbB].w);
+            wfArena[jbB].z = uintBitsToFloat(WF_JOB_FAIL);
+            if (zPlus1 != 0u && zPlus1 - 1u != idx)
+            {
+                uint zIdx = zPlus1 - 1u;
+                uint zSlot = RestirRegionOffset(RESTIR_SCRATCH_REGION) + zIdx;
+                vec4 zCore = pixelRes[zSlot].path.core;
+                if (zCore.x > 0.0 && zCore.y > 0.0)
+                {
+                    WfShiftCreateJob(jobB, zSlot, idx, false, fogCluster);
+                    wfArena[jbB].w = float(zIdx + 1u);
+                }
+                else wfArena[jbB].w = 0.0;
+            }
+            else wfArena[jbB].w = 0.0;
+        }
+        wfArena[idx].x = uintBitsToFloat(rng);
+        return;
+    }
+
+    // ---- Mode 0: pair-mixture rounds (Sala??n-stratified rank picks) -----
     // Antithetic stratified position for this round (A/B: uniform random
     // from the same pool when stratification is disabled).
     float pos;
@@ -150,15 +620,8 @@ void main()
     wfArena[idx].z = uintBitsToFloat(nIdx + 1u);
     if (nIdx == idx) return; // self round: smerge folds in the canonical
 
-    uint job0 = idx * 2u;
-    uint job1 = idx * 2u + 1u;
     wfArena[WfShiftJobBase(job0)].z = uintBitsToFloat(WF_JOB_FAIL);
     wfArena[WfShiftJobBase(job1)].z = uintBitsToFloat(WF_JOB_FAIL);
-
-    // Fog-cluster pairs (this pixel is a miss => the whole cluster is miss
-    // pixels) restrict both merge directions to the airlight family, the
-    // same symmetric volOnly restriction as the fog pairings of tinit.
-    bool fogCluster = gCur.posDepth.w < 0.0;
 
     // Forward: candidate sample into this pixel's domain.
     uint nSlot = RestirRegionOffset(RESTIR_SCRATCH_REGION) + nIdx;
@@ -169,7 +632,6 @@ void main()
     // Backward: the FROZEN canonical into the candidate's domain (the pair
     // estimator is canonical-vs-candidate; the running aggregate never
     // feeds MIS, which is what keeps the mixture linear over rounds).
-    vec4 cCore = pixelRes[canonSlot].path.core;
     if (cCore.x > 0.0 && cCore.y > 0.0)
         WfShiftCreateJob(job1, canonSlot, nIdx, false, fogCluster);
 }

@@ -1,0 +1,131 @@
+#version 460 core
+#include "common.glsl"
+#include "restir_common.glsl"
+#include "restir_wf_common.glsl"
+#include "restir_wf_shift.glsl"
+
+// Probe-guided selection, stage 1 (ROYALGL_RESTIR_PSEL, spatial mode 1):
+// one thread per (sort block, probe r). Resolves the probe position's
+// cluster run, dedups against earlier probes of the same block, picks a
+// mass-representative source entry z* (CDF inversion at S/2), creates ONE
+// shift job z* -> block-center receiver, and seeds the per-block table
+// entry in arena region [64N, 65N). restir_wf_pfin.comp folds the shift
+// result into the measured ideal weight w^_r after the probe pipeline.
+//
+// Probe POSITIONS depend only on (frame, block) - pool MEMBERSHIP is
+// sample-value-independent (the gate-3 lesson); the measured weights only
+// shape the compensated per-draw P.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void main()
+{
+    uint probes = min(RestirSearchIters(), WF_PSEL_MAX_PROBES);
+    uint tid = gl_GlobalInvocationID.x;
+    uint blockLinear = tid / probes;
+    uint r = tid - blockLinear * probes;
+    uint numBlocks = WfPselBlocksX() * WfPselBlocksY();
+    if (blockLinear >= numBlocks) return;
+
+    ivec2 blockCoord = ivec2(int(blockLinear % WfPselBlocksX()),
+                             int(blockLinear / WfPselBlocksX()));
+    uint slotA = WfPselSlot(blockLinear, r);
+    // Default: empty entry (also covers fully-outside jitter-border blocks).
+    wfArena[slotA] = vec4(0.0);
+    wfArena[slotA + 1u] = vec4(0.0);
+
+    ivec2 origin, lo, sz;
+    WfSortBlockRect(blockCoord, origin, lo, sz);
+    if (sz.x <= 0 || sz.y <= 0) return;
+    int blockPixels = sz.x * sz.y;
+    // The probe job rides pixel r of the block's valid rect (slot 0);
+    // border blocks with fewer pixels than probes drop the excess.
+    if (int(r) >= blockPixels) return;
+
+    ivec2 size = ivec2(uFrame.frameInfo.xy);
+    ivec2 pos = WfPselProbePos(blockCoord, r);
+    if (pos.x < 0 || pos.y < 0 || pos.x >= size.x || pos.y >= size.y) return;
+    uint qIdx = RestirPixelIndex(pos);
+    GBufferPixel gq = RestirLoadGBuf(GBufCurOffset() + qIdx);
+    uint key = WfClusterKey(gq);
+    if (key == 0xFFFFFFFFu || key == 0xFFFFFF00u) return; // surface runs only (v1)
+
+    uint qPacked = floatBitsToUint(wfArena[WfSortSlotBase() + qIdx].y);
+    uint start = WfSortRunStart(qPacked);
+    uint count = WfSortRunCount(qPacked);
+    if (count == 0u) return;
+    ivec2 qBlock = WfSortBlockOf(pos);
+    ivec2 qo, ql, qs;
+    WfSortBlockRect(qBlock, qo, ql, qs);
+    // Zero-mass runs STAY pool members (their confidences join cS and the
+    // backward draw domain; their entries are simply unselectable).
+    // Dropping them here would condition pool MEMBERSHIP on contribution -
+    // the gate-3 dead-branch trap at pool level, measured +8.7% bright on
+    // sparse scenes. Membership must depend on G-buffer facts only.
+    float S = WfSortRankCdf(qo, ql, qs, start + count - 1u);
+    float cSigma = max(wfArena[WfSortSlotBase() + qIdx].z, 0.0);
+
+    // Dedup: same run already probed by an earlier r' of this block.
+    for (uint rp = 0u; rp < r; ++rp)
+    {
+        ivec2 pp = WfPselProbePos(blockCoord, rp);
+        if (pp.x < 0 || pp.y < 0 || pp.x >= size.x || pp.y >= size.y) continue;
+        uint pIdx = RestirPixelIndex(pp);
+        uint pPacked = floatBitsToUint(wfArena[WfSortSlotBase() + pIdx].y);
+        if (WfSortRunCount(pPacked) == 0u) continue;
+        if (WfSortRunStart(pPacked) == start
+            && WfSortBlockOf(pp) == qBlock) return; // duplicate run
+    }
+
+    // Probe shift for drawable runs: invert the run CDF at S/2 for a
+    // mass-representative source entry (the top-pHat rank can carry
+    // W = 0; the median-of-mass entry cannot). Dead or unprobeable runs
+    // keep w^ = 0: reachable through the baseline share, never guided.
+    float wSeed = 0.0;
+    uint zStar = 0u;
+    float pHatX = 0.0;
+    if (S > 0.0)
+    {
+        float target = 0.5 * S;
+        uint loR = start, hiR = start + count - 1u;
+        while (loR < hiR)
+        {
+            uint mid = (loR + hiR) >> 1u;
+            if (WfSortRankCdf(qo, ql, qs, mid) > target) hiR = mid; else loR = mid + 1u;
+        }
+        zStar = WfSortRankPixel(qo, ql, qs, loR);
+        vec4 zCore = pixelRes[RestirRegionOffset(RESTIR_SCRATCH_REGION) + zStar].path.core;
+        uint recvIdx = WfPselReceiver(blockCoord);
+        GBufferPixel gr = RestirLoadGBuf(GBufCurOffset() + recvIdx);
+        if (zCore.x > 0.0 && zCore.y > 0.0 && gr.posDepth.w >= 0.0)
+        {
+            pHatX = zCore.y;
+            if (zStar == recvIdx)
+            {
+                // Identity: survival 1 by construction; the MIS factor
+                // at rho = 1 is ~cS/(cS+cC) - 1/2 as the stand-in.
+                wSeed = 0.5 * S;
+            }
+            else
+            {
+                uint jobIdx = RestirPixelIndex(origin + lo
+                                  + ivec2(int(r) % sz.x, int(r) / sz.x))
+                            * WF_JOBS_PER_PIXEL;
+                WfShiftCreateJob(jobIdx,
+                                 RestirRegionOffset(RESTIR_SCRATCH_REGION) + zStar,
+                                 recvIdx, false, false);
+                wSeed = -1.0; // pending: pfin folds the shift result
+            }
+        }
+    }
+
+    // A.x carries the probe's LANDING pixel (a member of the run for any
+    // S, dead or drawable) for rank addressing and the backward draw.
+    wfArena[slotA] = vec4(uintBitsToFloat((qIdx + 1u) | (count << 21u)),
+                          wSeed, cSigma, S);
+    // B.w packs the run identity sinit needs for dedup and rank-range
+    // addressing: start rank (9 bits) | run's block linear index << 9.
+    wfArena[slotA + 1u] = vec4(uintBitsToFloat(key),
+                               uintBitsToFloat(zStar + 1u), pHatX,
+                               uintBitsToFloat(start | (WfPselBlockLinear(qBlock) << 9u)));
+}

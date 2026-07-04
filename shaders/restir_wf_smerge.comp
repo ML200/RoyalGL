@@ -25,6 +25,344 @@
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
+// ---- SPMIS rounds (modes 1-2, Hedstrom et al. 2026) ----------------------
+// One reservoir chain over {canonical, K with-replacement candidates}: the
+// canonical folds ONCE at round 0 with its stochastically estimated MIS
+// weight m~_c (Eq. 18, N~c = 1 backward shift to a uniform run pixel z');
+// each round then folds its CDF-drawn candidate with the stochastic
+// non-canonical pairwise weight (Eq. 16)
+//     m~_z = 1/(N~ P(z)) * (cS/(cS+c_c)) * c^_z p^<-z / (cS p^<-z + c_c p^),
+// where every non-canonical confidence (c^_z and the run sum cS) is scaled
+// by N~/M_run (Sec. 4.3's defensive adjustment). The chain is linear in
+// the m~'s, so correlated draws across rounds (mode 2's antithetic CDF
+// positions) stay unbiased: E[K(z)] = N~ P(z) is all the proof needs.
+//
+// The aggregate keeps the pair-mixture's final-form invariant (core.x =
+// V / pHat_winner after every round) so resolve and the next frame's
+// temporal pass see an ordinary reservoir.
+void SpmisMergeRound(uint idx, uint outSlot, uint canonSlot,
+                     vec4 aCore, vec4 cCore, vec3 canonF,
+                     float M, float V, uint rng, bool fogCluster)
+{
+    // The reuse run chosen by sinit round 0's cell search (own block run
+    // when the search is off or found nothing better).
+    uint runPix = WfSpmisRunPixel(idx);
+    uint runSlot = WfSortSlotBase() + runPix;
+    uint runPacked = floatBitsToUint(wfArena[runSlot].y);
+    float countF = float(WfSortRunCount(runPacked));
+    float cap = RestirConfidenceCap();
+    float cC = cCore.z;
+    // N~/M_run-scaled run confidence sum (the paper's cS; for the pixel's
+    // own run it includes its own capped confidence, paper-faithfully).
+    float gamma = (countF > 0.0) ? M / countF : 0.0;
+    float cS = gamma * max(wfArena[runSlot].z, 0.0);
+    // Partners exist unless the run is the pixel's own single-pixel run
+    // (a foreign run's pixels are all non-canonical inputs).
+    bool noPartners = (countF <= 0.0) || (runPix == idx && countF <= 1.0);
+    // Probe-guided selection: the pool is the own run UNION the block's
+    // key-matching probed runs; sinit round 0 stored the pool's count and
+    // confidence mass in the learn region (Pc = 1/M_pool, cS over the
+    // union - the same chain functional at pool scale).
+    if (RestirPselEnabled() && RestirSpatialMode() == 1u)
+    {
+        countF = wfArena[WfShiftScoreSlot(idx)].w;
+        gamma = (countF > 0.0) ? M / countF : 0.0;
+        cS = gamma * max(wfArena[WfShiftScoreSlot(idx)].x, 0.0);
+        noPartners = countF <= 1.5;
+    }
+
+    float cOut = aCore.z;
+    float winnerPHat = aCore.y; // final-form invariant: core.x = V / winnerPHat
+    vec3 wRgb = vec3(0.0);
+
+    if (uWfRound == 0u && cCore.x > 0.0 && cCore.y > 0.0)
+    {
+        // Canonical fold: m~_c = c_c/(cS+c_c) + count * beta_z' (Pc = 1/M_run).
+        float mC;
+        if (noPartners)
+        {
+            mC = 1.0; // no reuse partners: deterministic pairwise MIS
+        }
+        else
+        {
+            mC = cC / (cS + cC);
+            uint jb1 = WfShiftJobBase(idx * WF_JOBS_PER_PIXEL + WF_SPATIAL_BATCH);
+            uint zPlus1 = uint(wfArena[jb1].w);
+            if (zPlus1 != 0u)
+            {
+                uint zIdx = zPlus1 - 1u;
+                float pHatBack;
+                float cZ;
+                if (zIdx == idx)
+                {
+                    pHatBack = cCore.y; // identity shift
+                    cZ = cC;
+                }
+                else
+                {
+                    pHatBack = 0.0;
+                    if (WfJobOk(jb1))
+                    {
+                        float JBack = WfJobJacobian(jb1);
+                        if (RestirJacobianValid(JBack))
+                            pHatBack = WfJobOmega(jb1) * RestirLum(WfJobF(jb1)) * JBack;
+                    }
+                    // Diag 6 (DELIBERATELY BIASED probe): treat every
+                    // backward shift as failed - the mean elevation vs the
+                    // plain chain is the beta channel's total headroom H,
+                    // against which false-negative-failure bias
+                    // (~ fnRate * H) is quantified.
+                    if (RestirShiftDiagMode() == 6u) pHatBack = 0.0;
+                    cZ = pixelRes[RestirRegionOffset(RESTIR_SCRATCH_REGION) + zIdx].path.core.z;
+                }
+                float cZs = gamma * min(max(cZ, 0.0), cap);
+                float beta = (cZs / (cS + cC))
+                           * (cC * cCore.y) / (cS * pHatBack + cC * cCore.y);
+                mC += countF * beta;
+                // History-guided policy: the backward shift IS a realized
+                // sample of this pixel's shift SURVIVAL RATIO
+                // pHat(T(Xc))*|J| / pHat(Xc) - record it for next frame's
+                // selection CDF (policy only; never enters this frame's
+                // estimator). Deliberately a bounded RATIO, not the
+                // absolute contribution: absolute observations double-
+                // count source brightness the SPMIS weight already
+                // carries, and their heavy tail concentrated P so hard it
+                // inflated 1/P MIS weights into fireflies (hot 319-400 vs
+                // <=45 baseline, orbit clutter test). The 0.02 floor keeps
+                // learned total-failure distinguishable from unlearned (0)
+                // while bounding the attenuation any entry can suffer.
+                if (RestirSpatialMode() >= 2u && zIdx != idx)
+                    WfShiftScoreUpdate(idx,
+                        clamp(pHatBack / max(cCore.y, 1e-12), 0.02, 1.0));
+                // Shift diagnostic: carry this frame's backward result to
+                // round 1, where the mirrored forward job of the same
+                // pair lands (identity pairs are uninformative: -1).
+                if (RestirShiftDiagMode() != 0u)
+                    wfArena[WfShiftScoreSlot(idx)].x =
+                        (zIdx != idx) ? pHatBack : -1.0;
+            }
+            else if (RestirShiftDiagMode() != 0u)
+                wfArena[WfShiftScoreSlot(idx)].x = -1.0;
+        }
+        float wC = mC * cCore.y * cCore.x;
+        if (isnan(wC) || isinf(wC)) wC = 0.0;
+        if (wC > 0.0)
+        {
+            vec3 vRgb = mC * canonF * cCore.x;
+            if (!any(isnan(vRgb)) && !any(isinf(vRgb)))
+                wRgb += vRgb;
+            if (!fogCluster)
+            {
+                V += wC;
+                if (RestirRand(rng) * V <= wC)
+                {
+                    pixelRes[outSlot].path = pixelRes[canonSlot].path;
+                    pixelRes[outSlot].path.core = vec4(V / cCore.y, cCore.y, cOut, cCore.w);
+                    winnerPHat = cCore.y;
+                }
+                else if (winnerPHat > 0.0)
+                {
+                    pixelRes[outSlot].path.core.x = V / winnerPHat;
+                }
+            }
+        }
+    }
+
+    // This sweep's batched forward candidates (P > 0 marks a draw; sinit
+    // stores P(z) into each job's meta .w after any WfShiftCreateJob call,
+    // and the source slot into meta .x).
+    for (uint b = 0u; b < WF_SPATIAL_BATCH; ++b)
+    {
+        uint jb0 = WfShiftJobBase(idx * WF_JOBS_PER_PIXEL + b);
+        float P = wfArena[jb0].w;
+        if (P <= 0.0) continue;
+        uint nIdx = floatBitsToUint(wfArena[jb0].x)
+                  - RestirRegionOffset(RESTIR_SCRATCH_REGION);
+        // jb.w IS the complete stochastic-MIS scale for this pick
+        // (sinit stores 1/(N~ P)).
+        float mScale = P;
+        // Debug identity (ROYALGL_STATS_SPMIS, mode 1): E[sum 1/(N~ P count)]
+        // over a frame's draws equals the run's contributing-entry fraction.
+        // (The shift diagnostic and PSEL own the channel while they run.)
+        if (RestirSpatialMode() == 1u && countF > 0.0 && RestirShiftDiagMode() == 0u
+            && !RestirPselEnabled())
+            wfArena[WfShiftScoreSlot(idx)].w += mScale / countF;
+        if (nIdx == idx)
+        {
+            // Self-draw: the run CDF picked this pixel's own scratch
+            // reservoir; the shift is the identity (J = 1), synthesized
+            // without a job. No confidence add - no new information.
+            if (cCore.x > 0.0 && cCore.y > 0.0)
+            {
+                float cZs = gamma * min(cC, cap);
+                float mZ = mScale * (cS / (cS + cC)) * cZs / (cS + cC);
+                float wN = mZ * cCore.y * cCore.x;
+                if (isnan(wN) || isinf(wN)) wN = 0.0;
+                if (wN > 0.0)
+                {
+                    vec3 nRgb = mZ * canonF * cCore.x;
+                    if (!any(isnan(nRgb)) && !any(isinf(nRgb)))
+                        wRgb += nRgb;
+                    if (!fogCluster)
+                    {
+                        V += wN;
+                        if (RestirRand(rng) * V <= wN)
+                        {
+                            pixelRes[outSlot].path = pixelRes[canonSlot].path;
+                            pixelRes[outSlot].path.core = vec4(V / cCore.y, cCore.y, cOut, cCore.w);
+                            winnerPHat = cCore.y;
+                        }
+                        else if (winnerPHat > 0.0)
+                        {
+                            pixelRes[outSlot].path.core.x = V / winnerPHat;
+                        }
+                    }
+                }
+            }
+        }
+        else
+        {
+            uint nSlot = RestirRegionOffset(RESTIR_SCRATCH_REGION) + nIdx;
+            vec4 nCore = pixelRes[nSlot].path.core;
+            float cN = min(max(nCore.z, 0.0), cap);
+
+            bool okN = WfJobOk(jb0);
+            float omegaN = WfJobOmega(jb0);
+            float pHatN_cur = okN ? omegaN * RestirLum(WfJobF(jb0)) : 0.0;
+            float JN = WfJobJacobian(jb0);
+
+            float wN = 0.0;
+            if (pHatN_cur > 0.0 && RestirJacobianValid(JN))
+            {
+                float pHatFromN = nCore.y / JN;
+                float cZs = gamma * cN;
+                float mZ = mScale * (cS / (cS + cC))
+                         * (cZs * pHatFromN) / (cS * pHatFromN + cC * pHatN_cur);
+                wN = mZ * pHatN_cur * nCore.x * JN;
+                if (isnan(wN) || isinf(wN)) wN = 0.0;
+                if (wN > 0.0)
+                {
+                    vec3 nRgb = mZ * omegaN * WfJobF(jb0) * nCore.x * JN;
+                    if (!any(isnan(nRgb)) && !any(isinf(nRgb)))
+                        wRgb += nRgb;
+                }
+            }
+
+            if (!fogCluster)
+            {
+                // The candidate's confidence joins the running total even
+                // when its contribution is zero (pair-mixture accounting).
+                cOut = min(cOut + cN, cap);
+                pixelRes[outSlot].path.core.z = cOut;
+
+                if (wN > 0.0)
+                {
+                    V += wN;
+                    if (RestirRand(rng) * V <= wN)
+                    {
+                        float Wnew = V / pHatN_cur;
+                        if (isnan(Wnew) || isinf(Wnew)) Wnew = 0.0;
+                        pixelRes[outSlot].path = pixelRes[nSlot].path;
+                        pixelRes[outSlot].path.core = vec4(Wnew, pHatN_cur, cOut, nCore.w);
+                        pixelRes[outSlot].path.fSeed.xyz = WfJobF(jb0);
+                        pixelRes[outSlot].path.rcInfo = vec4(WfJobRcCos(jb0), WfJobRcDist2(jb0),
+                                                             omegaN, WfJobReplayPdf(jb0));
+                        winnerPHat = pHatN_cur;
+                    }
+                    else if (winnerPHat > 0.0)
+                    {
+                        pixelRes[outSlot].path.core.x = V / winnerPHat;
+                    }
+                }
+            }
+        }
+    }
+
+    // Dual-direction shift diagnostic tally (round 1, mode 1): slot
+    // WF_SPATIAL_BATCH now holds the FORWARD shift z' -> c of the pair
+    // whose backward shift c -> z' round 0 measured (carried in the learn
+    // region's .x; -1 = no valid non-identity pair this frame). Tallies
+    // accumulate across frames in .y / .w - never into the estimator.
+    // Under gate1 (no foreign-run hops) the pair ensemble is EXCHANGEABLE
+    // (both pixels share the run, z' uniform), so any systematic .y/.w
+    // difference in modes 1/3/4/5 is a DIRECTION asymmetry of the shift
+    // machinery. Sub-modes:
+    //   1: .y += 1 if fwd ok & bwd FAILED, .w += 1 if bwd ok & fwd FAILED
+    //      (support asymmetry, exactly paired - same events, one run)
+    //   2: .y += 1 per valid pair,         .w += 1 if both ok (context)
+    //   3: both-ok pairs: .y += 1,         .w += log(rF / rB)
+    //   4: both-ok pairs: .y += rB,        .w += rF
+    //   5: .y += count*beta(bwd),          .w += count*beta'(fwd mirrored)
+    //      - beta' evaluates the SAME m~_c estimator channel with the
+    //      roles swapped (z' as canonical, c as partner, forward result
+    //      as its backward shift). E[.y] == E[.w] for direction-symmetric
+    //      machinery; their gap IS the m~_c bias channel, beta-shaped and
+    //      brightness-weighted.
+    // rF = pHatFwd/pHat_z(Xz), rB = pHatBack/pHat_c(Xc).
+    uint diag = RestirShiftDiagMode();
+    if (diag != 0u && uWfRound == 1u && RestirSpatialMode() == 1u && !fogCluster)
+    {
+        float pb = wfArena[WfShiftScoreSlot(idx)].x;
+        uint jb1 = WfShiftJobBase(idx * WF_JOBS_PER_PIXEL + WF_SPATIAL_BATCH);
+        uint zPlus1 = uint(wfArena[jb1].w);
+        if (pb >= 0.0 && zPlus1 != 0u && cCore.x > 0.0 && cCore.y > 0.0)
+        {
+            uint zIdx = zPlus1 - 1u;
+            uint zSlot = RestirRegionOffset(RESTIR_SCRATCH_REGION) + zIdx;
+            vec4 zCore = pixelRes[zSlot].path.core;
+            if (zCore.x > 0.0 && zCore.y > 0.0)
+            {
+                float pf = 0.0;
+                if (WfJobOk(jb1))
+                {
+                    float JF = WfJobJacobian(jb1);
+                    if (RestirJacobianValid(JF))
+                        pf = WfJobOmega(jb1) * RestirLum(WfJobF(jb1)) * JF;
+                }
+                bool fOk = pf > 0.0;
+                bool bOk = pb > 0.0;
+                float addY = 0.0, addW = 0.0;
+                if (diag == 1u)      { addY = (fOk && !bOk) ? 1.0 : 0.0; addW = (!fOk && bOk) ? 1.0 : 0.0; }
+                else if (diag == 2u) { addY = 1.0; addW = (fOk && bOk) ? 1.0 : 0.0; }
+                else if (diag == 5u)
+                {
+                    // Backward beta exactly as the round-0 fold computes it.
+                    float cZs = gamma * min(max(zCore.z, 0.0), cap);
+                    float bB = (cZs / (cS + cC))
+                             * (cC * cCore.y) / (cS * pb + cC * cCore.y);
+                    // Mirrored: z' canonical, c the partner (same run =>
+                    // same gamma/cS under gate1), forward result pf as the
+                    // mirrored pair's backward shift outcome.
+                    float cCs = gamma * min(max(cCore.z, 0.0), cap);
+                    float cZ = zCore.z;
+                    float bF = (cCs / (cS + cZ))
+                             * (cZ * zCore.y) / (cS * pf + cZ * zCore.y);
+                    addY = countF * bB;
+                    addW = countF * bF;
+                }
+                else if (fOk && bOk)
+                {
+                    float rB = pb / max(cCore.y, 1e-12);
+                    float rF = pf / max(zCore.y, 1e-12);
+                    if (diag == 3u) { addY = 1.0; addW = log(clamp(rF / max(rB, 1e-12), 1e-6, 1e6)); }
+                    else            { addY = rB;  addW = rF; }
+                }
+                wfArena[WfShiftScoreSlot(idx)].y += addY;
+                wfArena[WfShiftScoreSlot(idx)].w += addW;
+            }
+        }
+    }
+
+    if (!any(isnan(wRgb)) && !any(isinf(wRgb)))
+        wfArena[WfShadeAccSlot(idx)].xyz += wRgb / float(uWfPass + 1u);
+    wfArena[idx].x = uintBitsToFloat(rng);
+}
+
+// (The mode-3 "reservoir butterfly" lived here 2026-07-04: exponential
+// aggregation via reciprocal XOR-pair merges - exactly unbiased and
+// cheap, but the 2^J-pixel groups share aggregates, which reads as a
+// resolution loss. Removed; recover from git history / research log.)
+
 void main()
 {
     uint idx = gl_GlobalInvocationID.x;
@@ -58,6 +396,13 @@ void main()
     // MIS-weighted contribution omega*f in place of pHat = omega*lum(f).
     vec3 canonF = pixelRes[canonSlot].path.rcInfo.z * pixelRes[canonSlot].path.fSeed.xyz;
 
+    if (RestirSpatialMode() >= 1u)
+    {
+        SpmisMergeRound(idx, outSlot, canonSlot, aCore, cCore, canonF,
+                        M, V, rng, fogCluster);
+        return;
+    }
+
     if (nIdx == idx)
     {
         // Self round: E_k = canonical. Fold it into the mixture.
@@ -67,7 +412,7 @@ void main()
         {
             vec3 vRgb = canonF * cCore.x / M;
             if (!any(isnan(vRgb)) && !any(isinf(vRgb)))
-                wfArena[WfShadeAccSlot(idx)].xyz += vRgb;
+                wfArena[WfShadeAccSlot(idx)].xyz += vRgb / float(uWfPass + 1u);
             if (!fogCluster)
             {
                 V += v;
@@ -136,7 +481,7 @@ void main()
     if (isnan(w_C) || isinf(w_C)) w_C = 0.0;
     if (isnan(w_N) || isinf(w_N)) w_N = 0.0;
     if (!any(isnan(wRgb)) && !any(isinf(wRgb)))
-        wfArena[WfShadeAccSlot(idx)].xyz += wRgb / M;
+        wfArena[WfShadeAccSlot(idx)].xyz += wRgb / (M * float(uWfPass + 1u));
 
     if (fogCluster)
     {
